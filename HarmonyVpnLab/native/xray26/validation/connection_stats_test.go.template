@@ -1,0 +1,62 @@
+package xray
+
+import (
+	"testing"
+
+	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/stats"
+)
+
+// No inbounds, metrics HTTP server, DNS client or outbound socket is needed.
+const connectionStatsFixture = `{"log":{"loglevel":"none"},"stats":{},"policy":{"system":{"statsOutboundUplink":true,"statsOutboundDownlink":true}},"outbounds":[{"tag":"nodeProxy","protocol":"blackhole","settings":{}}]}`
+
+func TestHarmonyConnectionStats(t *testing.T) {
+	if core.Version() != "26.6.1" {
+		t.Fatal("unexpected core version")
+	}
+	if coreServer != nil {
+		t.Fatal("test requires an initially stopped wrapper")
+	}
+	t.Cleanup(func() { _ = StopXray() })
+	if _, err := GetConnectionStats(); err == nil || err.Error() != "connection core is not running" {
+		t.Fatal("stopped wrapper must reject statistics")
+	}
+	var previous stats.Manager
+	for iteration := 1; iteration <= 3; iteration++ {
+		if err := RunXrayFromJSON(t.TempDir(), connectionStatsFixture); err != nil {
+			t.Fatal(err)
+		}
+		manager := coreServer.GetFeature(stats.ManagerType()).(stats.Manager)
+		if previous != nil && previous == manager {
+			t.Fatal("restart reused the old statistics manager")
+		}
+		previous = manager
+		zero, err := GetConnectionStats()
+		if err != nil || zero.Uplink != 0 || zero.Downlink != 0 {
+			t.Fatal("new instance counters must start at zero")
+		}
+		manager.GetCounter("outbound>>>nodeProxy>>>traffic>>>uplink").Add(int64(iteration * 100))
+		manager.GetCounter("outbound>>>nodeProxy>>>traffic>>>downlink").Add(int64(iteration * 200))
+		read, err := GetConnectionStats()
+		if err != nil || read.Uplink != int64(iteration*100) || read.Downlink != int64(iteration*200) {
+			t.Fatal("accessor did not read this instance's counters")
+		}
+		if err := StopXray(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := GetConnectionStats(); err == nil || err.Error() != "connection core is not running" {
+			t.Fatal("statistics survived a stopped instance")
+		}
+		t.Logf("instance %d: start, zero, mutate, query, stop, query rejected", iteration)
+	}
+	const missingCounters = `{"log":{"loglevel":"none"},"stats":{},"outbounds":[{"tag":"nodeProxy","protocol":"blackhole","settings":{}}]}`
+	if err := RunXrayFromJSON(t.TempDir(), missingCounters); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GetConnectionStats(); err == nil || err.Error() != "connection counters are unavailable" {
+		t.Fatal("missing counters must fail instead of reporting a fabricated zero")
+	}
+	if err := StopXray(); err != nil {
+		t.Fatal(err)
+	}
+}

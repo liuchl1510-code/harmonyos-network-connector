@@ -1,0 +1,101 @@
+package protectionvalidation
+
+import (
+	"context"
+	"errors"
+	gonet "net"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/sagernet/sing/common/control"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/transport/internet"
+)
+
+// All addresses are local and synthetic. These tests never load a user node.
+func TestHarmonySocketProtection(t *testing.T) {
+	for _, network := range []string{"tcp", "udp"} {
+		for _, permit := range []bool{true, false} {
+			name := network + "/reject"
+			if permit {
+				name = network + "/permit"
+			}
+			t.Run(name, func(t *testing.T) {
+				sentinel := errors.New("synthetic socket protection rejected")
+				callbacks, subsequentControllers := 0, 0
+				dialer := &internet.DefaultSystemDialer{}
+				internet.UseAlternativeSystemDialer(dialer)
+				defer internet.UseAlternativeSystemDialer(nil)
+				controllers := []control.Func{
+					func(_, _ string, raw syscall.RawConn) error {
+						if err := raw.Control(func(uintptr) { callbacks++ }); err != nil {
+							return err
+						}
+						if !permit {
+							return sentinel
+						}
+						return nil
+					},
+					func(_, _ string, _ syscall.RawConn) error {
+						subsequentControllers++
+						return nil
+					},
+				}
+				for _, controller := range controllers {
+					if err := internet.RegisterDialerController(controller); err != nil {
+						t.Fatal(err)
+					}
+				}
+				destination := net.UDPDestination(net.LocalHostIP, net.Port(9))
+				var listener *gonet.TCPListener
+				if network == "tcp" {
+					var err error
+					listener, err = gonet.ListenTCP("tcp4", &gonet.TCPAddr{IP: gonet.IPv4(127, 0, 0, 1)})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer listener.Close()
+					destination = net.TCPDestination(net.LocalHostIP, net.Port(listener.Addr().(*gonet.TCPAddr).Port))
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				conn, err := dialer.Dial(ctx, nil, destination, nil)
+				if conn != nil {
+					defer conn.Close()
+				}
+				if callbacks != 1 {
+					t.Fatalf("synthetic callback count = %d, want 1", callbacks)
+				}
+				if permit {
+					if err != nil || conn == nil || subsequentControllers != 1 {
+						t.Fatalf("permitted socket: conn=%v err=%v nextControllers=%d", conn != nil, err, subsequentControllers)
+					}
+					if listener != nil {
+						listener.SetDeadline(time.Now().Add(time.Second))
+						accepted, acceptErr := listener.Accept()
+						if acceptErr != nil {
+							t.Fatal(acceptErr)
+						}
+						accepted.Close()
+					}
+				} else {
+					if conn != nil || !errors.Is(err, sentinel) || subsequentControllers != 0 {
+						t.Fatalf("rejected socket continued: conn=%v err=%v nextControllers=%d", conn != nil, err, subsequentControllers)
+					}
+					if listener != nil {
+						listener.SetDeadline(time.Now().Add(50 * time.Millisecond))
+						accepted, acceptErr := listener.Accept()
+						if accepted != nil {
+							accepted.Close()
+							t.Fatal("rejected TCP socket connected to the local listener")
+						}
+						if timeout, ok := acceptErr.(gonet.Error); !ok || !timeout.Timeout() {
+							t.Fatalf("want accept timeout after rejected protection, got %v", acceptErr)
+						}
+					}
+				}
+			})
+		}
+	}
+}

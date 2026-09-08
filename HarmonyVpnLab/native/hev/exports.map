@@ -1,0 +1,10 @@
+{
+  global:
+    hev_socks5_tunnel_main;
+    hev_socks5_tunnel_main_from_file;
+    hev_socks5_tunnel_main_from_str;
+    hev_socks5_tunnel_quit;
+    hev_socks5_tunnel_stats;
+    hev_ohos_io_stats;
+  local: *;
+};

@@ -1,0 +1,66 @@
+{
+  "sourceLockSHA256": "0f2d16308df7c7ba1e129f11e0e0a413638da3b49c14e32a1328aee2c02b835d",
+  "verifiedLibrarySHA256": "ee74757daaa2679da0363704c87ecc8cac0fc2b4aa04008026de0baa6820046f",
+  "legacyScriptSHA256": "32221e5261b9e021ad19735eb45d24baa894a4663d9cf51b0ff9da9a03e75373",
+  "compilerPatchSHA256": "da9f2f108194400edafb64434e17125d72b4710f051e4a61dcc1cc0abbbe2796",
+  "upstreamGoModSHA256": "3a849f620336dbf850370bbe3dabd8515a30ee0dceefca562ef2f86a67bffbf6",
+  "upstreamGoSumSHA256": "82b138ee6535c25406d57281ba6966e396b280b43901d44a70c9224b6acb85e3",
+  "validation": {
+    "frozenCompilerPatchAppliesToCleanBase": true,
+    "patchedFileHashesReproduced": 125,
+    "compiledGoVersion": "go1.26.7",
+    "ohosElfHasTlsdesc": true,
+    "expectedExports": 8,
+    "socketProtectionPositiveCasesPassed": 4,
+    "originalCoreNegativeCasesExposed": 2,
+    "linkedModuleLicenseNotices": 42,
+    "hostAssemblerTestsPassed": [
+      "cmd/internal/obj/arm64",
+      "cmd/asm/internal/asm"
+    ],
+    "hostRuntimeTestsPassed": [
+      "TestHeapAddrBitsValue"
+    ],
+    "authoredPowerShellSyntaxFiles": 8,
+    "authoredPythonSyntaxFiles": 3,
+    "readyCacheReadOnlyCheckPassed": true,
+    "emptyCacheReadOnlyCheckPassed": true,
+    "authoredCorePreparationOnFreshSourcePassed": true,
+    "authoredFilesAndModuleCacheUnchangedByPreparation": true,
+    "fullColdCacheRebuildAfterScriptPackagingRun": false
+  },
+  "deviceEvidence": {
+    "providedBy": "parent task signed HAP verification",
+    "appVersion": "0.5.0",
+    "minimalGoSmoke": {
+      "runId": "1788835553337",
+      "workers": 4,
+      "calls": 32,
+      "registerFailureMask": 0,
+      "replyFailures": 0
+    },
+    "registerDetectorNegativeControl": {
+      "runId": "1788835547480",
+      "brokenFixtureMask": 64
+    },
+    "localXrayHevLoopbackRunId": "1788836147477",
+    "nodeHttpsRuns": [
+      {
+        "runId": "1788836177464",
+        "httpStatus": 200,
+        "uplink": 3075,
+        "downlink": 3838
+      },
+      {
+        "runId": "1788836250853",
+        "httpStatus": 200,
+        "uplink": 3268,
+        "downlink": 3749
+      }
+    ],
+    "rejectedProtectionRunId": "1788836233458",
+    "rejectedProtectionSucceeded": 0,
+    "rejectedProtectionFixtureRequests": 0
+  },
+  "scope": "Bounded device/API/GC/IPv4 single-app checks. No claim of full Go standard-library tests, all HarmonyOS devices, DNS/IPv6 or full v2rayNG feature equivalence."
+}

@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "dateUtc": "2026-09-08T16:33:14.7070863Z",
+  "scope": "Source-only public checkout, fresh native roots, installed Windows SDK; unsigned HAP compilation; no device run.",
+  "applicationVersion": "0.10.0",
+  "target": "arm64-v8a / API 26",
+  "sourceCheckout": {
+    "excludedBinariesAndPersonalSigning": true,
+    "gitMetadataNotRequired": true
+  },
+  "native": {
+    "coldRootsRequired": true,
+    "historicalNativeCacheReused": false,
+    "compiler": "Go 1.26.7 with supplied OHOS patch",
+    "compilerPatchSHA256": "e0f0a63b6a0f28a61bdc6c7e019f7aa11b2e51afe296b198ec93a4097e5266d1",
+    "files": [
+      {
+        "name": "libhevsocks5tun.so",
+        "bytes": 344184,
+        "sha256": "2a23491b1b3327eefa058a37601d0d61447cb6b4f0a6ea72d53776b3424a270f"
+      },
+      {
+        "name": "libxray.so",
+        "bytes": 35243704,
+        "sha256": "0ec7cebd9978705229b2513e37ec2ccbf370c0a6e9a15b8eeb9ece3b07c98d0f"
+      },
+      {
+        "name": "libgoruntime-smoke.so",
+        "bytes": 1719240,
+        "sha256": "596fc54956315897e749f6f2da9c3d2ee4778750627bb2924ebbda98f7c14bc7"
+      },
+      {
+        "name": "libsmoke-good.so",
+        "bytes": 12184,
+        "sha256": "a126488f5a77cec2a00fe94b4b3d90ada9f1edc0e29655f9e3ddce3ac4dba9e8"
+      },
+      {
+        "name": "libsmoke-broken.so",
+        "bytes": 12224,
+        "sha256": "d08f5d4a22627822250a34a580d606040964bde5d3e6beb18cfdd14ad545d14e"
+      }
+    ],
+    "socketProtectionCasesPassed": 4,
+    "originalCoreNegativeCasesExposed": 2,
+    "statsRestartCyclesPassed": 3,
+    "exports": [
+      "CGoConnectionStats",
+      "CGoFree",
+      "CGoPing",
+      "CGoQueryStats",
+      "CGoRuntimeInfo",
+      "CGoRunXrayFromJSON",
+      "CGoSetSocketProtectCallback",
+      "CGoStopXray",
+      "CGoXrayVersion"
+    ]
+  },
+  "unsignedHap": {
+    "bytes": 40089169,
+    "sha256": "a38f00a6ec295bb21e3e52a3f34a967a1d5162486415cdd1d5e73d1e7ccf20ae",
+    "personalSigningProfileUsed": false,
+    "sdkSigningConfigOmitted": true,
+    "deviceInstallAttempted": false
+  },
+  "metadataExporter": {
+    "syntheticCasesPassed": 7,
+    "actualColdArtifactValidated": true
+  },
+  "limitations": [
+    "Installed DevEco SDK and operating system were reused; cache roots for native source/bootstrap/modules and unsigned app staging were new.",
+    "Native compilation and host tests do not replace fresh phone validation of these newly built binaries.",
+    "Historical device results identify their earlier artifacts separately.",
+    "Binary hashes can differ with build paths/toolchains; this record does not promise bit-for-bit reproduction."
+  ]
+}

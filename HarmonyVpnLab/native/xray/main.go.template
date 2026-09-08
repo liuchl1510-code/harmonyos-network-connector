@@ -1,0 +1,127 @@
+package main
+
+/*
+#include <stdlib.h>
+
+// The function pointer and fd are borrowed. The callback must finish protection
+// synchronously and must never close Go's original socket descriptor.
+static inline int harmonyProtectSocket(void *callback, int fd) {
+	if (callback == NULL) return -1;
+	return ((int (*)(int))callback)(fd);
+}
+*/
+import "C"
+
+import (
+	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"github.com/xtls/libxray/nodep"
+	"github.com/xtls/xray-core/transport/internet"
+)
+
+// Serialize lifecycle calls: the pinned upstream library stores one global core.
+var lifecycleMu sync.Mutex
+var socketProtectCallback atomic.Pointer[byte]
+var socketControllerRegistrationError = internet.RegisterDialerController(protectSocket)
+
+// protectSocket runs inside net.Dialer/ListenConfig.Control, before connect or
+// bind. A missing callback is an error, just like a rejected protection request.
+// The pinned core must propagate this error (see the fail-closed source patch).
+func protectSocket(network, address string, raw syscall.RawConn) error {
+	callback := socketProtectCallback.Load()
+	if callback == nil {
+		return fmt.Errorf("socket protection callback is not registered")
+	}
+	var protectErr error
+	if err := raw.Control(func(fd uintptr) {
+		if status := C.harmonyProtectSocket(unsafe.Pointer(callback), C.int(fd)); status != 0 {
+			protectErr = fmt.Errorf("socket protection failed (status %d)", int(status))
+		}
+	}); err != nil {
+		return fmt.Errorf("socket protection control failed: %w", err)
+	}
+	return protectErr
+}
+
+//export CGoSetSocketProtectCallback
+func CGoSetSocketProtectCallback(callback unsafe.Pointer) {
+	socketProtectCallback.Store((*byte)(callback))
+}
+
+func reply(call func() string) (result *C.char) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			var response nodep.CallResponse[string]
+			result = C.CString(response.EncodeToBase64("", fmt.Errorf("native core panic: %v", recovered)))
+		}
+	}()
+	return C.CString(call())
+}
+
+//export CGoRunXrayFromJSON
+func CGoRunXrayFromJSON(request *C.char) *C.char {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	return reply(func() string {
+		if socketControllerRegistrationError != nil {
+			var response nodep.CallResponse[string]
+			return response.EncodeToBase64("", fmt.Errorf("socket controller registration failed: %w", socketControllerRegistrationError))
+		}
+		return RunXrayFromJSON(C.GoString(request))
+	})
+}
+
+//export CGoStopXray
+func CGoStopXray() *C.char {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	return reply(StopXray)
+}
+
+//export CGoXrayVersion
+func CGoXrayVersion() *C.char {
+	return reply(XrayVersion)
+}
+
+type runtimeInfo struct {
+	UnixMillis int64  `json:"unixMillis"`
+	GoVersion  string `json:"goVersion"`
+	GoOS       string `json:"goos"`
+	GoArch     string `json:"goarch"`
+}
+
+//export CGoRuntimeInfo
+func CGoRuntimeInfo() *C.char {
+	return reply(func() string {
+		var response nodep.CallResponse[runtimeInfo]
+		return response.EncodeToBase64(runtimeInfo{
+			UnixMillis: time.Now().UnixMilli(),
+			GoVersion:  runtime.Version(),
+			GoOS:       runtime.GOOS,
+			GoArch:     runtime.GOARCH,
+		}, nil)
+	})
+}
+
+//export CGoPing
+func CGoPing(request *C.char) *C.char {
+	return reply(func() string { return Ping(C.GoString(request)) })
+}
+
+//export CGoQueryStats
+func CGoQueryStats(request *C.char) *C.char {
+	return reply(func() string { return QueryStats(C.GoString(request)) })
+}
+
+//export CGoFree
+func CGoFree(result *C.char) {
+	C.free(unsafe.Pointer(result))
+}
+
+func main() {}

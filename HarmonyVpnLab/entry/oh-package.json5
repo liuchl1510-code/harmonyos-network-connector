@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "0.10.0",
+  "description": "Native HarmonyOS IPv4 proxy and node manager",
+  "main": "",
+  "author": "liuchl1510-code",
+  "license": "GPL-3.0-or-later",
+  "dependencies": { "libvpnbridge.so": "file:./src/main/cpp/types/libvpnbridge" }
+}

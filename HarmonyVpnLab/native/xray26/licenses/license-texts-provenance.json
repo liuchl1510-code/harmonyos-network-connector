@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "note": "Complete GNU license texts copied byte-for-byte from installed redistributions. No license text was rewritten. Direct gnu.org retrieval was unavailable during this preparation; the official URLs identify the canonical texts, not a successful network verification.",
+  "files": [
+    {
+      "file": "GPL-3.0.txt",
+      "license": "GPL-3.0",
+      "canonicalUrl": "https://www.gnu.org/licenses/gpl-3.0.txt",
+      "copiedFrom": "Git for Windows distribution: mingw64/share/licenses/xz/COPYING.GPLv3",
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+    },
+    {
+      "file": "LGPL-3.0.txt",
+      "license": "LGPL-3.0",
+      "canonicalUrl": "https://www.gnu.org/licenses/lgpl-3.0.txt",
+      "copiedFrom": "DevEco OpenHarmony SDK CMake 3.28 distribution: Licenses/LGPLv3.txt",
+      "sha256": "ea7d049c7705dc13afc202dd18e1827f3484f8212fd3fa7b82fc4a0c363432c9"
+    }
+  ]
+}

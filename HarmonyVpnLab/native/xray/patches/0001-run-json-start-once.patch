@@ -1,0 +1,18 @@
+--- a/xray/xray.go
++++ b/xray/xray.go
+@@ -78,15 +78,11 @@
+ func RunXrayFromJSON(datDir string, configJSON string) (err error) {
+ 	InitEnv(datDir)
+ 	memory.InitForceFree()
+ 	coreServer, err = StartXrayFromJSON(configJSON)
+ 	if err != nil {
+ 		return
+ 	}
+ 
+-	if err = coreServer.Start(); err != nil {
+-		return
+-	}
+-
+ 	debug.FreeOSMemory()
+ 	return nil
+ }

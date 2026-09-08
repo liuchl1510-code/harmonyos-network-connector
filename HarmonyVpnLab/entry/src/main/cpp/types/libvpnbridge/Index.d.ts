@@ -1,0 +1,18 @@
+export const selfCheck: () => string;
+export const currentProcessId: () => number;
+export const processAlive: (pid: number) => boolean;
+export const inspectTunAddresses: (fd: number) => string;
+export const inspectFd: (fd: number) => string;
+export const startFixture: (token: string) => Promise<string>;
+export const stopFixture: () => Promise<string>;
+export const fixtureStatus: () => string;
+export const getFreePort: () => number;
+export const getFreePorts: () => string;
+export const startHev: (fd: number, port: number, captureIpv6?: boolean) => Promise<string>;
+export const stopHev: () => Promise<string>;
+export const forwardingStatus: () => string;
+export const xrayCall: (operation: string, request: string) => Promise<string>;
+export const configureXrayCa: (path: string) => Promise<string>;
+export const installSocketProtector: (callback: (fd: number) => Promise<void>) => void;
+export const socketProtectionStats: () => string;
+export const runRuntimeSmoke: (kind: string) => Promise<string>;

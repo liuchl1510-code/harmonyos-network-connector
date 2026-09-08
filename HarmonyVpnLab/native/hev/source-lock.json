@@ -1,0 +1,11 @@
+{
+  "name": "hev-socks5-tunnel",
+  "version": "2.9.0",
+  "repositories": [
+    { "path": ".", "url": "https://github.com/heiher/hev-socks5-tunnel.git", "commit": "99cd2d5d5dfc9b21038e977808e59a0b90b38fa0" },
+    { "path": "src/core", "url": "https://github.com/heiher/hev-socks5-core", "commit": "5d37a81dc8d492d54c89aa6a00a5c4f505b75b99" },
+    { "path": "third-part/hev-task-system", "url": "https://github.com/heiher/hev-task-system", "commit": "ed320fd855e84c6a0b8792db1edf5899f1584132" },
+    { "path": "third-part/lwip", "url": "https://github.com/heiher/lwip", "commit": "7a246bcd7ab66f6057bcbae979ca8b11428cc459" },
+    { "path": "third-part/yaml", "url": "https://github.com/heiher/yaml", "commit": "efa36117a8646d26d12b58e05bac472d7854a70d" }
+  ]
+}

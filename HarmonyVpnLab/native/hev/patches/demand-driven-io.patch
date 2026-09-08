@@ -1,0 +1,159 @@
+--- a/src/hev-socks5-session-tcp.c
++++ b/src/hev-socks5-session-tcp.c
+@@ -20,6 +20,7 @@
+ #include <hev-socks5-misc.h>
+ 
+ #include "hev-utils.h"
++#include "hev-ohos-interest.h"
+ #include "hev-config.h"
+ #include "hev-logger.h"
+ #include "hev-config-const.h"
+@@ -195,6 +196,7 @@
+     int tcp_buffer_size;
+     int res_f = 1;
+     int res_b = 1;
++    unsigned int poll_events = POLLIN | POLLOUT;
+ 
+     LOG_D ("%p socks5 session tcp splice", self);
+ 
+@@ -208,6 +210,7 @@
+ 
+     for (;;) {
+         HevTaskYieldType type;
++        unsigned int desired = 0;
+ 
+         if (res_f >= 0)
+             res_f = tcp_splice_f (self);
+@@ -221,10 +224,27 @@
+         else
+             break;
+ 
++        /* Only wait for work the session can consume. lwIP recv/sent
++         * callbacks wake this task when queue data/capacity changes. */
++        if (res_f >= 0 && self->queue)
++            desired |= POLLOUT;
++        if (res_b >= 0 &&
++            hev_ring_buffer_get_use_size (self->buffer) <
++                hev_ring_buffer_get_max_size (self->buffer))
++            desired |= POLLIN;
++        if (hev_ohos_update_interest (hev_task_self (), HEV_SOCKS5 (self)->fd,
++                                      &poll_events, desired) < 0) {
++            hev_socks5_set_timeout (HEV_SOCKS5 (self), 0);
++            break;
++        }
+         if (task_io_yielder (type, base) < 0)
+             break;
+     }
+ 
++    /* Socket EOF/HUP must not repeatedly wake ACK-only ring-buffer draining. */
++    if (hev_ohos_update_interest (hev_task_self (), HEV_SOCKS5 (self)->fd,
++                                  &poll_events, 0) < 0)
++        hev_socks5_set_timeout (HEV_SOCKS5 (self), 0);
+     while (self->pcb) {
+         if (hev_ring_buffer_get_use_size (self->buffer) == 0)
+             break;
+--- a/src/hev-socks5-session-udp.c
++++ b/src/hev-socks5-session-udp.c
+@@ -21,6 +21,7 @@
+ #include <hev-socks5-misc.h>
+ 
+ #include "hev-utils.h"
++#include "hev-ohos-interest.h"
+ #include "hev-config.h"
+ #include "hev-logger.h"
+ #include "hev-compiler.h"
+@@ -57,7 +58,8 @@
+ }
+ 
+ static int
+-hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self)
++hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self,
++                               unsigned int *poll_events)
+ {
+     HevSocks5UDPFrame *frame;
+     struct sockaddr *addr;
+@@ -68,6 +70,12 @@
+ 
+     for (;;) {
+         node = hev_list_first (&self->frame_list);
++        /* The reverse task owns a separate dup registered for POLLIN. */
++        if (hev_ohos_update_interest (
++                hev_task_self (),
++                hev_socks5_udp_get_fd (HEV_SOCKS5_UDP (self)), poll_events,
++                node ? POLLOUT : 0) < 0)
++            return -1;
+         if (node)
+             break;
+ 
+@@ -264,19 +272,24 @@
+ 
+     fd = hev_task_io_dup (hev_socks5_udp_get_fd (HEV_SOCKS5_UDP (self)));
+     if (fd < 0)
+-        return;
+-
+-    if (hev_task_add_fd (task, fd, POLLIN) < 0)
+-        hev_task_mod_fd (task, fd, POLLIN);
++        goto failed;
++
++    if (hev_task_add_fd (task, fd, POLLIN) < 0) {
++        close (fd);
++        goto failed;
++    }
+ 
+     for (;;) {
+         if (hev_socks5_session_udp_fwd_b (self) < 0)
+             break;
+     }
+ 
+-    self->alive &= ~HEV_SOCKS5_SESSION_UDP_ALIVE_B;
+     hev_task_del_fd (task, fd);
+     close (fd);
++failed:
++    self->alive &= ~HEV_SOCKS5_SESSION_UDP_ALIVE_B;
++    hev_socks5_set_timeout (HEV_SOCKS5 (self), 0);
++    hev_task_wakeup (self->data.task);
+ }
+ 
+ static void
+@@ -286,26 +299,38 @@
+     HevTask *task = hev_task_self ();
+     int stack_size;
+     int fd;
++    unsigned int poll_events = POLLIN | POLLOUT;
+ 
+     LOG_D ("%p socks5 session udp splice", self);
+ 
+     self->alive = HEV_SOCKS5_SESSION_UDP_ALIVE_F |
+                   HEV_SOCKS5_SESSION_UDP_ALIVE_B;
+     fd = hev_socks5_udp_get_fd (HEV_SOCKS5_UDP (self));
+-    if (hev_task_mod_fd (task, fd, POLLOUT) < 0)
+-        hev_task_add_fd (task, fd, POLLOUT);
++    /* UDP-in-UDP retains its TCP association channel for EOF detection,
++     * but the completed handshake no longer needs TCP write readiness. */
++    if (HEV_SOCKS5 (self)->type == HEV_SOCKS5_TYPE_UDP_IN_UDP &&
++        hev_task_mod_fd (task, HEV_SOCKS5 (self)->fd, POLLIN) < 0)
++        return;
++    if (hev_ohos_update_interest (task, fd, &poll_events,
++                                  hev_list_first (&self->frame_list) ?
++                                      POLLOUT : 0) < 0)
++        return;
+ 
+     stack_size = hev_config_get_misc_task_stack_size ();
+     task = hev_task_new (stack_size);
++    if (!task)
++        return;
+     hev_task_ref (task);
+     hev_task_run (task, splice_task_entry, self);
+ 
+     for (;;) {
+-        if (hev_socks5_session_udp_fwd_f (self) < 0)
++        if (hev_socks5_session_udp_fwd_f (self, &poll_events) < 0)
+             break;
+     }
+ 
+     self->alive &= ~HEV_SOCKS5_SESSION_UDP_ALIVE_F;
++    /* Wake the reverse task through join; its next WAITIO must terminate. */
++    hev_socks5_set_timeout (HEV_SOCKS5 (self), 0);
+     hev_task_join (task);
+     hev_task_unref (task);
+ }

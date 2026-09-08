@@ -1,0 +1,14 @@
+HarmonyOS Network Connector
+Application name: Harmony VPN
+Copyright (C) 2026 liuchl1510-code
+
+Unless a file states otherwise, original code authored for this project is
+licensed under the GNU General Public License, version 3 or (at your option)
+any later version. See LICENSE for the complete license text.
+
+Third-party code, source patches, certificate data, and retained notices remain
+subject to their original licenses. This notice does not relicense third-party
+files. See THIRD_PARTY_NOTICES.md and the original notices under
+HarmonyVpnLab/native/ for component-specific terms and source provenance.
+
+This independent project is not an official v2rayNG or Huawei application.

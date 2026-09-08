@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "libXray": {
+    "repository": "https://github.com/XTLS/libXray.git",
+    "commit": "1a6c2baedcf102053c1117ea08b3510d6dada895",
+    "archiveName": "libxray-1a6c2ba.tar",
+    "archiveSHA256": "8aa2ae4cf6eb859182e83d2e511f7e464311be65820c8c4a5f2bb8615175c36a",
+    "goDirective": "1.26.3"
+  },
+  "xrayCore": {
+    "moduleVersion": "v1.260327.1-0.20260601021109-94ffd50060f1",
+    "commit": "94ffd50060f1cfd5d7482ec90a23a92bdefdff68",
+    "moduleSum": "h1:RAxvdTekSZCn1OO5P9d0ioDrdiiqdOsdqllxLvC+IGQ=",
+    "goModSum": "h1:klRI+zA2uG6qrelDRoUaEur3gasszRE9W8e2zTgqXNU=",
+    "reportedVersion": "26.6.1"
+  },
+  "goPort": {
+    "baseRepository": "https://gitcode.com/openharmony-sig/ohos_golang_go",
+    "baseCommit": "3cc00d9c2b8ac231a5432ececa784814cc1eb075",
+    "actualGoVersion": "go1.26.7",
+    "patchSHA256": "e0f0a63b6a0f28a61bdc6c7e019f7aa11b2e51afe296b198ec93a4097e5266d1",
+    "baseArchiveSHA256": "ca15b5bc7d4ff632bde0e9848a648f76aa7e561c8dc97c90626a82dceae7ad74"
+  },
+  "bootstrap": {
+    "version": "go1.24.6",
+    "url": "https://go.dev/dl/go1.24.6.windows-amd64.zip",
+    "sha256": "4fbc8af2cfca9e5059019b5150a426eb78e1e57718bf08f0e52b1c942a2782bf"
+  },
+  "abi": [
+    "CGoConnectionStats",
+    "CGoFree",
+    "CGoPing",
+    "CGoQueryStats",
+    "CGoRuntimeInfo",
+    "CGoRunXrayFromJSON",
+    "CGoSetSocketProtectCallback",
+    "CGoStopXray",
+    "CGoXrayVersion"
+  ],
+  "wrapperSHA256": "24e470ccee28434d47d8aa7d8708cb1bc1a7edd408ac9e169d07622a29496963",
+  "connectionStatsSHA256": "ca31b64ff6c59e745446f15295f24e50c6b5db5612f78857d0f02509bd0a1853",
+  "connectionStatsTestSHA256": "98ca46be449b8b5d919f7461885c9fa601ce7c208f0a8724b6b6f0a799f99174",
+  "verifiedArtifactSHA256": "0cfda2bd92a12cdbd5bcd9cf516ca17344023c93cb3a6659747af0ceecd974bc"
+}

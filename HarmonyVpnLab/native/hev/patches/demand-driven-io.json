@@ -1,0 +1,17 @@
+{
+  "name": "demand-driven-io",
+  "patchSHA256": "1019febd615fec80646d99bb8e261b5e0f8c6939e283fc444b7c14ef4e4d04a4",
+  "normalization": "UTF-8 without BOM, LF in the two staged C files only",
+  "files": [
+    {
+      "path": "src/hev-socks5-session-tcp.c",
+      "beforeSHA256": "3131f28b334a1d856ee4668e4ef65fa3613dd58cf6349b9e310c7071218a4b42",
+      "afterSHA256": "94a1fd4a61b407a7f9d013f445ca0ef37f509cf208da02f172649605b8412142"
+    },
+    {
+      "path": "src/hev-socks5-session-udp.c",
+      "beforeSHA256": "507d63f03e75198ec43710e57c79b23e1d16bce0b7b46e1fc388529b70cb46d1",
+      "afterSHA256": "64ab33f4041d4ea7986deb35d6406e478ef487dfeb9ef7f3f8d2e95edd8208b7"
+    }
+  ]
+}

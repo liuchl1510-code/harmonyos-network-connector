@@ -1,0 +1,22 @@
+--- a/transport/internet/system_dialer.go
++++ b/transport/internet/system_dialer.go
+@@ -71,8 +71,9 @@
+ 		lc.Control = func(network, address string, c syscall.RawConn) error {
+ 			for _, ctl := range d.controllers {
+ 				if err := ctl(network, address, c); err != nil {
+ 					errors.LogInfoInner(ctx, err, "failed to apply external controller")
++					return err
+ 				}
+ 			}
+ 			return c.Control(func(fd uintptr) {
+ 				if sockopt != nil {
+@@ -125,8 +126,9 @@
+ 		dialer.Control = func(network, address string, c syscall.RawConn) error {
+ 			for _, ctl := range d.controllers {
+ 				if err := ctl(network, address, c); err != nil {
+ 					errors.LogInfoInner(ctx, err, "failed to apply external controller")
++					return err
+ 				}
+ 			}
+ 			return c.Control(func(fd uintptr) {
+ 				if sockopt != nil {

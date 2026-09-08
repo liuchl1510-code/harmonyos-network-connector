@@ -1,0 +1,9 @@
+# Source, patch, CA and license inventories contain exact byte digests.
+# Preserve bytes across checkouts rather than rewriting line endings.
+* -text whitespace=blank-at-eol,-blank-at-eof,space-before-tab,cr-at-eol
+
+# Unified-diff context lines and verbatim upstream licenses may contain
+# intentional whitespace; validate patches with git apply and locked hashes.
+*.patch -whitespace
+LICENSE -whitespace
+HarmonyVpnLab/native/**/licenses/** -whitespace

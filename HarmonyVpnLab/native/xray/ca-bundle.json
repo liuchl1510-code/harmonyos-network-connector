@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "sourceUrl": "https://curl.se/ca/cacert.pem",
+  "resolvedUrl": "https://curl.se/ca/cacert.pem",
+  "sourceDescriptionUrl": "https://curl.se/docs/caextract.html",
+  "publishedSha256Url": "https://curl.se/ca/cacert.pem.sha256",
+  "downloadedAtUtc": "2026-09-07T12:28:11.085484+00:00",
+  "lastModified": "Thu, 13 Aug 2026 03:12:01 GMT",
+  "sha256": "f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9",
+  "officialSha256Matched": true,
+  "bytes": 188900,
+  "certificateCount": 121,
+  "license": "MPL-2.0",
+  "parser": "OpenSSL 3.5.7 9 Jun 2026",
+  "verification": {
+    "tlsCertificateVerificationEnabled": true,
+    "bundleParsed": true,
+    "everyCertificateParsedSeparately": true,
+    "certStoreStats": {
+      "x509": 121,
+      "crl": 0,
+      "x509_ca": 121
+    }
+  },
+  "trustScope": "Application-private SSL_CERT_FILE only; no phone system trust-store changes.",
+  "updatePolicy": "Bundled snapshot; no automatic update. Review source, SHA256 and certificate changes when updating the application.",
+  "limits": "PEM does not carry all Firefox external domain/name constraints; parsing does not prove real-node TLS interoperability."
+}

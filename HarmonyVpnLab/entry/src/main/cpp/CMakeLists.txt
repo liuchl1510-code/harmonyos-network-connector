@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.5.0)
+project(HarmonyVpnLab)
+enable_language(ASM)
+if(DEFINED PACKAGE_FIND_FILE)
+    include(${PACKAGE_FIND_FILE})
+endif()
+set(RUNTIME_SMOKE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../native/runtime-smoke")
+add_library(vpnbridge SHARED napi_init.cpp forward_bridge.cpp probe_socks.cpp poll_edge_probe.cpp socket_protect.cpp runtime_smoke_bridge.cpp
+    "${RUNTIME_SMOKE_DIR}/loader.c" "${RUNTIME_SMOKE_DIR}/checked_call.S")
+target_compile_definitions(vpnbridge PRIVATE HARMONY_SMOKE_EMBEDDED)
+add_library(hev_socks5 SHARED IMPORTED)
+set_target_properties(hev_socks5 PROPERTIES IMPORTED_LOCATION
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../libs/${OHOS_ARCH}/libhevsocks5tun.so")
+target_compile_features(vpnbridge PRIVATE cxx_std_17)
+target_compile_options(vpnbridge PRIVATE -Wall -Wextra)
+target_link_libraries(vpnbridge PUBLIC libace_napi.z.so hev_socks5)

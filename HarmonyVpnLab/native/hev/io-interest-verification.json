@@ -1,0 +1,230 @@
+{
+  "schemaVersion": 1,
+  "recordedAtUtc": "2026-09-08T09:07:01.314429+00:00",
+  "device": {
+    "model": "Huawei Pura 80 Ultra",
+    "osReportedByUser": "HarmonyOS 7.0",
+    "profileKernel": "HongMeng Kernel 1.13.0"
+  },
+  "artifact": {
+    "path": "entry/libs/arm64-v8a/libhevsocks5tun.so",
+    "sha256": "c774d64188cbef76b3dfb56db9792fc36ebbb68a8c38861236beddf1eb9d2875",
+    "patchPath": "native/hev/patches/demand-driven-io.patch",
+    "patchSHA256": "1019febd615fec80646d99bb8e261b5e0f8c6939e283fc444b7c14ef4e4d04a4",
+    "interestHelperSHA256": "fe7be0fe270735e00b743230b53dbc38aeac46dd881ef4b16990f313d1138010"
+  },
+  "profile": {
+    "path": "build/connection-tests/0.6.5-cpu-report.txt",
+    "sha256": "77c5fcd4a52a7a384e5d7993e012faa9e4156902605508f3f4170d3f4d2c5a54",
+    "hotThread": "harmony-hev",
+    "event": "hw-cpu-cycles",
+    "threadEventWeightPercentApprox": 99.5
+  },
+  "runs": [
+    {
+      "appVersion": "0.6.6",
+      "approxDurationSeconds": 18.5,
+      "evidence": "build/connection-tests/20260908-045221-Stop.log",
+      "evidenceSHA256": "2d22a01940039de59c763941791cb24656f0bd13ec4f82cbcd2c3e5801b0def6",
+      "io": {
+        "epollCalls": 2763011,
+        "timeoutZero": 2390052,
+        "timeoutPositive": 372956,
+        "timeoutNegative": 3,
+        "epollErrors": 0,
+        "epollZero": 84,
+        "epollReady": 2762927,
+        "epollLastErrno": 0,
+        "readCalls": 37,
+        "readEagain": 16,
+        "readZero": 0,
+        "readOtherErrors": 0
+      },
+      "hevExitCode": 0,
+      "edgeControl": null,
+      "dnsPolicyObserved": true,
+      "domainHttpsObserved": true,
+      "cleanupObserved": true
+    },
+    {
+      "appVersion": "0.6.7",
+      "approxDurationSeconds": 14.4,
+      "evidence": "build/connection-tests/20260908-045515-Stop.log",
+      "evidenceSHA256": "737628982e04fb97cb5bd5532b72fa5797c2e1b42530e7188303983f2b6318ce",
+      "io": {
+        "epollCalls": 1999236,
+        "timeoutZero": 1627030,
+        "timeoutPositive": 372200,
+        "timeoutNegative": 6,
+        "epollErrors": 0,
+        "epollZero": 66,
+        "epollReady": 1999170,
+        "epollLastErrno": 0,
+        "readCalls": 45,
+        "readEagain": 21,
+        "readZero": 0,
+        "readOtherErrors": 0,
+        "readyIn": 27,
+        "readyOut": 1999175,
+        "readyErr": 0,
+        "readyHup": 0,
+        "readyRdhup": 0
+      },
+      "hevExitCode": 0,
+      "edgeControl": null,
+      "dnsPolicyObserved": true,
+      "domainHttpsObserved": true,
+      "cleanupObserved": true
+    },
+    {
+      "appVersion": "0.6.8",
+      "approxDurationSeconds": 19.0,
+      "evidence": "build/connection-tests/20260908-050346-Stop.log",
+      "evidenceSHA256": "901ea48040763d79bbf07da97044e9aeb1723e45290dabf7844e68c745ff04f7",
+      "io": {
+        "epollCalls": 464,
+        "timeoutZero": 35,
+        "timeoutPositive": 427,
+        "timeoutNegative": 2,
+        "epollErrors": 0,
+        "epollZero": 92,
+        "epollReady": 372,
+        "epollLastErrno": 0,
+        "readCalls": 37,
+        "readEagain": 15,
+        "readZero": 0,
+        "readOtherErrors": 0,
+        "readyIn": 27,
+        "readyOut": 351,
+        "readyErr": 0,
+        "readyHup": 0,
+        "readyRdhup": 0
+      },
+      "hevExitCode": 0,
+      "edgeControl": {
+        "unixEt": {
+          "setupError": 0,
+          "counts": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "masks": [
+            4,
+            0,
+            0,
+            0
+          ],
+          "waitErrors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "emptyReadErrno": 11
+        },
+        "unixLt": {
+          "setupError": 0,
+          "counts": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "masks": [
+            4,
+            4,
+            4,
+            4
+          ],
+          "waitErrors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "emptyReadErrno": 11
+        },
+        "udpEt": {
+          "setupError": 0,
+          "counts": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "masks": [
+            4,
+            0,
+            0,
+            0
+          ],
+          "waitErrors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "emptyReadErrno": 11
+        },
+        "tcpEt": {
+          "setupError": 0,
+          "counts": [
+            1,
+            0,
+            1,
+            0
+          ],
+          "masks": [
+            4,
+            0,
+            4,
+            0
+          ],
+          "waitErrors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "emptyReadErrno": 11
+        }
+      },
+      "dnsPolicyObserved": true,
+      "domainHttpsObserved": true,
+      "cleanupObserved": true
+    }
+  ],
+  "postPatchScope": "Application-only run1788858208882: DNS A/AAAA policy, domain HTTPS and cleanup; no global or long-duration CPU claim in this report",
+  "supportedConclusion": "On this tested device, TCP empty recv returning EAGAIN is followed by another EPOLLOUT report. Combined with permanently subscribed OUT and Hev retries, this produces repeated task wakeups. Demand-driven subscriptions eliminated the measured readiness storm.",
+  "notClaimed": [
+    "EPOLLET is wholly unsupported",
+    "All HarmonyOS kernels have this behavior",
+    "epoll call reduction is a CPU percentage measurement",
+    "Throughput, power and long-duration performance are fully validated"
+  ],
+  "review": {
+    "status": "completed-with-no-blocking-findings",
+    "reviewer": "Independent node_import agent",
+    "mode": "read-only source and staged-source review; no production changes",
+    "patchSHA256": "1019febd615fec80646d99bb8e261b5e0f8c6939e283fc444b7c14ef4e4d04a4",
+    "helperSHA256": "fe7be0fe270735e00b743230b53dbc38aeac46dd881ef4b16990f313d1138010",
+    "checked": [
+      "Initial interest mask matches post-handshake registration",
+      "TCP capacity predicate matches ring-buffer writing predicate",
+      "Queue and ACK callbacks wake the task; no cooperative yield between mask decision and WAITIO",
+      "UDP reverse dup retains independent IN registration and TCP association retains IN plus EOF check",
+      "Reverse failure sets zero timeout and wakes forward task; forward exit sets zero timeout and joins reverse task; join wakes target until STOPPED",
+      "No source evidence requires blind MOD after new-dup ADD failure"
+    ],
+    "limits": "No syscall-failure injection or sustained full-buffer pressure tests; no new definite P1/P2 finding is not proof that every path is correct"
+  },
+  "uncoveredScenarios": [
+    "Forced ADD/MOD/DEL failures",
+    "TCP ring buffer fill and subsequent ACK capacity recovery",
+    "Mid-transfer TCP EOF with buffered unacked data",
+    "UDP-in-TCP branch",
+    "Long-duration throughput and battery"
+  ]
+}

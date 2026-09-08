@@ -1,0 +1,32 @@
+package xray
+
+import (
+	"errors"
+
+	"github.com/xtls/xray-core/features/stats"
+)
+
+// ConnectionStats contains only the current nodeProxy byte counters. It does
+// not enumerate users, targets or other core state, and never opens a socket.
+type ConnectionStats struct {
+	Uplink   int64 `json:"uplink"`
+	Downlink int64 `json:"downlink"`
+}
+
+// GetConnectionStats reads the current instance. The C ABI caller holds the
+// same lifecycle mutex as Run/Stop so coreServer cannot change during a read.
+func GetConnectionStats() (ConnectionStats, error) {
+	if coreServer == nil || !coreServer.IsRunning() {
+		return ConnectionStats{}, errors.New("connection core is not running")
+	}
+	manager, ok := coreServer.GetFeature(stats.ManagerType()).(stats.Manager)
+	if !ok || manager == nil {
+		return ConnectionStats{}, errors.New("connection statistics are unavailable")
+	}
+	uplink := manager.GetCounter("outbound>>>nodeProxy>>>traffic>>>uplink")
+	downlink := manager.GetCounter("outbound>>>nodeProxy>>>traffic>>>downlink")
+	if uplink == nil || downlink == nil {
+		return ConnectionStats{}, errors.New("connection counters are unavailable")
+	}
+	return ConnectionStats{Uplink: uplink.Value(), Downlink: downlink.Value()}, nil
+}

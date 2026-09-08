@@ -1,0 +1,3634 @@
+--- a/api/go1.22.txt
++++ b/api/go1.22.txt
+@@ -133,3 +133,5 @@
+ pkg syscall (linux-arm), type SysProcAttr struct, PidFD *int #51246
+ pkg syscall (linux-arm-cgo), type SysProcAttr struct, PidFD *int #51246
+ pkg testing/slogtest, func Run(*testing.T, func(*testing.T) slog.Handler, func(*testing.T) map[string]interface{}) #61758
++pkg runtime, const IsOpenharmony bool #gitee/IBFOQM
++pkg runtime, const IsOpenharmony = false #gitee/IBFOQM
+--- a/src/bootstrap.bash
++++ b/src/bootstrap.bash
+@@ -74,6 +74,13 @@
+ 	rm -rf "pkg/${gohostos}_${gohostarch}" "pkg/tool/${gohostos}_${gohostarch}"
+ fi
+ 
++if ! command -v binary-sign-tool >/dev/null 2>&1; then
++  echo "warning: binary-sign-tool not found, check your toolchain." >&2
++else
++  find pkg/tool/${goos}_${goarch} bin -type f -exec \
++  binary-sign-tool sign -inFile {} -outFile {} -selfSign "1" > /dev/null \;
++fi
++
+ rm -rf pkg/bootstrap pkg/obj .git
+ 
+ echo ----
+--- a/src/cmd/api/main_test.go
++++ b/src/cmd/api/main_test.go
+@@ -328,6 +328,8 @@
+ 			if !ok {
+ 				log.Printf("%s:%d: missing proposal approval\n", filename, i+1)
+ 				exitCode = 1
++			} else if strings.HasPrefix(approval, "gitee/") {
++				// OpenHarmony fork proposal identifiers are not decimal Go issue IDs.
+ 			} else {
+ 				_, err := strconv.Atoi(approval)
+ 				if err != nil {
+--- a/src/cmd/asm/internal/flags/flags.go
++++ b/src/cmd/asm/internal/flags/flags.go
+@@ -26,6 +26,7 @@
+ 	SymABIs    = flag.Bool("gensymabis", false, "write symbol ABI information to output file, don't assemble")
+ 	Importpath = flag.String("p", obj.UnlinkablePkg, "set expected package import to path")
+ 	Spectre    = flag.String("spectre", "", "enable spectre mitigations in `list` (all, ret)")
++	Tls        = flag.String("tls", "", "specifies tls model to use from `list` (LE, IE, GD)")
+ )
+ 
+ var DebugFlags struct {
+--- a/src/cmd/asm/main.go
++++ b/src/cmd/asm/main.go
+@@ -64,6 +64,19 @@
+ 		ctxt.Retpoline = true
+ 	}
+ 
++	switch *flags.Tls {
++	default:
++		log.Printf("unknown tls model requested: -tls=%s (expected GD, IE or LE)", *flags.Tls)
++		os.Exit(2)
++	case "":
++	case "GD", "IE", "LE":
++		if GOARCH != "arm64" {
++			log.Printf("explicit tls mode (-tls) is currently only supported for arm64")
++			os.Exit(2)
++		}
++		ctxt.Tls = *flags.Tls
++	}
++
+ 	ctxt.Bso = bufio.NewWriter(os.Stdout)
+ 	defer ctxt.Bso.Flush()
+ 
+--- a/src/cmd/cgo/internal/test/buildid_linux.go
++++ b/src/cmd/cgo/internal/test/buildid_linux.go
+@@ -31,6 +31,9 @@
+ 	for i, s := range f.Sections {
+ 		if s.Type != elf.SHT_NOTE {
+ 			continue
++		}
++		if s.Name == ".note.ohos.ident" {
++			continue // If the field is .note.ohos.ident, skip the field and do not parse it.
+ 		}
+ 
+ 		d, err := s.Data()
+--- a/src/cmd/cgo/internal/test/cgo_linux_test.go
++++ b/src/cmd/cgo/internal/test/cgo_linux_test.go
+@@ -22,6 +22,10 @@
+ 	if runtime.GOOS == "android" {
+ 		t.Skip("unsupported on Android")
+ 	}
++	// openharmony use musl libc and fixed in go1.23
++	if runtime.IsOpenharmony {
++		t.Skip("setgid is broken with musl libc - go.dev/issue/39857")
++	}
+ 	testSetgidStress(t)
+ }
+ 
+--- /dev/null
++++ b/src/cmd/cgo/internal/test/cgo_stubs_openharmony_test.go
+@@ -0,0 +1,12 @@
++// Copyright 2024 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build openharmony
++
++package cgotest
++
++import "testing"
++
++// Stubs for tests that fails to build on OpenHarmony
++func test6997(t *testing.T) {}
+--- a/src/cmd/cgo/internal/test/issue6997_linux.c
++++ b/src/cmd/cgo/internal/test/issue6997_linux.c
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !android
++//go:build !android && !openharmony
+ 
+ #include <pthread.h>
+ #include <stdio.h>
+--- a/src/cmd/cgo/internal/test/issue6997_linux.go
++++ b/src/cmd/cgo/internal/test/issue6997_linux.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !android
++//go:build !android && !openharmony
+ 
+ // Test that pthread_cancel works as expected
+ // (NPTL uses SIGRTMIN to implement thread cancellation)
+--- a/src/cmd/cgo/internal/testcarchive/carchive_test.go
++++ b/src/cmd/cgo/internal/testcarchive/carchive_test.go
+@@ -160,7 +160,7 @@
+ 			if GOARCH == "arm64" {
+ 				libbase += "_shared"
+ 			}
+-		case "dragonfly", "freebsd", "linux", "netbsd", "openbsd", "solaris", "illumos":
++		case "dragonfly", "freebsd", "linux", "netbsd", "openbsd", "openharmony", "solaris", "illumos":
+ 			libbase += "_shared"
+ 		}
+ 	}
+--- a/src/cmd/cgo/internal/testcshared/cshared_test.go
++++ b/src/cmd/cgo/internal/testcshared/cshared_test.go
+@@ -118,7 +118,7 @@
+ 		if GOARCH == "arm64" {
+ 			libgodir += "_shared"
+ 		}
+-	case "dragonfly", "freebsd", "linux", "netbsd", "openbsd", "solaris", "illumos":
++	case "dragonfly", "freebsd", "linux", "netbsd", "openbsd", "solaris", "illumos", "openharmony":
+ 		libgodir += "_shared"
+ 	}
+ 	cc = append(cc, "-I", filepath.Join("pkg", libgodir))
+@@ -651,7 +651,7 @@
+ 
+ func TestPIE(t *testing.T) {
+ 	switch GOOS {
+-	case "linux", "android":
++	case "linux", "android", "openharmony":
+ 		break
+ 	default:
+ 		t.Skipf("Skipping on %s", GOOS)
+--- a/src/cmd/cgo/internal/testshared/shared_test.go
++++ b/src/cmd/cgo/internal/testshared/shared_test.go
+@@ -414,6 +414,10 @@
+ 		if sect.Type != elf.SHT_NOTE {
+ 			continue
+ 		}
++		if sect.Name == ".note.ohos.ident" {
++			continue // If the field is .note.ohos.ident, skip the field and do not parse it.
++		}
++
+ 		r := sect.Open()
+ 		for {
+ 			var namesize, descsize, tag int32
+--- a/src/cmd/compile/internal/loopvar/loopvar_test.go
++++ b/src/cmd/compile/internal/loopvar/loopvar_test.go
+@@ -171,7 +171,7 @@
+ 	switch runtime.GOOS {
+ 	case "linux", "darwin":
+ 	default:
+-		t.Skipf("Slow test, usually avoid it, os=%s not linux or darwin", runtime.GOOS)
++		t.Skipf("Slow test, usually avoid it, os=%s not linux, openharmony or darwin", runtime.GOOS)
+ 	}
+ 	switch runtime.GOARCH {
+ 	case "amd64", "arm64":
+@@ -232,7 +232,7 @@
+ 	switch runtime.GOOS {
+ 	case "linux", "darwin":
+ 	default:
+-		t.Skipf("Slow test, usually avoid it, os=%s not linux or darwin", runtime.GOOS)
++		t.Skipf("Slow test, usually avoid it, os=%s not linux, openharmony or darwin", runtime.GOOS)
+ 	}
+ 	switch runtime.GOARCH {
+ 	case "amd64", "arm64":
+@@ -271,7 +271,7 @@
+ 	switch runtime.GOOS {
+ 	case "linux", "darwin":
+ 	default:
+-		t.Skipf("Slow test, usually avoid it, os=%s not linux or darwin", runtime.GOOS)
++		t.Skipf("Slow test, usually avoid it, os=%s not linux, openharmony or darwin", runtime.GOOS)
+ 	}
+ 	switch runtime.GOARCH {
+ 	case "amd64", "arm64":
+@@ -310,7 +310,7 @@
+ 	switch runtime.GOOS {
+ 	case "linux", "darwin":
+ 	default:
+-		t.Skipf("Slow test, usually avoid it, os=%s not linux or darwin", runtime.GOOS)
++		t.Skipf("Slow test, usually avoid it, os=%s not linux, openharmony or darwin", runtime.GOOS)
+ 	}
+ 	switch runtime.GOARCH {
+ 	case "amd64", "arm64":
+@@ -349,7 +349,7 @@
+ 	switch runtime.GOOS {
+ 	case "linux", "darwin":
+ 	default:
+-		t.Skipf("Slow test, usually avoid it, os=%s not linux or darwin", runtime.GOOS)
++		t.Skipf("Slow test, usually avoid it, os=%s not linux, openharmony or darwin", runtime.GOOS)
+ 	}
+ 	switch runtime.GOARCH {
+ 	case "amd64", "arm64":
+--- a/src/cmd/compile/internal/ssa/debug_lines_test.go
++++ b/src/cmd/compile/internal/ssa/debug_lines_test.go
+@@ -53,7 +53,7 @@
+ 
+ func unixOnly(t *testing.T) {
+ 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" { // in particular, it could be windows.
+-		t.Skip("this test depends on creating a file with a wonky name, only works for sure on Linux and Darwin")
++		t.Skip("this test depends on creating a file with a wonky name, only works for sure on Linux, openharmony and Darwin")
+ 	}
+ }
+ 
+--- a/src/cmd/compile/internal/ssa/fmahash_test.go
++++ b/src/cmd/compile/internal/ssa/fmahash_test.go
+@@ -20,7 +20,7 @@
+ 	switch runtime.GOOS {
+ 	case "linux", "darwin":
+ 	default:
+-		t.Skipf("Slow test, usually avoid it, os=%s not linux or darwin", runtime.GOOS)
++		t.Skipf("Slow test, usually avoid it, os=%s not linux, openharmony or darwin", runtime.GOOS)
+ 	}
+ 	switch runtime.GOARCH {
+ 	case "amd64", "arm64":
+--- a/src/cmd/dist/build.go
++++ b/src/cmd/dist/build.go
+@@ -99,6 +99,7 @@
+ 	"freebsd",
+ 	"nacl", // keep;
+ 	"netbsd",
++	"openharmony",
+ 	"openbsd",
+ 	"plan9",
+ 	"windows",
+@@ -322,8 +323,9 @@
+ // clangos lists the operating systems where we prefer clang to gcc.
+ var clangos = []string{
+ 	"darwin", "ios", // macOS 10.9 and later require clang
+-	"freebsd", // FreeBSD 10 and later do not ship gcc
+-	"openbsd", // OpenBSD ships with GCC 4.2, which is now quite old.
++	"freebsd",     // FreeBSD 10 and later do not ship gcc
++	"openbsd",     // OpenBSD ships with GCC 4.2, which is now quite old.
++	"openharmony", // openharmony default CC is clang.
+ }
+ 
+ // compilerEnvLookup returns the compiler settings for goos/goarch in map m.
+@@ -639,6 +641,8 @@
+ 			// set up by the dynamic linker, so internal cgo linking
+ 			// doesn't work. Test case is "go test runtime/cgo".
+ 			return true
++		case "openharmony":
++			return true
+ 		}
+ 	}
+ 
+@@ -1063,18 +1067,19 @@
+ // unixOS is the set of GOOS values matched by the "unix" build tag.
+ // This is the same list as in internal/syslist/syslist.go.
+ var unixOS = map[string]bool{
+-	"aix":       true,
+-	"android":   true,
+-	"darwin":    true,
+-	"dragonfly": true,
+-	"freebsd":   true,
+-	"hurd":      true,
+-	"illumos":   true,
+-	"ios":       true,
+-	"linux":     true,
+-	"netbsd":    true,
+-	"openbsd":   true,
+-	"solaris":   true,
++	"aix":         true,
++	"android":     true,
++	"darwin":      true,
++	"dragonfly":   true,
++	"freebsd":     true,
++	"hurd":        true,
++	"illumos":     true,
++	"ios":         true,
++	"linux":       true,
++	"openharmony": true,
++	"netbsd":      true,
++	"openbsd":     true,
++	"solaris":     true,
+ }
+ 
+ // matchtag reports whether the tag matches this build.
+@@ -1083,7 +1088,7 @@
+ 	case "gc", "cmd_go_bootstrap", "go1.1":
+ 		return true
+ 	case "linux":
+-		return goos == "linux" || goos == "android"
++		return goos == "linux" || goos == "android" || goos == "openharmony"
+ 	case "solaris":
+ 		return goos == "solaris" || goos == "illumos"
+ 	case "darwin":
+@@ -1801,6 +1806,7 @@
+ 	"netbsd/amd64":    true,
+ 	"netbsd/arm":      true,
+ 	"netbsd/arm64":    true,
++	"openharmony/arm64": true,
+ 	"openbsd/386":     true,
+ 	"openbsd/amd64":   true,
+ 	"openbsd/arm":     true,
+@@ -1829,14 +1835,15 @@
+ 
+ // List of platforms which are first class ports. See go.dev/issue/38874.
+ var firstClass = map[string]bool{
+-	"darwin/amd64":  true,
+-	"darwin/arm64":  true,
+-	"linux/386":     true,
+-	"linux/amd64":   true,
+-	"linux/arm":     true,
+-	"linux/arm64":   true,
+-	"windows/386":   true,
+-	"windows/amd64": true,
++	"darwin/amd64":      true,
++	"darwin/arm64":      true,
++	"linux/386":         true,
++	"linux/amd64":       true,
++	"linux/arm":         true,
++	"linux/arm64":       true,
++	"windows/386":       true,
++	"windows/amd64":     true,
++	"openharmony/arm64": true,
+ }
+ 
+ // We only need CC if cgo is forced on, or if the platform requires external linking.
+--- a/src/cmd/dist/test.go
++++ b/src/cmd/dist/test.go
+@@ -1200,6 +1200,9 @@
+ 	if goos == "android" {
+ 		return false
+ 	}
++	if goos == "openharmony" {
++		return false
++	}
+ 	if goos == "ios" {
+ 		return false
+ 	}
+@@ -1226,6 +1229,8 @@
+ 		return false
+ 	}
+ 	switch goos + "-" + goarch {
++	case "openharmony-arm64":
++		return true
+ 	case "darwin-amd64", "darwin-arm64",
+ 		"linux-amd64", "linux-arm64", "linux-loong64", "linux-ppc64le",
+ 		"android-arm64",
+@@ -1721,6 +1726,8 @@
+ 		return goarch == "amd64" || goarch == "arm64"
+ 	case "freebsd", "netbsd", "windows":
+ 		return goarch == "amd64"
++	case "openharmony":
++		return goarch == "arm64"
+ 	default:
+ 		return false
+ 	}
+@@ -1761,6 +1768,8 @@
+ 			}
+ 		case "freebsd":
+ 			return goarch == "amd64"
++		case "openharmony":
++			return goarch == "arm64"
+ 		}
+ 		return false
+ 
+@@ -1771,7 +1780,8 @@
+ 			"freebsd/amd64",
+ 			"darwin/amd64", "darwin/arm64",
+ 			"windows/amd64", "windows/386", "windows/arm64",
+-			"wasip1/wasm":
++			"wasip1/wasm",
++			"openharmony/arm64":
+ 			return true
+ 		}
+ 		return false
+@@ -1784,6 +1794,8 @@
+ 
+ 	case "pie":
+ 		switch platform {
++		case "openharmony/arm64":
++			return true
+ 		case "linux/386", "linux/amd64", "linux/arm", "linux/arm64", "linux/loong64", "linux/ppc64le", "linux/riscv64", "linux/s390x",
+ 			"android/amd64", "android/arm", "android/arm64", "android/386",
+ 			"freebsd/amd64",
+@@ -1798,6 +1810,8 @@
+ 
+ 	case "shared":
+ 		switch platform {
++		case "openharmony/arm64":
++			return true
+ 		case "linux/386", "linux/amd64", "linux/arm", "linux/arm64", "linux/ppc64le", "linux/s390x":
+ 			return true
+ 		}
+@@ -1805,6 +1819,8 @@
+ 
+ 	case "plugin":
+ 		switch platform {
++		case "openharmony/arm64":
++			return true
+ 		case "linux/amd64", "linux/arm", "linux/arm64", "linux/386", "linux/loong64", "linux/riscv64", "linux/s390x", "linux/ppc64le",
+ 			"android/amd64", "android/386",
+ 			"darwin/amd64", "darwin/arm64",
+--- a/src/cmd/distpack/test.go
++++ b/src/cmd/distpack/test.go
+@@ -55,14 +55,17 @@
+ 	{name: "go/src/cmd/dist/dist.exe", exclude: true},
+ 
+ 	{name: "go/bin/go", goos: "linux"},
++	{name: "go/bin/go", goos: "openharmony"},
+ 	{name: "go/bin/go", goos: "darwin"},
+ 	{name: "go/bin/go", goos: "windows", exclude: true},
+ 	{name: "go/bin/go.exe", goos: "windows"},
+ 	{name: "go/bin/gofmt", goos: "linux"},
++	{name: "go/bin/gofmt", goos: "openharmony"},
+ 	{name: "go/bin/gofmt", goos: "darwin"},
+ 	{name: "go/bin/gofmt", goos: "windows", exclude: true},
+ 	{name: "go/bin/gofmt.exe", goos: "windows"},
+ 	{name: "go/pkg/tool/*/compile", goos: "linux"},
++	{name: "go/pkg/tool/*/compile", goos: "openharmony"},
+ 	{name: "go/pkg/tool/*/compile", goos: "darwin"},
+ 	{name: "go/pkg/tool/*/compile", goos: "windows", exclude: true},
+ 	{name: "go/pkg/tool/*/compile.exe", goos: "windows"},
+@@ -91,14 +94,17 @@
+ 	{name: "golang.org/toolchain@*/src/cmd/dist/dist.exe", exclude: true},
+ 
+ 	{name: "golang.org/toolchain@*/bin/go", goos: "linux"},
++	{name: "golang.org/toolchain@*/bin/go", goos: "openharmony"},
+ 	{name: "golang.org/toolchain@*/bin/go", goos: "darwin"},
+ 	{name: "golang.org/toolchain@*/bin/go", goos: "windows", exclude: true},
+ 	{name: "golang.org/toolchain@*/bin/go.exe", goos: "windows"},
+ 	{name: "golang.org/toolchain@*/bin/gofmt", goos: "linux"},
++	{name: "golang.org/toolchain@*/bin/gofmt", goos: "openharmony"},
+ 	{name: "golang.org/toolchain@*/bin/gofmt", goos: "darwin"},
+ 	{name: "golang.org/toolchain@*/bin/gofmt", goos: "windows", exclude: true},
+ 	{name: "golang.org/toolchain@*/bin/gofmt.exe", goos: "windows"},
+ 	{name: "golang.org/toolchain@*/pkg/tool/*/compile", goos: "linux"},
++	{name: "golang.org/toolchain@*/pkg/tool/*/compile", goos: "openharmony"},
+ 	{name: "golang.org/toolchain@*/pkg/tool/*/compile", goos: "darwin"},
+ 	{name: "golang.org/toolchain@*/pkg/tool/*/compile", goos: "windows", exclude: true},
+ 	{name: "golang.org/toolchain@*/pkg/tool/*/compile.exe", goos: "windows"},
+--- a/src/cmd/go/go_test.go
++++ b/src/cmd/go/go_test.go
+@@ -63,6 +63,7 @@
+ var (
+ 	goHostOS, goHostArch string
+ 	cgoEnabled           string // raw value from 'go env CGO_ENABLED'
++	goos                 string
+ )
+ 
+ // netTestSem is a semaphore limiting the number of tests that may use the
+@@ -238,6 +239,10 @@
+ 		os.Setenv("TESTGO_GOHOSTARCH", goHostArch)
+ 
+ 		cgoEnabled = goEnv("CGO_ENABLED")
++		goos = runtime.GOOS
++		if runtime.IsOpenharmony {
++			goos = "openharmony"
++		}
+ 
+ 		// Duplicate the test executable into the path at testGo, for $PATH.
+ 		// If the OS supports symlinks, use them instead of copying bytes.
+--- a/src/cmd/go/internal/bug/bug.go
++++ b/src/cmd/go/internal/bug/bug.go
+@@ -124,8 +124,10 @@
+ 		printCmdOut(w, "", "sw_vers")
+ 	case "linux":
+ 		printCmdOut(w, "uname -sr: ", "uname", "-sr")
+-		printCmdOut(w, "", "lsb_release", "-a")
+-		printGlibcVersion(w)
++		if !runtime.IsOpenharmony {
++			printCmdOut(w, "", "lsb_release", "-a")
++			printGlibcVersion(w)
++		}
+ 	case "openbsd", "netbsd", "freebsd", "dragonfly":
+ 		printCmdOut(w, "uname -v: ", "uname", "-v")
+ 	case "illumos", "solaris":
+--- a/src/cmd/go/internal/cfg/cfg.go
++++ b/src/cmd/go/internal/cfg/cfg.go
+@@ -141,11 +141,15 @@
+ 	// Recreate that logic here with the new GOOS/GOARCH setting.
+ 	// We need to run steps 2 and 3 to determine what the default value
+ 	// of CgoEnabled would be for computing CGOChanged.
++	gohostos := runtime.GOOS
++	if runtime.IsOpenharmony {
++		gohostos = "openharmony"
++	}
+ 	defaultCgoEnabled := false
+ 	if buildcfg.DefaultCGO_ENABLED == "1" {
+ 		defaultCgoEnabled = true
+ 	} else if buildcfg.DefaultCGO_ENABLED == "0" {
+-	} else if runtime.GOARCH == ctxt.GOARCH && runtime.GOOS == ctxt.GOOS {
++	} else if runtime.GOARCH == ctxt.GOARCH && gohostos == ctxt.GOOS {
+ 		defaultCgoEnabled = platform.CgoSupported(ctxt.GOOS, ctxt.GOARCH)
+ 		// Use built-in default cgo setting for GOOS/GOARCH.
+ 		// Note that ctxt.GOOS/GOARCH are derived from the preference list
+@@ -264,7 +268,9 @@
+ 			installedGOARCH = testArch
+ 		}
+ 	}
+-
++	if runtime.IsOpenharmony {
++		installedGOOS = "openharmony"
++	}
+ 	if runtime.Compiler != "gccgo" {
+ 		if goroot == "" {
+ 			build.ToolDir = ""
+--- a/src/cmd/go/internal/envcmd/env.go
++++ b/src/cmd/go/internal/envcmd/env.go
+@@ -78,6 +78,10 @@
+ 
+ func MkEnv() []cfg.EnvVar {
+ 	envFile, envFileChanged, _ := cfg.EnvFile()
++	goos := runtime.GOOS
++	if runtime.IsOpenharmony {
++		goos = "openharmony"
++	}
+ 	env := []cfg.EnvVar{
+ 		// NOTE: Keep this list (and in general, all lists in source code) sorted by name.
+ 		{Name: "GO111MODULE", Value: cfg.Getenv("GO111MODULE")},
+@@ -100,7 +104,7 @@
+ 		{Name: "GOFIPS140", Value: cfg.GOFIPS140, Changed: cfg.GOFIPS140Changed},
+ 		{Name: "GOFLAGS", Value: cfg.Getenv("GOFLAGS")},
+ 		{Name: "GOHOSTARCH", Value: runtime.GOARCH},
+-		{Name: "GOHOSTOS", Value: runtime.GOOS},
++		{Name: "GOHOSTOS", Value: goos},
+ 		{Name: "GOINSECURE", Value: cfg.GOINSECURE},
+ 		{Name: "GOMODCACHE", Value: cfg.GOMODCACHE, Changed: cfg.GOMODCACHEChanged},
+ 		{Name: "GONOPROXY", Value: cfg.GONOPROXY, Changed: cfg.GONOPROXYChanged},
+--- a/src/cmd/go/internal/generate/generate_test.go
++++ b/src/cmd/go/internal/generate/generate_test.go
+@@ -27,13 +27,20 @@
+ 
+ const anyLineNo = 0
+ 
++func getGoos() string {
++	if runtime.IsOpenharmony {
++		return "openharmony"
++	}
++	return runtime.GOOS
++}
++
+ var splitTests = []splitTest{
+ 	{"", nil},
+ 	{"x", []string{"x"}},
+ 	{" a b\tc ", []string{"a", "b", "c"}},
+ 	{` " a " `, []string{" a "}},
+ 	{"$GOARCH", []string{runtime.GOARCH}},
+-	{"$GOOS", []string{runtime.GOOS}},
++	{"$GOOS", []string{getGoos()}},
+ 	{"$GOFILE", []string{"proc.go"}},
+ 	{"$GOPACKAGE", []string{"sys"}},
+ 	{"a $XXNOTDEFINEDXX b", []string{"a", "", "b"}},
+--- a/src/cmd/go/internal/imports/build.go
++++ b/src/cmd/go/internal/imports/build.go
+@@ -208,7 +208,7 @@
+ 
+ 	switch name {
+ 	case "linux":
+-		return tags["android"]
++		return tags["android"] || tags["openharmony"]
+ 	case "solaris":
+ 		return tags["illumos"]
+ 	case "darwin":
+--- a/src/cmd/go/internal/load/pkg.go
++++ b/src/cmd/go/internal/load/pkg.go
+@@ -1831,7 +1831,11 @@
+ 		}
+ 		elem := p.DefaultExecName() + cfg.ExeSuffix
+ 		full := filepath.Join(cfg.BuildContext.GOOS+"_"+cfg.BuildContext.GOARCH, elem)
+-		if cfg.BuildContext.GOOS != runtime.GOOS || cfg.BuildContext.GOARCH != runtime.GOARCH {
++		gohostos := runtime.GOOS
++		if runtime.IsOpenharmony {
++			gohostos = "openharmony"
++		}
++		if cfg.BuildContext.GOOS != gohostos || cfg.BuildContext.GOARCH != runtime.GOARCH {
+ 			// Install cross-compiled binaries to subdirectories of bin.
+ 			elem = full
+ 		}
+--- a/src/cmd/go/internal/modindex/build.go
++++ b/src/cmd/go/internal/modindex/build.go
+@@ -693,6 +693,9 @@
+ 	if ctxt.GOOS == "ios" && name == "darwin" {
+ 		return true
+ 	}
++	if ctxt.GOOS == "openharmony" && name == "linux" {
++		return true
++	}
+ 	if name == "unix" && syslist.UnixOS[ctxt.GOOS] {
+ 		return true
+ 	}
+--- a/src/cmd/go/internal/work/exec.go
++++ b/src/cmd/go/internal/work/exec.go
+@@ -990,7 +990,7 @@
+ 	// This is read by readGccgoArchive in cmd/internal/buildid/buildid.go.
+ 	if a.buildID != "" && cfg.BuildToolchainName == "gccgo" {
+ 		switch cfg.Goos {
+-		case "aix", "android", "dragonfly", "freebsd", "illumos", "linux", "netbsd", "openbsd", "solaris":
++		case "aix", "android", "dragonfly", "freebsd", "illumos", "linux", "netbsd", "openbsd", "solaris", "openharmony":
+ 			asmfile, err := b.gccgoBuildIDFile(a)
+ 			if err != nil {
+ 				return err
+@@ -3567,7 +3567,7 @@
+ // systems that normally use gold or the GNU linker.
+ func (b *Builder) disableBuildID(ldflags []string) []string {
+ 	switch cfg.Goos {
+-	case "android", "dragonfly", "linux", "netbsd":
++	case "android", "dragonfly", "linux", "netbsd", "openharmony":
+ 		ldflags = append(ldflags, "-Wl,--build-id=none")
+ 	}
+ 	return ldflags
+--- a/src/cmd/go/internal/work/gccgo.go
++++ b/src/cmd/go/internal/work/gccgo.go
+@@ -426,7 +426,7 @@
+ 		// On systems that normally use gold or the GNU linker,
+ 		// use the --build-id option to write a GNU build ID note.
+ 		switch cfg.Goos {
+-		case "android", "dragonfly", "linux", "netbsd":
++		case "android", "dragonfly", "linux", "netbsd", "openharmony":
+ 			ldflags = append(ldflags, fmt.Sprintf("-Wl,--build-id=0x%x", root.buildID))
+ 		}
+ 	}
+@@ -451,7 +451,7 @@
+ 	goLibBegin := str.StringList(wholeArchive, "-lgolibbegin", noWholeArchive)
+ 	switch buildmode {
+ 	case "exe":
+-		if usesCgo && cfg.Goos == "linux" {
++		if usesCgo && (cfg.Goos == "linux" || cfg.Goos == "openharmony") {
+ 			ldflags = append(ldflags, "-Wl,-E")
+ 		}
+ 
+--- a/src/cmd/go/internal/work/init.go
++++ b/src/cmd/go/internal/work/init.go
+@@ -215,6 +215,7 @@
+ func buildModeInit() {
+ 	gccgo := cfg.BuildToolchainName == "gccgo"
+ 	var codegenArg string
++	var tlsModel string
+ 
+ 	// Configure the build mode first, then verify that it is supported.
+ 	// That way, if the flag is completely bogus we will prefer to error out with
+@@ -235,11 +236,15 @@
+ 					codegenArg = "-shared"
+ 				}
+ 
+-			case "dragonfly", "freebsd", "illumos", "linux", "netbsd", "openbsd", "solaris":
++			case "dragonfly", "freebsd", "illumos", "linux", "netbsd", "openbsd", "solaris", "openharmony":
+ 				// Use -shared so that the result is
+ 				// suitable for inclusion in a PIE or
+ 				// shared library.
+ 				codegenArg = "-shared"
++				switch cfg.Goarch {
++				case "arm64":
++					tlsModel = "GD"
++				}
+ 			}
+ 		}
+ 		cfg.ExeSuffix = ".a"
+@@ -250,8 +255,12 @@
+ 			codegenArg = "-fPIC"
+ 		} else {
+ 			switch cfg.Goos {
+-			case "linux", "android", "freebsd":
++			case "linux", "android", "freebsd", "openharmony":
+ 				codegenArg = "-shared"
++				switch cfg.Goarch {
++				case "arm64":
++					tlsModel = "GD"
++				}
+ 			case "windows":
+ 				// Do not add usual .exe suffix to the .dll file.
+ 				cfg.ExeSuffix = ""
+@@ -346,6 +355,9 @@
+ 			}
+ 			cfg.BuildContext.InstallSuffix += codegenArg[1:]
+ 		}
++	}
++	if tlsModel != "" {
++		forcedAsmflags = append(forcedAsmflags, "-tls="+tlsModel, "-D=TLS_"+tlsModel)
+ 	}
+ 
+ 	switch cfg.BuildMod {
+--- a/src/cmd/go/script_test.go
++++ b/src/cmd/go/script_test.go
+@@ -231,7 +231,7 @@
+ 		"GODEBUG=" + os.Getenv("GODEBUG"),
+ 		"GOEXE=" + cfg.ExeSuffix,
+ 		"GOEXPERIMENT=" + os.Getenv("GOEXPERIMENT"),
+-		"GOOS=" + runtime.GOOS,
++		"GOOS=" + goos,
+ 		"TESTGO_GOHOSTOS=" + goHostOS,
+ 		"GOPROXY=" + proxyURL,
+ 		"GOPRIVATE=",
+@@ -271,7 +271,7 @@
+ 		// short mode.
+ 		env = append(env, "TESTGOVCSREMOTE=panic")
+ 	}
+-	if os.Getenv("CGO_ENABLED") != "" || runtime.GOOS != goHostOS || runtime.GOARCH != goHostArch {
++	if os.Getenv("CGO_ENABLED") != "" || goos != goHostOS || runtime.GOARCH != goHostArch {
+ 		// If the actual CGO_ENABLED might not match the cmd/go default, set it
+ 		// explicitly in the environment. Otherwise, leave it unset so that we also
+ 		// cover the default behaviors.
+--- a/src/cmd/go/testdata/script/bug.txt
++++ b/src/cmd/go/testdata/script/bug.txt
+@@ -1,6 +1,6 @@
+ # Verify that go bug creates the appropriate URL issue body
+ 
+-[!GOOS:linux] skip
++[!GOOS:linux] [!GOOS:openharmony] skip
+ [short] skip
+ 
+ go install
+--- a/src/cmd/go/testdata/script/build_gcflags.txt
++++ b/src/cmd/go/testdata/script/build_gcflags.txt
+@@ -4,7 +4,7 @@
+ 
+ [compiler:gccgo] skip  # gccgo does not use -gcflags
+ [!cgo] skip
+-[!GOOS:linux] skip  # test only works if c-archive implies -shared
++[!GOOS:linux] [!GOOS:openharmony] skip  # test only works if c-archive implies -shared
+ [short] skip
+ 
+ env GOCACHE=$WORK/gocache  # Looking for compile commands, so need a clean cache.
+--- a/src/cmd/go/testdata/script/cover_atomic_pkgall.txt
++++ b/src/cmd/go/testdata/script/cover_atomic_pkgall.txt
+@@ -1,3 +1,4 @@
++[GOOS:openharmony] skip '-race mode not supported in openharmony'
+ env GO111MODULE=off
+ 
+ [short] skip
+--- a/src/cmd/go/testdata/script/cover_build_simple.txt
++++ b/src/cmd/go/testdata/script/cover_build_simple.txt
+@@ -1,3 +1,4 @@
++[GOOS:openharmony] skip '-race mode not supported in openharmony'
+ # This test checks basic "go build -cover" functionality.
+ 
+ [short] skip
+--- a/src/cmd/go/testdata/script/cover_modes.txt
++++ b/src/cmd/go/testdata/script/cover_modes.txt
+@@ -1,3 +1,4 @@
++[GOOS:openharmony] skip '-race mode not supported in openharmony'
+ env GO111MODULE=off
+ 
+ # Coverage analysis should use 'set' mode by default,
+--- a/src/cmd/go/testdata/script/cover_pkgall_runtime.txt
++++ b/src/cmd/go/testdata/script/cover_pkgall_runtime.txt
+@@ -1,3 +1,4 @@
++[GOOS:openharmony] skip '-race mode not supported in openharmony'
+ env GO111MODULE=off
+ 
+ # Issue 23882
+--- a/src/cmd/go/testdata/script/cover_sync_atomic_import.txt
++++ b/src/cmd/go/testdata/script/cover_sync_atomic_import.txt
+@@ -1,3 +1,4 @@
++[GOOS:openharmony] skip '-race mode not supported in openharmony'
+ [short] skip
+ [compiler:gccgo] skip # gccgo has no cover tool
+ 
+--- a/src/cmd/go/testdata/script/cover_test_race_issue56370.txt
++++ b/src/cmd/go/testdata/script/cover_test_race_issue56370.txt
+@@ -1,3 +1,4 @@
++[GOOS:openharmony] skip '-race mode not supported in openharmony'
+ [short] skip
+ [!race] skip
+ 
+--- a/src/cmd/go/testdata/script/gotoolchain_net.txt
++++ b/src/cmd/go/testdata/script/gotoolchain_net.txt
+@@ -1,3 +1,4 @@
++[GOOS:openharmony] skip 'downloading go tool chain from net not supported in openharmony'
+ # This test only checks that basic network lookups work.
+ # The full test of toolchain version selection is in gotoolchain.txt.
+ 
+--- a/src/cmd/go/testdata/script/test_empty.txt
++++ b/src/cmd/go/testdata/script/test_empty.txt
+@@ -1,3 +1,4 @@
++[GOOS:openharmony] skip '-race mode not supported in openharmony'
+ [!race] skip
+ 
+ cd $GOPATH/src/empty/pkg
+--- a/src/cmd/go/testdata/script/test_race.txt
++++ b/src/cmd/go/testdata/script/test_race.txt
+@@ -1,3 +1,4 @@
++[GOOS:openharmony] skip '-race mode not supported in openharmony'
+ [short] skip
+ [!race] skip
+ 
+--- a/src/cmd/go/testdata/script/testing_issue40908.txt
++++ b/src/cmd/go/testdata/script/testing_issue40908.txt
+@@ -1,3 +1,4 @@
++[GOOS:openharmony] skip '-race mode not supported in openharmony'
+ [short] skip
+ [!race] skip
+ 
+--- a/src/cmd/internal/bootstrap_test/reboot_test.go
++++ b/src/cmd/internal/bootstrap_test/reboot_test.go
+@@ -24,6 +24,10 @@
+ 		t.Skip("skipping test that rebuilds the entire toolchain")
+ 	}
+ 	switch runtime.GOOS {
++	case "linux":
++		if runtime.IsOpenharmony {
++			t.Skipf("skipping because the toolchain does not have to bootstrap on openharmony")
++		}
+ 	case "android", "ios", "js", "wasip1":
+ 		t.Skipf("skipping because the toolchain does not have to bootstrap on GOOS=%s", runtime.GOOS)
+ 	}
+--- a/src/cmd/internal/buildid/note.go
++++ b/src/cmd/internal/buildid/note.go
+@@ -36,6 +36,10 @@
+ 		if sect.Type != elf.SHT_NOTE {
+ 			continue
+ 		}
++		if sect.Name == ".note.ohos.ident" {
++			continue // If the field is .note.ohos.ident, skip the field and do not parse it.
++		}
++
+ 		r := sect.Open()
+ 		for {
+ 			var namesize, descsize, noteType int32
+--- a/src/cmd/internal/obj/arm64/a.out.go
++++ b/src/cmd/internal/obj/arm64/a.out.go
+@@ -472,6 +472,11 @@
+ 	// by the program linker) that the dynamic linker will fill with the
+ 	// offset from the thread local base.
+ 	C_TLS_IE
++
++	// TLS "var" in general dynamic mode: does not assume that module number
++	// or variable offset is known at link time, will be lowered to instructions
++	// sequence ending with a call which the dynamic linker will fix up.
++	C_TLS_GD
+ 
+ 	C_ROFF // register offset (including register extended)
+ 
+--- a/src/cmd/internal/obj/arm64/asm7.go
++++ b/src/cmd/internal/obj/arm64/asm7.go
+@@ -480,6 +480,7 @@
+ 	{AMOVD, C_GOTADDR, C_NONE, C_NONE, C_ZREG, C_NONE, 71, 8, 0, 0, 0},
+ 	{AMOVD, C_TLS_LE, C_NONE, C_NONE, C_ZREG, C_NONE, 69, 4, 0, 0, 0},
+ 	{AMOVD, C_TLS_IE, C_NONE, C_NONE, C_ZREG, C_NONE, 70, 8, 0, 0, 0},
++	{AMOVD, C_TLS_GD, C_NONE, C_NONE, C_ZREG, C_NONE, 109, 16, 0, 0, 0},
+ 
+ 	{AFMOVS, C_FREG, C_NONE, C_NONE, C_ADDR, C_NONE, 64, 12, 0, 0, 0},
+ 	{AFMOVS, C_ADDR, C_NONE, C_NONE, C_FREG, C_NONE, 65, 12, 0, 0, 0},
+@@ -2088,10 +2089,22 @@
+ 			c.instoffset = a.Offset
+ 			if a.Sym != nil { // use relocation
+ 				if a.Sym.Type == objabi.STLSBSS {
+-					if c.ctxt.Flag_shared {
++					switch c.ctxt.Tls {
++					default:
++						c.ctxt.Diag("%v: unknown tls model requested: %s (expected GD, IE or LE)", a, c.ctxt.Tls)
++						fallthrough
++					case "":
++						if c.ctxt.Flag_shared {
++							return C_TLS_IE
++						} else {
++							return C_TLS_LE
++						}
++					case "IE":
+ 						return C_TLS_IE
+-					} else {
++					case "LE":
+ 						return C_TLS_LE
++					case "GD":
++						return C_TLS_GD
+ 					}
+ 				}
+ 				return C_ADDR
+@@ -4677,6 +4690,25 @@
+ 		})
+ 		if p.From.Offset != 0 {
+ 			c.ctxt.Diag("invalid offset on MOVW $tlsvar")
++		}
++
++	case 109: /* GD model movd $tlsvar, reg -> adrp reg, #0; ldr REGTMP, [reg, #0]; add reg, reg, #0; blr REGTMP + relocs */
++		o1 = ADR(1, 0, uint32(p.To.Reg))
++		o2 = c.olsr12u(p, c.opldr(p, AMOVD), 0, p.To.Reg, REGTMP)
++		o3 = c.opirr(p, AADD)
++		o4 = c.opbrr(p, ABL)
++		o4 |= uint32((REGTMP)&31) << 5
++		c.cursym.AddRel(c.ctxt, obj.Reloc{
++			Type: objabi.R_ARM64_TLS_GD,
++			Off:  int32(c.pc),
++			Siz:  8,
++			Sym:  p.From.Sym,
++		})
++		if p.From.Offset != 0 {
++			c.ctxt.Diag("invalid offset on MOVW $tlsvar")
++		}
++		if p.To.Reg != REG_R0 {
++			c.ctxt.Diag("expected R0 output on MOVW $tlsvar")
+ 		}
+ 
+ 	case 71: /* movd sym@GOT, reg -> adrp REGTMP, #0; ldr reg, [REGTMP, #0] + relocs */
+--- a/src/cmd/internal/obj/link.go
++++ b/src/cmd/internal/obj/link.go
+@@ -1168,6 +1168,7 @@
+ 	Retpoline            bool   // emit use of retpoline stubs for indirect jmp/call
+ 	Flag_maymorestack    string // If not "", call this function before stack checks
+ 	Bso                  *bufio.Writer
++	Tls                  string // Explicit arm64 TLS model: LE, IE or GD.
+ 	Pathname             string
+ 	Pkgpath              string           // the current package's import path
+ 	hashmu               sync.Mutex       // protects hash, funchash
+--- a/src/cmd/internal/objabi/head.go
++++ b/src/cmd/internal/objabi/head.go
+@@ -63,7 +63,7 @@
+ 		*h = Hfreebsd
+ 	case "js":
+ 		*h = Hjs
+-	case "linux", "android":
++	case "linux", "android", "openharmony":
+ 		*h = Hlinux
+ 	case "netbsd":
+ 		*h = Hnetbsd
+--- a/src/cmd/internal/objabi/reloctype.go
++++ b/src/cmd/internal/objabi/reloctype.go
+@@ -137,6 +137,14 @@
+ 	// referenced (thread local) symbol from the GOT.
+ 	R_ARM64_TLS_IE
+ 
++	// Relocates an ADRP; LD64; ADD; BLR instruction sequence:
++	// - ADRP gets part of the address of the GOT entry for thread-local variable
++	// - LD64 loads the stub address from the GOT entry
++	// - ADD is part of address calculation for the GOT entry to pass as argument
++	// - BLR calls the stub passing the calculated address.
++	// The stub returns the variable offset from the thread pointer in R0.
++	R_ARM64_TLS_GD
++
+ 	// R_ARM64_GOTPCREL relocates an adrp, ld64 pair to compute the address of the GOT
+ 	// slot of the referenced symbol.
+ 	R_ARM64_GOTPCREL
+--- a/src/cmd/internal/objabi/reloctype_string.go
++++ b/src/cmd/internal/objabi/reloctype_string.go
+@@ -1,4 +1,4 @@
+-// Code generated by "stringer -type=RelocType"; DO NOT EDIT.
++// Code generated by "stringer -type=RelocType -output reloctype_string.go reloctype.go"; DO NOT EDIT.
+ 
+ package objabi
+ 
+@@ -41,81 +41,82 @@
+ 	_ = x[R_DWARFSECREF-31]
+ 	_ = x[R_ARM64_TLS_LE-32]
+ 	_ = x[R_ARM64_TLS_IE-33]
+-	_ = x[R_ARM64_GOTPCREL-34]
+-	_ = x[R_ARM64_GOT-35]
+-	_ = x[R_ARM64_PCREL-36]
+-	_ = x[R_ARM64_PCREL_LDST8-37]
+-	_ = x[R_ARM64_PCREL_LDST16-38]
+-	_ = x[R_ARM64_PCREL_LDST32-39]
+-	_ = x[R_ARM64_PCREL_LDST64-40]
+-	_ = x[R_ARM64_LDST8-41]
+-	_ = x[R_ARM64_LDST16-42]
+-	_ = x[R_ARM64_LDST32-43]
+-	_ = x[R_ARM64_LDST64-44]
+-	_ = x[R_ARM64_LDST128-45]
+-	_ = x[R_POWER_TLS_LE-46]
+-	_ = x[R_POWER_TLS_IE-47]
+-	_ = x[R_POWER_TLS-48]
+-	_ = x[R_POWER_TLS_IE_PCREL34-49]
+-	_ = x[R_POWER_TLS_LE_TPREL34-50]
+-	_ = x[R_ADDRPOWER_DS-51]
+-	_ = x[R_ADDRPOWER_GOT-52]
+-	_ = x[R_ADDRPOWER_GOT_PCREL34-53]
+-	_ = x[R_ADDRPOWER_PCREL-54]
+-	_ = x[R_ADDRPOWER_TOCREL-55]
+-	_ = x[R_ADDRPOWER_TOCREL_DS-56]
+-	_ = x[R_ADDRPOWER_D34-57]
+-	_ = x[R_ADDRPOWER_PCREL34-58]
+-	_ = x[R_RISCV_JAL-59]
+-	_ = x[R_RISCV_JAL_TRAMP-60]
+-	_ = x[R_RISCV_CALL-61]
+-	_ = x[R_RISCV_PCREL_ITYPE-62]
+-	_ = x[R_RISCV_PCREL_STYPE-63]
+-	_ = x[R_RISCV_TLS_IE-64]
+-	_ = x[R_RISCV_TLS_LE-65]
+-	_ = x[R_RISCV_GOT_HI20-66]
+-	_ = x[R_RISCV_GOT_PCREL_ITYPE-67]
+-	_ = x[R_RISCV_PCREL_HI20-68]
+-	_ = x[R_RISCV_PCREL_LO12_I-69]
+-	_ = x[R_RISCV_PCREL_LO12_S-70]
+-	_ = x[R_RISCV_BRANCH-71]
+-	_ = x[R_RISCV_ADD32-72]
+-	_ = x[R_RISCV_SUB32-73]
+-	_ = x[R_RISCV_RVC_BRANCH-74]
+-	_ = x[R_RISCV_RVC_JUMP-75]
+-	_ = x[R_PCRELDBL-76]
+-	_ = x[R_LOONG64_ADDR_HI-77]
+-	_ = x[R_LOONG64_ADDR_LO-78]
+-	_ = x[R_LOONG64_ADDR_PCREL20_S2-79]
+-	_ = x[R_LOONG64_TLS_LE_HI-80]
+-	_ = x[R_LOONG64_TLS_LE_LO-81]
+-	_ = x[R_CALLLOONG64-82]
+-	_ = x[R_LOONG64_CALL36-83]
+-	_ = x[R_LOONG64_TLS_IE_HI-84]
+-	_ = x[R_LOONG64_TLS_IE_LO-85]
+-	_ = x[R_LOONG64_GOT_HI-86]
+-	_ = x[R_LOONG64_GOT_LO-87]
+-	_ = x[R_LOONG64_ADD64-88]
+-	_ = x[R_LOONG64_SUB64-89]
+-	_ = x[R_JMP16LOONG64-90]
+-	_ = x[R_JMP21LOONG64-91]
+-	_ = x[R_JMPLOONG64-92]
+-	_ = x[R_ADDRMIPSU-93]
+-	_ = x[R_ADDRMIPSTLS-94]
+-	_ = x[R_ADDRCUOFF-95]
+-	_ = x[R_WASMIMPORT-96]
+-	_ = x[R_XCOFFREF-97]
+-	_ = x[R_PEIMAGEOFF-98]
+-	_ = x[R_INITORDER-99]
+-	_ = x[R_DWTXTADDR_U1-100]
+-	_ = x[R_DWTXTADDR_U2-101]
+-	_ = x[R_DWTXTADDR_U3-102]
+-	_ = x[R_DWTXTADDR_U4-103]
++	_ = x[R_ARM64_TLS_GD-34]
++	_ = x[R_ARM64_GOTPCREL-35]
++	_ = x[R_ARM64_GOT-36]
++	_ = x[R_ARM64_PCREL-37]
++	_ = x[R_ARM64_PCREL_LDST8-38]
++	_ = x[R_ARM64_PCREL_LDST16-39]
++	_ = x[R_ARM64_PCREL_LDST32-40]
++	_ = x[R_ARM64_PCREL_LDST64-41]
++	_ = x[R_ARM64_LDST8-42]
++	_ = x[R_ARM64_LDST16-43]
++	_ = x[R_ARM64_LDST32-44]
++	_ = x[R_ARM64_LDST64-45]
++	_ = x[R_ARM64_LDST128-46]
++	_ = x[R_POWER_TLS_LE-47]
++	_ = x[R_POWER_TLS_IE-48]
++	_ = x[R_POWER_TLS-49]
++	_ = x[R_POWER_TLS_IE_PCREL34-50]
++	_ = x[R_POWER_TLS_LE_TPREL34-51]
++	_ = x[R_ADDRPOWER_DS-52]
++	_ = x[R_ADDRPOWER_GOT-53]
++	_ = x[R_ADDRPOWER_GOT_PCREL34-54]
++	_ = x[R_ADDRPOWER_PCREL-55]
++	_ = x[R_ADDRPOWER_TOCREL-56]
++	_ = x[R_ADDRPOWER_TOCREL_DS-57]
++	_ = x[R_ADDRPOWER_D34-58]
++	_ = x[R_ADDRPOWER_PCREL34-59]
++	_ = x[R_RISCV_JAL-60]
++	_ = x[R_RISCV_JAL_TRAMP-61]
++	_ = x[R_RISCV_CALL-62]
++	_ = x[R_RISCV_PCREL_ITYPE-63]
++	_ = x[R_RISCV_PCREL_STYPE-64]
++	_ = x[R_RISCV_TLS_IE-65]
++	_ = x[R_RISCV_TLS_LE-66]
++	_ = x[R_RISCV_GOT_HI20-67]
++	_ = x[R_RISCV_GOT_PCREL_ITYPE-68]
++	_ = x[R_RISCV_PCREL_HI20-69]
++	_ = x[R_RISCV_PCREL_LO12_I-70]
++	_ = x[R_RISCV_PCREL_LO12_S-71]
++	_ = x[R_RISCV_BRANCH-72]
++	_ = x[R_RISCV_ADD32-73]
++	_ = x[R_RISCV_SUB32-74]
++	_ = x[R_RISCV_RVC_BRANCH-75]
++	_ = x[R_RISCV_RVC_JUMP-76]
++	_ = x[R_PCRELDBL-77]
++	_ = x[R_LOONG64_ADDR_HI-78]
++	_ = x[R_LOONG64_ADDR_LO-79]
++	_ = x[R_LOONG64_ADDR_PCREL20_S2-80]
++	_ = x[R_LOONG64_TLS_LE_HI-81]
++	_ = x[R_LOONG64_TLS_LE_LO-82]
++	_ = x[R_CALLLOONG64-83]
++	_ = x[R_LOONG64_CALL36-84]
++	_ = x[R_LOONG64_TLS_IE_HI-85]
++	_ = x[R_LOONG64_TLS_IE_LO-86]
++	_ = x[R_LOONG64_GOT_HI-87]
++	_ = x[R_LOONG64_GOT_LO-88]
++	_ = x[R_LOONG64_ADD64-89]
++	_ = x[R_LOONG64_SUB64-90]
++	_ = x[R_JMP16LOONG64-91]
++	_ = x[R_JMP21LOONG64-92]
++	_ = x[R_JMPLOONG64-93]
++	_ = x[R_ADDRMIPSU-94]
++	_ = x[R_ADDRMIPSTLS-95]
++	_ = x[R_ADDRCUOFF-96]
++	_ = x[R_WASMIMPORT-97]
++	_ = x[R_XCOFFREF-98]
++	_ = x[R_PEIMAGEOFF-99]
++	_ = x[R_INITORDER-100]
++	_ = x[R_DWTXTADDR_U1-101]
++	_ = x[R_DWTXTADDR_U2-102]
++	_ = x[R_DWTXTADDR_U3-103]
++	_ = x[R_DWTXTADDR_U4-104]
+ }
+ 
+-const _RelocType_name = "R_ADDRR_ADDRPOWERR_ADDRARM64R_ADDRMIPSR_ADDROFFR_SIZER_CALLR_CALLARMR_CALLARM64R_CALLINDR_CALLPOWERR_CALLMIPSR_CONSTR_PCRELR_TLS_LER_TLS_IER_GOTOFFR_PLT0R_PLT1R_PLT2R_USEFIELDR_USETYPER_USEIFACER_USEIFACEMETHODR_USENAMEDMETHODR_METHODOFFR_KEEPR_POWER_TOCR_GOTPCRELR_JMPMIPSR_DWARFSECREFR_ARM64_TLS_LER_ARM64_TLS_IER_ARM64_GOTPCRELR_ARM64_GOTR_ARM64_PCRELR_ARM64_PCREL_LDST8R_ARM64_PCREL_LDST16R_ARM64_PCREL_LDST32R_ARM64_PCREL_LDST64R_ARM64_LDST8R_ARM64_LDST16R_ARM64_LDST32R_ARM64_LDST64R_ARM64_LDST128R_POWER_TLS_LER_POWER_TLS_IER_POWER_TLSR_POWER_TLS_IE_PCREL34R_POWER_TLS_LE_TPREL34R_ADDRPOWER_DSR_ADDRPOWER_GOTR_ADDRPOWER_GOT_PCREL34R_ADDRPOWER_PCRELR_ADDRPOWER_TOCRELR_ADDRPOWER_TOCREL_DSR_ADDRPOWER_D34R_ADDRPOWER_PCREL34R_RISCV_JALR_RISCV_JAL_TRAMPR_RISCV_CALLR_RISCV_PCREL_ITYPER_RISCV_PCREL_STYPER_RISCV_TLS_IER_RISCV_TLS_LER_RISCV_GOT_HI20R_RISCV_GOT_PCREL_ITYPER_RISCV_PCREL_HI20R_RISCV_PCREL_LO12_IR_RISCV_PCREL_LO12_SR_RISCV_BRANCHR_RISCV_ADD32R_RISCV_SUB32R_RISCV_RVC_BRANCHR_RISCV_RVC_JUMPR_PCRELDBLR_LOONG64_ADDR_HIR_LOONG64_ADDR_LOR_LOONG64_ADDR_PCREL20_S2R_LOONG64_TLS_LE_HIR_LOONG64_TLS_LE_LOR_CALLLOONG64R_LOONG64_CALL36R_LOONG64_TLS_IE_HIR_LOONG64_TLS_IE_LOR_LOONG64_GOT_HIR_LOONG64_GOT_LOR_LOONG64_ADD64R_LOONG64_SUB64R_JMP16LOONG64R_JMP21LOONG64R_JMPLOONG64R_ADDRMIPSUR_ADDRMIPSTLSR_ADDRCUOFFR_WASMIMPORTR_XCOFFREFR_PEIMAGEOFFR_INITORDERR_DWTXTADDR_U1R_DWTXTADDR_U2R_DWTXTADDR_U3R_DWTXTADDR_U4"
++const _RelocType_name = "R_ADDRR_ADDRPOWERR_ADDRARM64R_ADDRMIPSR_ADDROFFR_SIZER_CALLR_CALLARMR_CALLARM64R_CALLINDR_CALLPOWERR_CALLMIPSR_CONSTR_PCRELR_TLS_LER_TLS_IER_GOTOFFR_PLT0R_PLT1R_PLT2R_USEFIELDR_USETYPER_USEIFACER_USEIFACEMETHODR_USENAMEDMETHODR_METHODOFFR_KEEPR_POWER_TOCR_GOTPCRELR_JMPMIPSR_DWARFSECREFR_ARM64_TLS_LER_ARM64_TLS_IER_ARM64_TLS_GDR_ARM64_GOTPCRELR_ARM64_GOTR_ARM64_PCRELR_ARM64_PCREL_LDST8R_ARM64_PCREL_LDST16R_ARM64_PCREL_LDST32R_ARM64_PCREL_LDST64R_ARM64_LDST8R_ARM64_LDST16R_ARM64_LDST32R_ARM64_LDST64R_ARM64_LDST128R_POWER_TLS_LER_POWER_TLS_IER_POWER_TLSR_POWER_TLS_IE_PCREL34R_POWER_TLS_LE_TPREL34R_ADDRPOWER_DSR_ADDRPOWER_GOTR_ADDRPOWER_GOT_PCREL34R_ADDRPOWER_PCRELR_ADDRPOWER_TOCRELR_ADDRPOWER_TOCREL_DSR_ADDRPOWER_D34R_ADDRPOWER_PCREL34R_RISCV_JALR_RISCV_JAL_TRAMPR_RISCV_CALLR_RISCV_PCREL_ITYPER_RISCV_PCREL_STYPER_RISCV_TLS_IER_RISCV_TLS_LER_RISCV_GOT_HI20R_RISCV_GOT_PCREL_ITYPER_RISCV_PCREL_HI20R_RISCV_PCREL_LO12_IR_RISCV_PCREL_LO12_SR_RISCV_BRANCHR_RISCV_ADD32R_RISCV_SUB32R_RISCV_RVC_BRANCHR_RISCV_RVC_JUMPR_PCRELDBLR_LOONG64_ADDR_HIR_LOONG64_ADDR_LOR_LOONG64_ADDR_PCREL20_S2R_LOONG64_TLS_LE_HIR_LOONG64_TLS_LE_LOR_CALLLOONG64R_LOONG64_CALL36R_LOONG64_TLS_IE_HIR_LOONG64_TLS_IE_LOR_LOONG64_GOT_HIR_LOONG64_GOT_LOR_LOONG64_ADD64R_LOONG64_SUB64R_JMP16LOONG64R_JMP21LOONG64R_JMPLOONG64R_ADDRMIPSUR_ADDRMIPSTLSR_ADDRCUOFFR_WASMIMPORTR_XCOFFREFR_PEIMAGEOFFR_INITORDERR_DWTXTADDR_U1R_DWTXTADDR_U2R_DWTXTADDR_U3R_DWTXTADDR_U4"
+ 
+-var _RelocType_index = [...]uint16{0, 6, 17, 28, 38, 47, 53, 59, 68, 79, 88, 99, 109, 116, 123, 131, 139, 147, 153, 159, 165, 175, 184, 194, 210, 226, 237, 243, 254, 264, 273, 286, 300, 314, 330, 341, 354, 373, 393, 413, 433, 446, 460, 474, 488, 503, 517, 531, 542, 564, 586, 600, 615, 638, 655, 673, 694, 709, 728, 739, 756, 768, 787, 806, 820, 834, 850, 873, 891, 911, 931, 945, 958, 971, 989, 1005, 1015, 1032, 1049, 1074, 1093, 1112, 1125, 1141, 1160, 1179, 1195, 1211, 1226, 1241, 1255, 1269, 1281, 1292, 1305, 1316, 1328, 1338, 1350, 1361, 1375, 1389, 1403, 1417}
++var _RelocType_index = [...]uint16{0, 6, 17, 28, 38, 47, 53, 59, 68, 79, 88, 99, 109, 116, 123, 131, 139, 147, 153, 159, 165, 175, 184, 194, 210, 226, 237, 243, 254, 264, 273, 286, 300, 314, 328, 344, 355, 368, 387, 407, 427, 447, 460, 474, 488, 502, 517, 531, 545, 556, 578, 600, 614, 629, 652, 669, 687, 708, 723, 742, 753, 770, 782, 801, 820, 834, 848, 864, 887, 905, 925, 945, 959, 972, 985, 1003, 1019, 1029, 1046, 1063, 1088, 1107, 1126, 1139, 1155, 1174, 1193, 1209, 1225, 1240, 1255, 1269, 1283, 1295, 1306, 1319, 1330, 1342, 1352, 1364, 1375, 1389, 1403, 1417, 1431}
+ 
+ func (i RelocType) String() string {
+ 	i -= 1
+--- a/src/cmd/internal/script/conds.go
++++ b/src/cmd/internal/script/conds.go
+@@ -23,6 +23,9 @@
+ 		"runtime.GOOS == <suffix>",
+ 		func(_ *State, suffix string) (bool, error) {
+ 			if suffix == runtime.GOOS {
++				return true, nil
++			}
++			if suffix == "openharmony" && runtime.IsOpenharmony {
+ 				return true, nil
+ 			}
+ 			if _, ok := syslist.KnownOS[suffix]; !ok {
+--- a/src/cmd/internal/testdir/testdir_test.go
++++ b/src/cmd/internal/testdir/testdir_test.go
+@@ -171,7 +171,7 @@
+ 	names := []string{}
+ 	for _, file := range files {
+ 		name := file.Name()
+-		if !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go") && shardMatch(name) {
++		if !strings.HasPrefix(name, ".") && (strings.HasSuffix(name, ".go") || strings.HasSuffix(name, ".s")) && shardMatch(name) {
+ 			names = append(names, name)
+ 		}
+ 	}
+@@ -423,7 +423,7 @@
+ 		return true
+ 	}
+ 
+-	if name == ctxt.GOOS || name == ctxt.GOARCH || name == "gc" {
++	if name == ctxt.GOOS || (name == "linux" && ctxt.GOOS == "openharmony") || name == ctxt.GOARCH || name == "gc" {
+ 		return true
+ 	}
+ 
+@@ -510,7 +510,7 @@
+ 
+ 	// TODO: Clean up/simplify this switch statement.
+ 	switch action {
+-	case "compile", "compiledir", "build", "builddir", "buildrundir", "run", "buildrun", "runoutput", "rundir", "runindir", "asmcheck":
++	case "compile", "compiledir", "build", "builddir", "buildrundir", "run", "buildrun", "runoutput", "rundir", "runindir", "asmcheck", "objcheck":
+ 		// nothing to do
+ 	case "errorcheckandrundir":
+ 		wantError = false // should be no error if also will run
+@@ -691,11 +691,15 @@
+ 		t.Fatalf("unimplemented action %q", action)
+ 		panic("unreachable")
+ 
+-	case "asmcheck":
++	case "asmcheck", "objcheck":
+ 		// Compile Go file and match the generated assembly
+ 		// against a set of regexps in comments.
+ 		ops := t.wantedAsmOpcodes(long)
+ 		self := runtime.GOOS + "/" + runtime.GOARCH
++		objname := ""
++		if action == "objcheck" {
++			objname = long + ".o"
++		}
+ 		for _, env := range ops.Envs() {
+ 			// Only run checks relevant to the current GOOS/GOARCH,
+ 			// to avoid triggering a cross-compile of the runtime.
+@@ -704,22 +708,35 @@
+ 			}
+ 			// -S=2 forces outermost line numbers when disassembling inlined code.
+ 			cmdline := []string{"build", "-gcflags", "-S=2"}
+-
+-			// Append flags, but don't override -gcflags=-S=2; add to it instead.
+-			for i := 0; i < len(flags); i++ {
+-				flag := flags[i]
+-				switch {
+-				case strings.HasPrefix(flag, "-gcflags="):
+-					cmdline[2] += " " + strings.TrimPrefix(flag, "-gcflags=")
+-				case strings.HasPrefix(flag, "--gcflags="):
+-					cmdline[2] += " " + strings.TrimPrefix(flag, "--gcflags=")
+-				case flag == "-gcflags", flag == "--gcflags":
+-					i++
+-					if i < len(flags) {
+-						cmdline[2] += " " + flags[i]
++			if action == "objcheck" {
++				cmdline[2] = "-o=" + objname
++			}
++
++			if strings.HasSuffix(t.goFileName(), ".s") {
++				cmdline[0] = "tool"
++				cmdline[1] = "asm"
++				// Append flags
++				for i := 0; i < len(flags); i++ {
++					flag := flags[i]
++					cmdline = append(cmdline, flag)
++				}
++			} else {
++				// Append flags, but don't override -gcflags=-S=2; add to it instead.
++				for i := 0; i < len(flags); i++ {
++					flag := flags[i]
++					switch {
++					case strings.HasPrefix(flag, "-gcflags="):
++						cmdline[2] += " " + strings.TrimPrefix(flag, "-gcflags=")
++					case strings.HasPrefix(flag, "--gcflags="):
++						cmdline[2] += " " + strings.TrimPrefix(flag, "--gcflags=")
++					case flag == "-gcflags", flag == "--gcflags":
++						i++
++						if i < len(flags) {
++							cmdline[2] += " " + flags[i]
++						}
++					default:
++						cmdline = append(cmdline, flag)
+ 					}
+-				default:
+-					cmdline = append(cmdline, flag)
+ 				}
+ 			}
+ 
+@@ -737,9 +754,24 @@
+ 				return err
+ 			}
+ 
+-			err := t.asmCheck(buf.String(), long, env, ops[env])
++			if action == "objcheck" {
++				dumpline := []string{"tool", "objdump", objname}
++				cmd := exec.Command(goTool, dumpline...)
++				cmd.Env = append(os.Environ(), env.Environ()...)
++				cmd.Stdout, cmd.Stderr = &buf, &buf
++				if err := cmd.Run(); err != nil {
++					t.Log(env, "\n", cmd.Stderr)
++					return err
++				}
++				err = t.objCheck(buf.String(), t.gorootTestDir, t.goFileName(), env, ops[env])
++			} else {
++				err = t.asmCheck(buf.String(), long, env, ops[env])
++			}
+ 			if err != nil {
+ 				return err
++			}
++			if err := os.Remove(objname); err != nil {
++				t.Log(env, "\n", cmd.Stderr)
+ 			}
+ 		}
+ 		return nil
+@@ -1740,6 +1772,92 @@
+ 	}
+ 
+ 	// At least one asmcheck failed; report them.
++	lastFunction := -1
++	var errbuf bytes.Buffer
++	fmt.Fprintln(&errbuf)
++	sort.Slice(failed, func(i, j int) bool { return failed[i].line < failed[j].line })
++	for _, o := range failed {
++		// Dump the function in which this opcode check was supposed to
++		// pass but failed.
++		funcIdx := lineFuncMap[o.fileline]
++		if funcIdx != 0 && funcIdx != lastFunction {
++			funcLines := lines[functionMarkers[funcIdx]:functionMarkers[funcIdx+1]]
++			t.Log(strings.Join(funcLines, "\n"))
++			lastFunction = funcIdx // avoid printing same function twice
++		}
++
++		if o.negative {
++			fmt.Fprintf(&errbuf, "%s:%d: %s: wrong opcode found: %q\n", t.goFileName(), o.line, env, o.opcode.String())
++		} else {
++			fmt.Fprintf(&errbuf, "%s:%d: %s: opcode not found: %q\n", t.goFileName(), o.line, env, o.opcode.String())
++		}
++	}
++	return errors.New(errbuf.String())
++}
++
++func (t test) objCheck(outStr string, dir, sn string, env buildEnv, fullops map[string][]wantedAsmOpcode) error {
++	// The objdump disassembly contains the concatenated dump of multiple functions.
++	// The first line of each function begins with "TEXT".
++	// The objCheck's processed format differs from the asmCheck's one in two ways:
++	// 1. objdump's output shows shortened file names instead of full paths
++	// 2. each line prefixes the disassembly with the machine encoding
++	//
++	// When writing test patterns, use ".*\b" to match past that prefix and reach
++	// the disassembly text, unless you specifically need to verify
++	// the machine instruction encoding.
++
++	functionMarkers := make([]int, 1)
++	lineFuncMap := make(map[string]int)
++
++	lines := strings.Split(outStr, "\n")
++	rxLine := regexp.MustCompile(fmt.Sprintf(`(%s:\d+)\s+(.*\S)`, regexp.QuoteMeta(sn)))
++
++	for nl, line := range lines {
++		// Check if this line begins a function
++		if len(line) > 0 && strings.HasPrefix(line, "TEXT") {
++			functionMarkers = append(functionMarkers, nl)
++		}
++
++		// Search if this line contains a disassembled opcode (which is prefixed by the
++		// short source file/line in parenthesis)
++		matches := rxLine.FindStringSubmatch(line)
++		if len(matches) == 0 {
++			continue
++		}
++		srcFileLine, asm := filepath.Join(dir, matches[1]), matches[2]
++
++		// Associate the original file/line information to the current
++		// function in the output; it will be useful to dump it in case
++		// of error.
++		lineFuncMap[srcFileLine] = len(functionMarkers) - 1
++
++		// If there are opcode checks associated to this source file/line,
++		// run the checks.
++		if ops, found := fullops[srcFileLine]; found {
++			for i := range ops {
++				if !ops[i].found && ops[i].opcode.FindString(asm) != "" {
++					ops[i].found = true
++				}
++			}
++		}
++	}
++	functionMarkers = append(functionMarkers, len(lines))
++
++	var failed []wantedAsmOpcode
++	for _, ops := range fullops {
++		for _, o := range ops {
++			// There's a failure if a negative match was found,
++			// or a positive match was not found.
++			if o.negative == o.found {
++				failed = append(failed, o)
++			}
++		}
++	}
++	if len(failed) == 0 {
++		return nil
++	}
++
++	// At least one objcheck failed; report them.
+ 	lastFunction := -1
+ 	var errbuf bytes.Buffer
+ 	fmt.Fprintln(&errbuf)
+--- a/src/cmd/link/internal/arm64/asm.go
++++ b/src/cmd/link/internal/arm64/asm.go
+@@ -561,6 +561,17 @@
+ 		out.Write64(uint64(r.Xadd))
+ 		out.Write64(uint64(sectoff + 4))
+ 		out.Write64(uint64(elf.R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC) | uint64(elfsym)<<32)
++	case objabi.R_ARM64_TLS_GD:
++		out.Write64(uint64(elf.R_AARCH64_TLSDESC_ADR_PAGE21) | uint64(elfsym)<<32)
++		out.Write64(uint64(r.Xadd))
++		out.Write64(uint64(sectoff + 4))
++		out.Write64(uint64(elf.R_AARCH64_TLSDESC_LD64_LO12_NC) | uint64(elfsym)<<32)
++		out.Write64(uint64(r.Xadd))
++		out.Write64(uint64(sectoff + 8))
++		out.Write64(uint64(elf.R_AARCH64_TLSDESC_ADD_LO12_NC) | uint64(elfsym)<<32)
++		out.Write64(uint64(r.Xadd))
++		out.Write64(uint64(sectoff + 12))
++		out.Write64(uint64(elf.R_AARCH64_TLSDESC_CALL) | uint64(elfsym)<<32)
+ 	case objabi.R_ARM64_GOTPCREL:
+ 		out.Write64(uint64(elf.R_AARCH64_ADR_GOT_PAGE) | uint64(elfsym)<<32)
+ 		out.Write64(uint64(r.Xadd))
+@@ -871,6 +882,10 @@
+ 			nExtReloc = 2 // need two ELF relocations. see elfreloc1
+ 			return val, nExtReloc, isOk
+ 
++		case objabi.R_ARM64_TLS_GD:
++			nExtReloc = 4 // need two ELF relocations. see elfreloc1
++			return val, nExtReloc, isOk
++
+ 		case objabi.R_ADDR:
+ 			if target.IsWindows() && r.Add() != 0 {
+ 				if r.Siz() == 8 {
+@@ -988,6 +1003,9 @@
+ 		} else {
+ 			log.Fatalf("cannot handle R_ARM64_TLS_IE (sym %s) when linking internally", ldr.SymName(s))
+ 		}
++
++	case objabi.R_ARM64_TLS_GD:
++		log.Fatalf("cannot handle R_ARM64_TLS_GD (sym %s) when linking internally", ldr.SymName(s))
+ 
+ 	case objabi.R_CALLARM64:
+ 		var t int64
+@@ -1131,7 +1149,8 @@
+ 		return rr, true
+ 	case objabi.R_CALLARM64,
+ 		objabi.R_ARM64_TLS_LE,
+-		objabi.R_ARM64_TLS_IE:
++		objabi.R_ARM64_TLS_IE,
++		objabi.R_ARM64_TLS_GD:
+ 		return ld.ExtrelocSimple(ldr, r), true
+ 	}
+ 	return loader.ExtReloc{}, false
+--- a/src/cmd/link/internal/ld/decodesym.go
++++ b/src/cmd/link/internal/ld/decodesym.go
+@@ -218,10 +218,55 @@
+ 	return str
+ }
+ 
++// decodetypeGcprogShlibByReloc get GCData Field's value in type descriptor.
++// s is the type descriptor symbol.
++func decodetypeGcprogShlibByReloc(ctxt *Link, s loader.Sym) (uint64, bool) {
++	getShlib := func(path string) *Shlib {
++		for i, shlib := range ctxt.Shlibs {
++			if shlib.Path == path {
++				return &ctxt.Shlibs[i]
++			}
++		}
++		return nil
++	}
++	shlib := getShlib(ctxt.loader.SymPkg(s))
++	if shlib == nil {
++		Exitf("cannot find shlib for s=%d, name=%s, sympkg=%s\n",
++			s, ctxt.loader.SymName(s), ctxt.loader.SymPkg(s))
++	}
++
++	if shlib.addendMap == nil {
++		return 0, false
++	}
++
++	// The value of type descriptor symbol is the address of its data.
++	dataStartAddr, ok := ctxt.loader.GetShlibSymValue(s)
++	if !ok {
++		log.Printf("Warning: GetShlibSymValue failed for s=%d, name=%s, sympkg=%s\n",
++			s, ctxt.loader.SymName(s), ctxt.loader.SymPkg(s))
++		return 0, false
++	}
++
++	// Get the address of GcData field in type descriptor's data.
++	gcDataFieldAddr := dataStartAddr + uint64(2*int32(ctxt.Arch.PtrSize)+8+1*int32(ctxt.Arch.PtrSize))
++
++	addend, ok := shlib.addendMap[gcDataFieldAddr]
++	if !ok || addend == 0 {
++		log.Printf("Warning: get addend failed for s=%d, name=%s, sympkg=%s, gcDataFieldAddr=0x%x\n",
++			s, ctxt.loader.SymName(s), ctxt.loader.SymPkg(s), gcDataFieldAddr)
++		return 0, false
++	}
++
++	return uint64(addend), ok
++}
++
+ func decodetypeGcmask(ctxt *Link, s loader.Sym) []byte {
+ 	if ctxt.loader.SymType(s) == sym.SDYNIMPORT {
+ 		symData := ctxt.loader.Data(s)
+-		addr := decodetypeGcprogShlib(ctxt, symData)
++		addr, ok := decodetypeGcprogShlibByReloc(ctxt, s)
++		if !ok {
++			addr = decodetypeGcprogShlib(ctxt, symData)
++		}
+ 		ptrdata := decodetypePtrdata(ctxt.Arch, symData)
+ 		sect := findShlibSection(ctxt, ctxt.loader.SymPkg(s), addr)
+ 		if sect != nil {
+--- a/src/cmd/link/internal/ld/lib.go
++++ b/src/cmd/link/internal/ld/lib.go
+@@ -487,7 +487,7 @@
+ 		// This only matters when link tool is called directly without explicit -extld,
+ 		// go tool already passes the correct linker in other cases.
+ 		switch buildcfg.GOOS {
+-		case "darwin", "freebsd", "openbsd":
++		case "darwin", "freebsd", "openbsd", "openharmony":
+ 			flagExtld = []string{"clang"}
+ 		default:
+ 			flagExtld = []string{"gcc"}
+@@ -1381,11 +1381,15 @@
+ 	exitIfErrors()
+ 
+ 	if *flagExtar == "" {
+-		const printProgName = "--print-prog-name=ar"
+-		cc := ctxt.extld()
+-		*flagExtar = "ar"
+-		if linkerFlagSupported(ctxt.Arch, cc[0], "", printProgName) {
+-			*flagExtar = ctxt.findExtLinkTool("ar")
++		if extar := os.Getenv("AR"); extar != "" {
++			*flagExtar = extar
++		} else {
++			const printProgName = "--print-prog-name=ar"
++			cc := ctxt.extld()
++			*flagExtar = "ar"
++			if linkerFlagSupported(ctxt.Arch, cc[0], "", printProgName) {
++				*flagExtar = ctxt.findExtLinkTool("ar")
++			}
+ 		}
+ 	}
+ 
+@@ -1694,7 +1698,13 @@
+ 		// from the beginning of the section (like sym.STYPE).
+ 		argv = append(argv, "-Wl,-z,nocopyreloc")
+ 
+-		if buildcfg.GOOS == "android" {
++		// On ohos, since RTLD_GLOBAL is ignored by dlopen since it's following bionic, so need set to .dynamic
++		// https://github.com/bminor/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/elf/elf.h#L960
++		if buildcfg.GOOS == "openharmony" {
++			argv = append(argv, "-Wl,-z,global")
++		}
++
++		if buildcfg.GOOS == "android" || buildcfg.GOOS == "openharmony" {
+ 			// Use lld to avoid errors from default linker (issue #38838)
+ 			altLinker = "lld"
+ 		}
+@@ -2587,6 +2597,10 @@
+ 		if sect.Type != elf.SHT_NOTE {
+ 			continue
+ 		}
++		if sect.Name == ".note.ohos.ident" {
++			continue // If the field is .note.ohos.ident, skip the field and do not parse it.
++		}
++
+ 		r := sect.Open()
+ 		for {
+ 			var namesize, descsize, noteType int32
+@@ -2744,6 +2758,10 @@
+ 			sname := l.SymName(s)
+ 			if strings.HasPrefix(sname, "type:") && !strings.HasPrefix(sname, "type:.") {
+ 				su.SetData(readelfsymboldata(ctxt, f, &elfsym))
++				if elfsym.Value != 0 {
++					// record the symbol value in shlib.
++					l.SetShlibSymValue(s, elfsym.Value)
++				}
+ 			}
+ 		}
+ 
+@@ -2825,7 +2843,69 @@
+ 		relocTarget[off] = syms[idx-1].Name
+ 	}
+ 
+-	ctxt.Shlibs = append(ctxt.Shlibs, Shlib{Path: libpath, Hash: hash, Deps: deps, File: f, symAddr: symAddr, relocTarget: relocTarget})
++	addendMap := getRelocAddendMapShlib(f, libpath)
++	ctxt.Shlibs = append(ctxt.Shlibs, Shlib{Path: libpath, Hash: hash, Deps: deps, File: f, symAddr: symAddr, relocTarget: relocTarget, addendMap: addendMap})
++}
++
++// getRelocAddendMapShlib generate a map.
++// key is r_offset, value is r_addend.
++// Reference to debug.(*elf).applyRelocations().
++func getRelocAddendMapShlib(f *elf.File, libpath string) map[uint64]int64 {
++	switch {
++	case f.Class == elf.ELFCLASS64 && f.Machine == elf.EM_AARCH64:
++		return getRelocAddendMapShlibARM64(f, libpath)
++	default:
++		// not implement of others
++	}
++	return nil
++}
++
++func getRelocAddendMapShlibARM64(f *elf.File, libpath string) map[uint64]int64 {
++	addendMap := make(map[uint64]int64)
++	for _, sect := range f.Sections {
++		if sect.Type != elf.SHT_RELA {
++			// not implement for elf.SHT_REL
++			continue
++		}
++		sectData, err := sect.Data()
++		if err != nil {
++			log.Fatalf("malformed shlib %s, cannot read rela data from sect %s",
++				libpath, sect.Name)
++		}
++		entSize := 24
++		if len(sectData)%entSize != 0 {
++			log.Fatalf("malformed shlib %s, sect %s size=%d",
++				libpath, sect.Name, len(sectData))
++		}
++		relocsNum := len(sectData) / entSize
++		b := bytes.NewReader(sectData)
++		var rela elf.Rela64
++
++		for j := 0; j < relocsNum; j++ {
++			err := binary.Read(b, f.ByteOrder, &rela)
++			if err != nil {
++				log.Fatalf("malformed shlib %s, read rela data failed from sect %s",
++					libpath, sect.Name)
++			}
++			symNo := rela.Info >> 32
++			t := elf.R_AARCH64(rela.Info & 0xffff)
++			if symNo != 0 {
++				// not implement for symNo != 0
++				continue
++			}
++			switch t {
++			case elf.R_AARCH64_RELATIVE:
++				if v, ok := addendMap[rela.Off]; ok {
++					log.Printf("Warning: offset already existed, offset=%d, addend=%d, new addend=%d\n",
++						rela.Off, v, rela.Addend)
++				}
++				addendMap[rela.Off] = rela.Addend
++			default:
++				// not implement of other types
++			}
++		}
++	}
++	return addendMap
+ }
+ 
+ func addsection(ldr *loader.Loader, arch *sys.Arch, seg *sym.Segment, name string, rwx int) *sym.Section {
+--- a/src/cmd/link/internal/ld/link.go
++++ b/src/cmd/link/internal/ld/link.go
+@@ -54,6 +54,9 @@
+ 	// address relocation with no addend. These were R_ADDR
+ 	// relocations when the shared library was built.
+ 	relocTarget map[uint64]string
++	// Only used for get r_addend in decodetypeGcprogShlibByReloc.
++	// key is r_offset, value is r_addend.
++	addendMap map[uint64]int64
+ }
+ 
+ // A relocation that applies to part of the shared library.
+--- a/src/cmd/link/internal/ld/outbuf_mmap.go
++++ b/src/cmd/link/internal/ld/outbuf_mmap.go
+@@ -28,7 +28,7 @@
+ 		// Some file systems do not support fallocate. We ignore that error as linking
+ 		// can still take place, but you might SIGBUS when you write to the mmapped
+ 		// area.
+-		if err != syscall.ENOTSUP && err != syscall.EOPNOTSUPP && err != syscall.EPERM && err != errNoFallocate {
++		if err != syscall.ENOTSUP && err != syscall.EOPNOTSUPP && err != syscall.EPERM && err != errNoFallocate && err != syscall.EACCES {
+ 			return err
+ 		}
+ 	}
+--- a/src/cmd/link/internal/loader/loader.go
++++ b/src/cmd/link/internal/loader/loader.go
+@@ -193,6 +193,8 @@
+ 	payloadBatch []extSymPayload
+ 	payloads     []*extSymPayload // contents of linker-materialized external syms
+ 	values       []int64          // symbol values, indexed by global sym index
++
++	shlibSymValues map[Sym]uint64 // record symbol values of shlib symbols
+ 
+ 	sects    []*sym.Section // sections
+ 	symSects []uint16       // symbol's section, index to sects array
+@@ -332,6 +334,7 @@
+ 		attrCgoExportStatic:  make(map[Sym]struct{}),
+ 		deferReturnTramp:     make(map[Sym]bool),
+ 		extStaticSyms:        make(map[nameVer]Sym),
++		shlibSymValues:       make(map[Sym]uint64),
+ 		builtinSyms:          make([]Sym, nbuiltin),
+ 		flags:                flags,
+ 		errorReporter:        reporter,
+@@ -339,6 +342,15 @@
+ 	}
+ 	reporter.ldr = ldr
+ 	return ldr
++}
++
++func (l *Loader) SetShlibSymValue(s Sym, v uint64) {
++	l.shlibSymValues[s] = v
++}
++
++func (l *Loader) GetShlibSymValue(s Sym) (uint64, bool) {
++	v, ok := l.shlibSymValues[s]
++	return v, ok
+ }
+ 
+ // Add object file r
+@@ -2644,6 +2656,9 @@
+ 	}
+ 	l.payloads[l.extIndex(dst)] = l.payloads[l.extIndex(src)]
+ 	l.SetSymPkg(dst, l.SymPkg(src))
++	if symValue, ok := l.GetShlibSymValue(src); ok {
++		l.SetShlibSymValue(dst, symValue)
++	}
+ 	// TODO: other attributes?
+ }
+ 
+--- a/src/cmd/link/link_test.go
++++ b/src/cmd/link/link_test.go
+@@ -1269,7 +1269,7 @@
+ func TestIssue42396(t *testing.T) {
+ 	testenv.MustHaveGoBuild(t)
+ 
+-	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
++	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) || runtime.IsOpenharmony {
+ 		t.Skip("no race detector support")
+ 	}
+ 
+--- a/src/go/build/build.go
++++ b/src/go/build/build.go
+@@ -368,7 +368,7 @@
+ 		c.CgoEnabled = false
+ 	default:
+ 		// cgo must be explicitly enabled for cross compilation builds
+-		if runtime.GOARCH == c.GOARCH && runtime.GOOS == c.GOOS {
++		if runtime.GOARCH == c.GOARCH && (runtime.GOOS == c.GOOS || (runtime.IsOpenharmony && c.GOOS == "openharmony")) {
+ 			c.CgoEnabled = platform.CgoSupported(c.GOOS, c.GOARCH)
+ 			break
+ 		}
+@@ -1965,6 +1965,9 @@
+ 	if ctxt.GOOS == "ios" && name == "darwin" {
+ 		return true
+ 	}
++	if ctxt.GOOS == "openharmony" && name == "linux" {
++		return true
++	}
+ 	if name == "unix" && syslist.UnixOS[ctxt.GOOS] {
+ 		return true
+ 	}
+--- a/src/go/build/gc.go
++++ b/src/go/build/gc.go
+@@ -13,5 +13,8 @@
+ 
+ // getToolDir returns the default value of ToolDir.
+ func getToolDir() string {
++	if runtime.IsOpenharmony {
++		return filepath.Join(runtime.GOROOT(), "pkg/tool/openharmony_"+runtime.GOARCH)
++	}
+ 	return filepath.Join(runtime.GOROOT(), "pkg/tool/"+runtime.GOOS+"_"+runtime.GOARCH)
+ }
+--- a/src/internal/coverage/cfile/emitdata_test.go
++++ b/src/internal/coverage/cfile/emitdata_test.go
+@@ -466,7 +466,7 @@
+ 	// go build, go run, and "-race" support.
+ 	testenv.MustHaveGoRun(t)
+ 	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) ||
+-		!testenv.HasCGO() {
++		!testenv.HasCGO() || runtime.IsOpenharmony {
+ 		t.Skip("skipped due to lack of race detector support / CGO")
+ 	}
+ 
+--- a/src/internal/cpu/cpu_arm64_other.go
++++ b/src/internal/cpu/cpu_arm64_other.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build arm64 && !linux && !freebsd && !android && (!darwin || ios) && !openbsd
++//go:build arm64 && !linux && !freebsd && !android && (!darwin || ios) && !openbsd && !openharmony
+ 
+ package cpu
+ 
+--- a/src/internal/goos/gengoos.go
++++ b/src/internal/goos/gengoos.go
+@@ -42,7 +42,7 @@
+ 		}
+ 		var tags []string
+ 		if target == "linux" {
+-			tags = append(tags, "!android") // must explicitly exclude android for linux
++			tags = append(tags, []string{"!android", "!openharmony"}...) // must explicitly exclude android for linux
+ 		}
+ 		if target == "solaris" {
+ 			tags = append(tags, "!illumos") // must explicitly exclude illumos for solaris
+@@ -55,7 +55,11 @@
+ 		fmt.Fprintf(&buf, "// Code generated by gengoos.go using 'go generate'. DO NOT EDIT.\n\n")
+ 		fmt.Fprintf(&buf, "//go:build %s\n\n", strings.Join(tags, " && "))
+ 		fmt.Fprintf(&buf, "package goos\n\n")
+-		fmt.Fprintf(&buf, "const GOOS = `%s`\n\n", target)
++		if target == "openharmony" {
++			fmt.Fprintf(&buf, "const GOOS = `linux`\n\n")
++		} else {
++			fmt.Fprintf(&buf, "const GOOS = `%s`\n\n", target)
++		}
+ 		for _, goos := range gooses {
+ 			value := 0
+ 			if goos == target {
+--- a/src/internal/goos/zgoos_aix.go
++++ b/src/internal/goos/zgoos_aix.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_android.go
++++ b/src/internal/goos/zgoos_android.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_darwin.go
++++ b/src/internal/goos/zgoos_darwin.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_dragonfly.go
++++ b/src/internal/goos/zgoos_dragonfly.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_freebsd.go
++++ b/src/internal/goos/zgoos_freebsd.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_hurd.go
++++ b/src/internal/goos/zgoos_hurd.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_illumos.go
++++ b/src/internal/goos/zgoos_illumos.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_ios.go
++++ b/src/internal/goos/zgoos_ios.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_js.go
++++ b/src/internal/goos/zgoos_js.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_linux.go
++++ b/src/internal/goos/zgoos_linux.go
+@@ -1,6 +1,6 @@
+ // Code generated by gengoos.go using 'go generate'. DO NOT EDIT.
+ 
+-//go:build !android && linux
++//go:build !android && !openharmony && linux
+ 
+ package goos
+ 
+@@ -18,6 +18,7 @@
+ const IsLinux = 1
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_netbsd.go
++++ b/src/internal/goos/zgoos_netbsd.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 1
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_openbsd.go
++++ b/src/internal/goos/zgoos_openbsd.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 1
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- /dev/null
++++ b/src/internal/goos/zgoos_openharmony.go
+@@ -0,0 +1,27 @@
++// Code generated by gengoos.go using 'go generate'. DO NOT EDIT.
++
++//go:build openharmony
++
++package goos
++
++const GOOS = `linux`
++
++const IsAix = 0
++const IsAndroid = 0
++const IsDarwin = 0
++const IsDragonfly = 0
++const IsFreebsd = 0
++const IsHurd = 0
++const IsIllumos = 0
++const IsIos = 0
++const IsJs = 0
++const IsLinux = 0
++const IsNacl = 0
++const IsNetbsd = 0
++const IsOpenharmony = 1
++const IsOpenbsd = 0
++const IsPlan9 = 0
++const IsSolaris = 0
++const IsWasip1 = 0
++const IsWindows = 0
++const IsZos = 0
+--- a/src/internal/goos/zgoos_plan9.go
++++ b/src/internal/goos/zgoos_plan9.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 1
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_solaris.go
++++ b/src/internal/goos/zgoos_solaris.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 1
+--- a/src/internal/goos/zgoos_wasip1.go
++++ b/src/internal/goos/zgoos_wasip1.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_windows.go
++++ b/src/internal/goos/zgoos_windows.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/goos/zgoos_zos.go
++++ b/src/internal/goos/zgoos_zos.go
+@@ -18,6 +18,7 @@
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsOpenharmony = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+--- a/src/internal/platform/supported.go
++++ b/src/internal/platform/supported.go
+@@ -61,7 +61,7 @@
+ // ('go test -fuzz=.').
+ func FuzzSupported(goos, goarch string) bool {
+ 	switch goos {
+-	case "darwin", "freebsd", "linux", "openbsd", "windows":
++	case "darwin", "freebsd", "linux", "openbsd", "windows", "openharmony":
+ 		return true
+ 	default:
+ 		return false
+@@ -104,6 +104,8 @@
+ 			// It seems that on Dragonfly thread local storage is
+ 			// set up by the dynamic linker, so internal cgo linking
+ 			// doesn't work. Test case is "go test runtime/cgo".
++			return true
++		case "openharmony":
+ 			return true
+ 		}
+ 	}
+@@ -159,6 +161,8 @@
+ 			}
+ 		case "freebsd":
+ 			return goarch == "amd64"
++		case "openharmony":
++			return goarch == "arm64"
+ 		}
+ 		return false
+ 
+@@ -169,7 +173,8 @@
+ 			"freebsd/amd64",
+ 			"darwin/amd64", "darwin/arm64",
+ 			"windows/amd64", "windows/386", "windows/arm64",
+-			"wasip1/wasm":
++			"wasip1/wasm",
++			"openharmony/arm64":
+ 			return true
+ 		}
+ 		return false
+@@ -182,6 +187,8 @@
+ 
+ 	case "pie":
+ 		switch platform {
++		case "openharmony/arm64":
++			return true
+ 		case "linux/386", "linux/amd64", "linux/arm", "linux/arm64", "linux/loong64", "linux/ppc64le", "linux/riscv64", "linux/s390x",
+ 			"android/amd64", "android/arm", "android/arm64", "android/386",
+ 			"freebsd/amd64",
+@@ -196,6 +203,8 @@
+ 
+ 	case "shared":
+ 		switch platform {
++		case "openharmony/arm64":
++			return true
+ 		case "linux/386", "linux/amd64", "linux/arm", "linux/arm64", "linux/ppc64le", "linux/s390x":
+ 			return true
+ 		}
+@@ -203,6 +212,8 @@
+ 
+ 	case "plugin":
+ 		switch platform {
++		case "openharmony/arm64":
++			return true
+ 		case "linux/amd64", "linux/arm", "linux/arm64", "linux/386", "linux/loong64", "linux/riscv64", "linux/s390x", "linux/ppc64le",
+ 			"android/amd64", "android/386",
+ 			"darwin/amd64", "darwin/arm64",
+@@ -218,6 +229,8 @@
+ 
+ func InternalLinkPIESupported(goos, goarch string) bool {
+ 	switch goos + "/" + goarch {
++	case "openharmony/arm64":
++		return true
+ 	case "android/arm64",
+ 		"darwin/amd64", "darwin/arm64",
+ 		"linux/amd64", "linux/arm64", "linux/loong64", "linux/ppc64le",
+--- a/src/internal/platform/zosarch.go
++++ b/src/internal/platform/zosarch.go
+@@ -50,6 +50,7 @@
+ 	{"openbsd", "mips64"},
+ 	{"openbsd", "ppc64"},
+ 	{"openbsd", "riscv64"},
++	{"openharmony", "arm64"},
+ 	{"plan9", "386"},
+ 	{"plan9", "amd64"},
+ 	{"plan9", "arm"},
+@@ -61,54 +62,55 @@
+ }
+ 
+ var distInfo = map[OSArch]osArchInfo{
+-	{"aix", "ppc64"}:       {CgoSupported: true},
+-	{"android", "386"}:     {CgoSupported: true},
+-	{"android", "amd64"}:   {CgoSupported: true},
+-	{"android", "arm"}:     {CgoSupported: true},
+-	{"android", "arm64"}:   {CgoSupported: true},
+-	{"darwin", "amd64"}:    {CgoSupported: true, FirstClass: true},
+-	{"darwin", "arm64"}:    {CgoSupported: true, FirstClass: true},
+-	{"dragonfly", "amd64"}: {CgoSupported: true},
+-	{"freebsd", "386"}:     {CgoSupported: true},
+-	{"freebsd", "amd64"}:   {CgoSupported: true},
+-	{"freebsd", "arm"}:     {CgoSupported: true},
+-	{"freebsd", "arm64"}:   {CgoSupported: true},
+-	{"freebsd", "riscv64"}: {CgoSupported: true, Broken: true},
+-	{"illumos", "amd64"}:   {CgoSupported: true},
+-	{"ios", "amd64"}:       {CgoSupported: true},
+-	{"ios", "arm64"}:       {CgoSupported: true},
+-	{"js", "wasm"}:         {},
+-	{"linux", "386"}:       {CgoSupported: true, FirstClass: true},
+-	{"linux", "amd64"}:     {CgoSupported: true, FirstClass: true},
+-	{"linux", "arm"}:       {CgoSupported: true, FirstClass: true},
+-	{"linux", "arm64"}:     {CgoSupported: true, FirstClass: true},
+-	{"linux", "loong64"}:   {CgoSupported: true},
+-	{"linux", "mips"}:      {CgoSupported: true},
+-	{"linux", "mips64"}:    {CgoSupported: true},
+-	{"linux", "mips64le"}:  {CgoSupported: true},
+-	{"linux", "mipsle"}:    {CgoSupported: true},
+-	{"linux", "ppc64"}:     {},
+-	{"linux", "ppc64le"}:   {CgoSupported: true},
+-	{"linux", "riscv64"}:   {CgoSupported: true},
+-	{"linux", "s390x"}:     {CgoSupported: true},
+-	{"linux", "sparc64"}:   {CgoSupported: true, Broken: true},
+-	{"netbsd", "386"}:      {CgoSupported: true},
+-	{"netbsd", "amd64"}:    {CgoSupported: true},
+-	{"netbsd", "arm"}:      {CgoSupported: true},
+-	{"netbsd", "arm64"}:    {CgoSupported: true},
+-	{"openbsd", "386"}:     {CgoSupported: true},
+-	{"openbsd", "amd64"}:   {CgoSupported: true},
+-	{"openbsd", "arm"}:     {CgoSupported: true},
+-	{"openbsd", "arm64"}:   {CgoSupported: true},
+-	{"openbsd", "mips64"}:  {CgoSupported: true, Broken: true},
+-	{"openbsd", "ppc64"}:   {},
+-	{"openbsd", "riscv64"}: {CgoSupported: true},
+-	{"plan9", "386"}:       {},
+-	{"plan9", "amd64"}:     {},
+-	{"plan9", "arm"}:       {},
+-	{"solaris", "amd64"}:   {CgoSupported: true},
+-	{"wasip1", "wasm"}:     {},
+-	{"windows", "386"}:     {CgoSupported: true, FirstClass: true},
+-	{"windows", "amd64"}:   {CgoSupported: true, FirstClass: true},
+-	{"windows", "arm64"}:   {CgoSupported: true},
++	{"aix", "ppc64"}:         {CgoSupported: true},
++	{"android", "386"}:       {CgoSupported: true},
++	{"android", "amd64"}:     {CgoSupported: true},
++	{"android", "arm"}:       {CgoSupported: true},
++	{"android", "arm64"}:     {CgoSupported: true},
++	{"darwin", "amd64"}:      {CgoSupported: true, FirstClass: true},
++	{"darwin", "arm64"}:      {CgoSupported: true, FirstClass: true},
++	{"dragonfly", "amd64"}:   {CgoSupported: true},
++	{"freebsd", "386"}:       {CgoSupported: true},
++	{"freebsd", "amd64"}:     {CgoSupported: true},
++	{"freebsd", "arm"}:       {CgoSupported: true},
++	{"freebsd", "arm64"}:     {CgoSupported: true},
++	{"freebsd", "riscv64"}:   {CgoSupported: true, Broken: true},
++	{"illumos", "amd64"}:     {CgoSupported: true},
++	{"ios", "amd64"}:         {CgoSupported: true},
++	{"ios", "arm64"}:         {CgoSupported: true},
++	{"js", "wasm"}:           {},
++	{"linux", "386"}:         {CgoSupported: true, FirstClass: true},
++	{"linux", "amd64"}:       {CgoSupported: true, FirstClass: true},
++	{"linux", "arm"}:         {CgoSupported: true, FirstClass: true},
++	{"linux", "arm64"}:       {CgoSupported: true, FirstClass: true},
++	{"linux", "loong64"}:     {CgoSupported: true},
++	{"linux", "mips"}:        {CgoSupported: true},
++	{"linux", "mips64"}:      {CgoSupported: true},
++	{"linux", "mips64le"}:    {CgoSupported: true},
++	{"linux", "mipsle"}:      {CgoSupported: true},
++	{"linux", "ppc64"}:       {},
++	{"linux", "ppc64le"}:     {CgoSupported: true},
++	{"linux", "riscv64"}:     {CgoSupported: true},
++	{"linux", "s390x"}:       {CgoSupported: true},
++	{"linux", "sparc64"}:     {CgoSupported: true, Broken: true},
++	{"netbsd", "386"}:        {CgoSupported: true},
++	{"netbsd", "amd64"}:      {CgoSupported: true},
++	{"netbsd", "arm"}:        {CgoSupported: true},
++	{"netbsd", "arm64"}:      {CgoSupported: true},
++	{"openbsd", "386"}:       {CgoSupported: true},
++	{"openbsd", "amd64"}:     {CgoSupported: true},
++	{"openbsd", "arm"}:       {CgoSupported: true},
++	{"openbsd", "arm64"}:     {CgoSupported: true},
++	{"openbsd", "mips64"}:    {CgoSupported: true, Broken: true},
++	{"openbsd", "ppc64"}:     {},
++	{"openbsd", "riscv64"}:   {CgoSupported: true},
++	{"openharmony", "arm64"}: {CgoSupported: true, FirstClass: true},
++	{"plan9", "386"}:         {},
++	{"plan9", "amd64"}:       {},
++	{"plan9", "arm"}:         {},
++	{"solaris", "amd64"}:     {CgoSupported: true},
++	{"wasip1", "wasm"}:       {},
++	{"windows", "386"}:       {CgoSupported: true, FirstClass: true},
++	{"windows", "amd64"}:     {CgoSupported: true, FirstClass: true},
++	{"windows", "arm64"}:     {CgoSupported: true},
+ }
+--- a/src/internal/syslist/syslist.go
++++ b/src/internal/syslist/syslist.go
+@@ -15,42 +15,44 @@
+ // Do not remove from this list, as it is used for filename matching.
+ // If you add an entry to this list, look at UnixOS, below.
+ var KnownOS = map[string]bool{
+-	"aix":       true,
+-	"android":   true,
+-	"darwin":    true,
+-	"dragonfly": true,
+-	"freebsd":   true,
+-	"hurd":      true,
+-	"illumos":   true,
+-	"ios":       true,
+-	"js":        true,
+-	"linux":     true,
+-	"nacl":      true,
+-	"netbsd":    true,
+-	"openbsd":   true,
+-	"plan9":     true,
+-	"solaris":   true,
+-	"wasip1":    true,
+-	"windows":   true,
+-	"zos":       true,
++	"aix":         true,
++	"android":     true,
++	"darwin":      true,
++	"dragonfly":   true,
++	"freebsd":     true,
++	"hurd":        true,
++	"illumos":     true,
++	"ios":         true,
++	"js":          true,
++	"linux":       true,
++	"nacl":        true,
++	"netbsd":      true,
++	"openharmony": true,
++	"openbsd":     true,
++	"plan9":       true,
++	"solaris":     true,
++	"wasip1":      true,
++	"windows":     true,
++	"zos":         true,
+ }
+ 
+ // UnixOS is the set of GOOS values matched by the "unix" build tag.
+ // This is not used for filename matching.
+ // This list also appears in cmd/dist/build.go.
+ var UnixOS = map[string]bool{
+-	"aix":       true,
+-	"android":   true,
+-	"darwin":    true,
+-	"dragonfly": true,
+-	"freebsd":   true,
+-	"hurd":      true,
+-	"illumos":   true,
+-	"ios":       true,
+-	"linux":     true,
+-	"netbsd":    true,
+-	"openbsd":   true,
+-	"solaris":   true,
++	"aix":         true,
++	"android":     true,
++	"darwin":      true,
++	"dragonfly":   true,
++	"freebsd":     true,
++	"hurd":        true,
++	"illumos":     true,
++	"ios":         true,
++	"linux":       true,
++	"netbsd":      true,
++	"openharmony": true,
++	"openbsd":     true,
++	"solaris":     true,
+ }
+ 
+ // KnownArch is the list of past, present, and future known GOARCH values.
+--- a/src/internal/testenv/testenv.go
++++ b/src/internal/testenv/testenv.go
+@@ -28,6 +28,13 @@
+ 	"testing"
+ )
+ 
++func getGoos() string {
++	if runtime.IsOpenharmony {
++		return "openharmony"
++	}
++	return runtime.GOOS
++}
++
+ // Save the original environment during init for use in checks. A test
+ // binary may modify its environment before calling HasExec to change its
+ // behavior (such as mimicking a command-line tool), and that modified
+@@ -85,7 +92,7 @@
+ 		return err
+ 	}
+ 
+-	if platform.MustLinkExternal(runtime.GOOS, runtime.GOARCH, false) {
++	if platform.MustLinkExternal(getGoos(), runtime.GOARCH, false) {
+ 		// We can assume that we always have a complete Go toolchain available.
+ 		// However, this platform requires a C linker to build even pure Go
+ 		// programs, including tests. Do we have one in the test environment?
+@@ -337,7 +344,7 @@
+ // CanInternalLink reports whether the current system can link programs with
+ // internal linking.
+ func CanInternalLink(withCgo bool) bool {
+-	return !platform.MustLinkExternal(runtime.GOOS, runtime.GOARCH, withCgo)
++	return !platform.MustLinkExternal(getGoos(), runtime.GOARCH, withCgo)
+ }
+ 
+ // SpecialBuildTypes are interesting build types that may affect linking.
+@@ -361,9 +368,9 @@
+ 	if !CanInternalLink(with.Cgo) {
+ 		t.Helper()
+ 		if with.Cgo && CanInternalLink(false) {
+-			t.Skipf("skipping test: internal linking on %s/%s is not supported with cgo", runtime.GOOS, runtime.GOARCH)
+-		}
+-		t.Skipf("skipping test: internal linking on %s/%s is not supported", runtime.GOOS, runtime.GOARCH)
++			t.Skipf("skipping test: internal linking on %s/%s is not supported with cgo", getGoos(), runtime.GOARCH)
++		}
++		t.Skipf("skipping test: internal linking on %s/%s is not supported", getGoos(), runtime.GOARCH)
+ 	}
+ }
+ 
+--- /dev/null
++++ b/src/mime/type_openharmony.go
+@@ -0,0 +1,9 @@
++// Copyright 2024 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package mime
++
++func init() {
++	typeFiles = append(typeFiles, "/system/etc/cups/share/mime/mime.types")
++}
+--- a/src/net/cgo_unix_cgo.go
++++ b/src/net/cgo_unix_cgo.go
+@@ -17,6 +17,7 @@
+ #include <unistd.h>
+ #include <string.h>
+ #include <stdlib.h>
++#include <ifaddrs.h>
+ 
+ #ifndef EAI_NODATA
+ #define EAI_NODATA -5
+@@ -60,6 +61,7 @@
+ 	_C_socklen_t       = C.socklen_t
+ 	_C_struct_addrinfo = C.struct_addrinfo
+ 	_C_struct_sockaddr = C.struct_sockaddr
++	_C_struct_ifaddrs  = C.struct_ifaddrs
+ )
+ 
+ func _C_malloc(n uintptr) unsafe.Pointer { return C.malloc(C.size_t(n)) }
+@@ -84,3 +86,14 @@
+ 	x, err := C.getaddrinfo(hostname, servname, hints, res)
+ 	return int(x), err
+ }
++
++func _C_getifaddrs(res **_C_struct_ifaddrs) (int, error) {
++	x, err := C.getifaddrs(res)
++	return int(x), err
++}
++
++func _C_ifa_next(ifa *_C_struct_ifaddrs) **_C_struct_ifaddrs  { return &ifa.ifa_next }
++func _C_ifa_addr(ifa *_C_struct_ifaddrs) **_C_struct_sockaddr { return &ifa.ifa_addr }
++func _C_ifa_mask(ifa *_C_struct_ifaddrs) **_C_struct_sockaddr { return &ifa.ifa_netmask }
++func _C_ifa_flags(ifa *_C_struct_ifaddrs) *_C_uint            { return &ifa.ifa_flags }
++func _C_gifa_name(ifa *_C_struct_ifaddrs) string              { return C.GoString(ifa.ifa_name) }
+--- a/src/net/conf.go
++++ b/src/net/conf.go
+@@ -184,6 +184,12 @@
+ 	// Issue #10714.
+ 	case "android":
+ 		return true
++
++	case "linux":
++		if runtime.IsOpenharmony {
++			return true
++		}
++		return false
+ 
+ 	default:
+ 		return false
+--- a/src/net/interface_linux.go
++++ b/src/net/interface_linux.go
+@@ -9,41 +9,6 @@
+ 	"syscall"
+ 	"unsafe"
+ )
+-
+-// If the ifindex is zero, interfaceTable returns mappings of all
+-// network interfaces. Otherwise it returns a mapping of a specific
+-// interface.
+-func interfaceTable(ifindex int) ([]Interface, error) {
+-	tab, err := syscall.NetlinkRIB(syscall.RTM_GETLINK, syscall.AF_UNSPEC)
+-	if err != nil {
+-		return nil, os.NewSyscallError("netlinkrib", err)
+-	}
+-	msgs, err := syscall.ParseNetlinkMessage(tab)
+-	if err != nil {
+-		return nil, os.NewSyscallError("parsenetlinkmessage", err)
+-	}
+-	var ift []Interface
+-loop:
+-	for _, m := range msgs {
+-		switch m.Header.Type {
+-		case syscall.NLMSG_DONE:
+-			break loop
+-		case syscall.RTM_NEWLINK:
+-			ifim := (*syscall.IfInfomsg)(unsafe.Pointer(&m.Data[0]))
+-			if ifindex == 0 || ifindex == int(ifim.Index) {
+-				attrs, err := syscall.ParseNetlinkRouteAttr(&m)
+-				if err != nil {
+-					return nil, os.NewSyscallError("parsenetlinkrouteattr", err)
+-				}
+-				ift = append(ift, *newLink(ifim, attrs))
+-				if ifindex == int(ifim.Index) {
+-					break loop
+-				}
+-			}
+-		}
+-	}
+-	return ift, nil
+-}
+ 
+ const (
+ 	// See linux/if_arp.h.
+@@ -117,25 +82,6 @@
+ 	return f
+ }
+ 
+-// If the ifi is nil, interfaceAddrTable returns addresses for all
+-// network interfaces. Otherwise it returns addresses for a specific
+-// interface.
+-func interfaceAddrTable(ifi *Interface) ([]Addr, error) {
+-	tab, err := syscall.NetlinkRIB(syscall.RTM_GETADDR, syscall.AF_UNSPEC)
+-	if err != nil {
+-		return nil, os.NewSyscallError("netlinkrib", err)
+-	}
+-	msgs, err := syscall.ParseNetlinkMessage(tab)
+-	if err != nil {
+-		return nil, os.NewSyscallError("parsenetlinkmessage", err)
+-	}
+-	ifat, err := addrTable(ifi, msgs)
+-	if err != nil {
+-		return nil, err
+-	}
+-	return ifat, nil
+-}
+-
+ func addrTable(ifi *Interface, msgs []syscall.NetlinkMessage) ([]Addr, error) {
+ 	var ifat []Addr
+ loop:
+--- /dev/null
++++ b/src/net/interface_table_linux.go
+@@ -0,0 +1,67 @@
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build !(cgo && openharmony)
++
++package net
++
++import (
++	"os"
++	"syscall"
++	"unsafe"
++)
++
++// If the ifindex is zero, interfaceTable returns mappings of all
++// network interfaces. Otherwise it returns a mapping of a specific
++// interface.
++func interfaceTable(ifindex int) ([]Interface, error) {
++	tab, err := syscall.NetlinkRIB(syscall.RTM_GETLINK, syscall.AF_UNSPEC)
++	if err != nil {
++		return nil, os.NewSyscallError("netlinkrib", err)
++	}
++	msgs, err := syscall.ParseNetlinkMessage(tab)
++	if err != nil {
++		return nil, os.NewSyscallError("parsenetlinkmessage", err)
++	}
++	var ift []Interface
++loop:
++	for _, m := range msgs {
++		switch m.Header.Type {
++		case syscall.NLMSG_DONE:
++			break loop
++		case syscall.RTM_NEWLINK:
++			ifim := (*syscall.IfInfomsg)(unsafe.Pointer(&m.Data[0]))
++			if ifindex == 0 || ifindex == int(ifim.Index) {
++				attrs, err := syscall.ParseNetlinkRouteAttr(&m)
++				if err != nil {
++					return nil, os.NewSyscallError("parsenetlinkrouteattr", err)
++				}
++				ift = append(ift, *newLink(ifim, attrs))
++				if ifindex == int(ifim.Index) {
++					break loop
++				}
++			}
++		}
++	}
++	return ift, nil
++}
++
++// If the ifi is nil, interfaceAddrTable returns addresses for all
++// network interfaces. Otherwise it returns addresses for a specific
++// interface.
++func interfaceAddrTable(ifi *Interface) ([]Addr, error) {
++	tab, err := syscall.NetlinkRIB(syscall.RTM_GETADDR, syscall.AF_UNSPEC)
++	if err != nil {
++		return nil, os.NewSyscallError("netlinkrib", err)
++	}
++	msgs, err := syscall.ParseNetlinkMessage(tab)
++	if err != nil {
++		return nil, os.NewSyscallError("parsenetlinkmessage", err)
++	}
++	ifat, err := addrTable(ifi, msgs)
++	if err != nil {
++		return nil, err
++	}
++	return ifat, nil
++}
+--- /dev/null
++++ b/src/net/interface_table_openharmony.go
+@@ -0,0 +1,146 @@
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build cgo && openharmony
++
++package net
++
++import (
++	"errors"
++	"os"
++	"syscall"
++	"unsafe"
++)
++
++type ifreq struct {
++	Name [16]uint8
++	Ifru [24]byte
++}
++
++func interfaceTable(ifindex int) ([]Interface, error) {
++	// get all internet address
++	var res *_C_struct_ifaddrs
++	gerrno, err := _C_getifaddrs(&res)
++	if gerrno != 0 || err != nil {
++		return nil, os.NewSyscallError("_C_getifaddrs", errors.Join(err, errors.New(_C_gai_strerror(_C_int(gerrno)))))
++	}
++
++	// create a socket for ioctl syscall
++	s, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
++	if err != nil {
++		return nil, os.NewSyscallError("Socket", err)
++	}
++
++	var ifts []Interface
++	processed := make(map[int]int)
++	for r := res; r != nil; r = *_C_ifa_next(r) {
++		ifaAddr := *_C_ifa_addr(r)
++		if ifaAddr == nil {
++			continue
++		}
++		ift := Interface{
++			Name:  _C_gifa_name(r),
++			Flags: linkFlags(uint32(*_C_ifa_flags(r))),
++		}
++
++		ifr := &ifreq{}
++		copy(ifr.Name[:], ift.Name)
++		// retrieve index
++		_, _, ep := syscall.Syscall(syscall.SYS_IOCTL, uintptr(s), syscall.SIOCGIFINDEX, uintptr(unsafe.Pointer(ifr)))
++		if ep == 0 {
++			ift.Index = int(*(*uint32)(unsafe.Pointer(&ifr.Ifru[:4][0])))
++			if _, ok := processed[ift.Index]; ok {
++				continue
++			}
++			if ifindex != 0 && ift.Index != ifindex {
++				continue
++			}
++		}
++		// retrieve mtu
++		_, _, ep = syscall.Syscall(syscall.SYS_IOCTL, uintptr(s), syscall.SIOCGIFMTU, uintptr(unsafe.Pointer(ifr)))
++		if ep == 0 {
++			ift.MTU = int(*(*uint32)(unsafe.Pointer(&ifr.Ifru[:4][0])))
++		}
++		// retrieve mac addr
++		_, _, ep = syscall.Syscall(syscall.SYS_IOCTL, uintptr(s), syscall.SIOCGIFHWADDR, uintptr(unsafe.Pointer(ifr)))
++		if ep == 0 {
++			// ifr_ifru.ifru_hwaddr.sa_data, skip address family and length(2 bytes).
++			var nonzero bool
++			for _, b := range ifr.Ifru[2:8] {
++				if b != 0 {
++					nonzero = true
++					break
++				}
++			}
++			if nonzero {
++				ift.HardwareAddr = ifr.Ifru[2:8]
++			}
++		}
++
++		ifts = append(ifts, ift)
++		processed[ift.Index] = 1
++	}
++
++	return ifts, nil
++}
++
++func interfaceAddrTable(ifi *Interface) ([]Addr, error) {
++	// get all internet address
++	var res *_C_struct_ifaddrs
++	gerrno, err := _C_getifaddrs(&res)
++	if gerrno != 0 || err != nil {
++		return nil, os.NewSyscallError("_C_getifaddrs", errors.Join(err, errors.New(_C_gai_strerror(_C_int(gerrno)))))
++	}
++
++	// create a socket for ioctl syscall
++	s, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
++	if err != nil {
++		return nil, os.NewSyscallError("Socket", err)
++	}
++
++	var addrs []Addr
++	for r := res; r != nil; r = *_C_ifa_next(r) {
++		ifaAddr := *_C_ifa_addr(r)
++		if ifaAddr == nil {
++			continue
++		}
++		ifr := &ifreq{}
++		copy(ifr.Name[:], _C_gifa_name(r))
++		// retrieve index
++		_, _, ep := syscall.Syscall(syscall.SYS_IOCTL, uintptr(s), syscall.SIOCGIFINDEX, uintptr(unsafe.Pointer(ifr)))
++		if ep != 0 {
++			continue
++		}
++		index := int(*(*uint32)(unsafe.Pointer(&ifr.Ifru[:4][0])))
++		if ifi != nil && ifi.Index != index {
++			continue
++		}
++
++		rsa := (*syscall.RawSockaddrAny)(unsafe.Pointer(ifaAddr))
++		switch rsa.Addr.Family {
++		case syscall.AF_INET:
++			sa := (*syscall.RawSockaddrInet4)(unsafe.Pointer(rsa))
++			ipv4 := &IPNet{IP: IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3])}
++
++			maskAddr := *_C_ifa_mask(r)
++			if maskAddr != nil {
++				maskSa := (*syscall.RawSockaddrInet4)(unsafe.Pointer(maskAddr))
++				ipv4.Mask = CIDRMask(simpleMaskLength(maskSa.Addr[:]), 8*IPv4len)
++			}
++			addrs = append(addrs, ipv4)
++		case syscall.AF_INET6:
++			sa := (*syscall.RawSockaddrInet6)(unsafe.Pointer(rsa))
++			ipv6 := &IPNet{IP: make(IP, IPv6len)}
++			copy(ipv6.IP, sa.Addr[:])
++			maskAddr := *_C_ifa_mask(r)
++			if maskAddr != nil {
++				maskSa := (*syscall.RawSockaddrInet6)(unsafe.Pointer(maskAddr))
++				ipv6.Mask = CIDRMask(simpleMaskLength(maskSa.Addr[:]), 8*IPv6len)
++			}
++			addrs = append(addrs, ipv6)
++		}
++	}
++
++	return addrs, nil
++}
+--- a/src/net/parse_test.go
++++ b/src/net/parse_test.go
+@@ -12,11 +12,14 @@
+ )
+ 
+ func TestReadLine(t *testing.T) {
+-	// /etc/services file does not exist on android, plan9, windows, or wasip1
++	// /etc/services file does not exist on android, plan9, windows, openharmony, or wasip1
+ 	// where it would be required to be mounted from the host file system.
+ 	switch runtime.GOOS {
+ 	case "android", "plan9", "windows", "wasip1":
+ 		t.Skipf("not supported on %s", runtime.GOOS)
++	}
++	if runtime.IsOpenharmony {
++		t.Skipf("not supported on openharmony")
+ 	}
+ 	filename := "/etc/services" // a nice big file
+ 
+--- a/src/os/file_unix.go
++++ b/src/os/file_unix.go
+@@ -390,7 +390,7 @@
+ func tempDir() string {
+ 	dir := Getenv("TMPDIR")
+ 	if dir == "" {
+-		if runtime.GOOS == "android" {
++		if runtime.GOOS == "android" || runtime.IsOpenharmony {
+ 			dir = "/data/local/tmp"
+ 		} else {
+ 			dir = "/tmp"
+--- a/src/os/os_test.go
++++ b/src/os/os_test.go
+@@ -156,6 +156,19 @@
+ 		r = name1 == name2
+ 	}
+ 	return
++}
++
++// localTmp returns a local temporary directory not on NFS.
++func localTmp() string {
++	switch runtime.GOOS {
++	case "android", "ios", "windows":
++		return TempDir()
++	case "linux":
++		if runtime.IsOpenharmony {
++			return TempDir()
++		}
++	}
++	return "/tmp"
+ }
+ 
+ func newFile(t *testing.T) (f *File) {
+@@ -626,6 +639,10 @@
+ 	// big directory that doesn't change often.
+ 	dir := "/usr/bin"
+ 	switch runtime.GOOS {
++	case "linux":
++		if runtime.IsOpenharmony {
++			dir = "/system/bin"
++		}
+ 	case "android":
+ 		dir = "/system/bin"
+ 	case "ios", "wasip1":
+@@ -1673,6 +1690,10 @@
+ 	dirs := []string{"/", "/usr/bin", "/tmp"}
+ 	// /usr/bin does not usually exist on Plan 9 or Android.
+ 	switch runtime.GOOS {
++	case "linux":
++		if runtime.IsOpenharmony {
++			dirs = []string{"/system/bin"}
++		}
+ 	case "android":
+ 		dirs = []string{"/system/bin"}
+ 	case "plan9":
+--- a/src/os/user/user_test.go
++++ b/src/os/user/user_test.go
+@@ -6,6 +6,7 @@
+ 
+ import (
+ 	"os"
++	"runtime"
+ 	"slices"
+ 	"testing"
+ )
+@@ -37,7 +38,7 @@
+ 			t.Skipf("skipping: %v", err)
+ 		}
+ 	}
+-	if u.HomeDir == "" {
++	if !runtime.IsOpenharmony && u.HomeDir == "" {
+ 		t.Errorf("didn't get a HomeDir")
+ 	}
+ 	if u.Username == "" {
+--- a/src/runtime/asm_arm64.s
++++ b/src/runtime/asm_arm64.s
+@@ -121,9 +121,9 @@
+ 	// Initialize TLS.
+ 	MOVD	ZR, g // clear g, make sure it's not junk.
+ 	SUB	$32, RSP
+-	MRS_TPIDR_R0
+-	AND	$~7, R0
+-	MOVD	R0, 16(RSP)             // arg2: TLS base
++	MRS_TPIDR_R27
++	AND	$~7, R27
++	MOVD	R27, 16(RSP)             // arg2: TLS base
+ 	MOVD	$runtime·tls_g(SB), R2
+ 	MOVD	R2, 8(RSP)              // arg1: &tlsg
+ 	BL	·tlsinit(SB)
+@@ -145,8 +145,8 @@
+ 	CBZ	R12, nocgo
+ 
+ #ifdef GOOS_android
+-	MRS_TPIDR_R0			// load TLS base pointer
+-	MOVD	R0, R3			// arg 3: TLS base pointer
++	MRS_TPIDR_R27			// load TLS base pointer
++	MOVD	R27, R3			// arg 3: TLS base pointer
+ 	MOVD	$runtime·tls_g(SB), R2 	// arg 2: &tls_g
+ #else
+ 	MOVD	$0, R2		        // arg 2: not used when using platform's TLS
+--- /dev/null
++++ b/src/runtime/cgo/callbacks_musl_linux.go
+@@ -0,0 +1,23 @@
++// Copyright 2024 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build linux
++
++package cgo
++
++import _ "unsafe" // for go:linkname
++
++// x_cgo_is_musl returns 1 if the C library is musl.
++
++//go:cgo_import_static x_cgo_is_musl
++//go:linkname x_cgo_is_musl x_cgo_is_musl
++//go:linkname _cgo_is_musl _cgo_is_musl
++var x_cgo_is_musl byte
++var _cgo_is_musl = &x_cgo_is_musl
++
++//go:cgo_import_static x_cgo_get_environ
++//go:linkname x_cgo_get_environ x_cgo_get_environ
++//go:linkname _cgo_get_environ _cgo_get_environ
++var x_cgo_get_environ byte
++var _cgo_get_environ = &x_cgo_get_environ
+--- /dev/null
++++ b/src/runtime/cgo/gcc_musl_linux.c
+@@ -0,0 +1,29 @@
++// Copyright 2024 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build linux
++
++#include <stddef.h>
++
++extern char **environ;
++
++// x_cgo_is_musl reports whether the C library is musl.
++int x_cgo_is_musl() {
++	#if defined(__GLIBC__) || defined(__UCLIBC__)
++		return 0;
++	#else
++		return 1;
++	#endif
++}
++
++int x_cgo_get_environ(char ***env_ptr) {
++	if (env_ptr == NULL) {
++		return -1;
++	}
++	if (!environ) {
++		return -1;
++	}
++	*env_ptr = environ;
++	return 0;
++}
+--- a/src/runtime/crash_cgo_test.go
++++ b/src/runtime/crash_cgo_test.go
+@@ -301,6 +301,7 @@
+ 	case "linux/arm64":
+ 	case "linux/loong64":
+ 	case "linux/ppc64le":
++	case "openharmony/arm64":
+ 	default:
+ 		t.Skipf("not yet supported on %s", platform)
+ 	}
+@@ -326,6 +327,7 @@
+ 	case "linux/arm64":
+ 	case "linux/loong64":
+ 	case "linux/ppc64le":
++	case "openharmony/arm64":
+ 	default:
+ 		t.Skipf("not yet supported on %s", platform)
+ 	}
+--- /dev/null
++++ b/src/runtime/export_heap_addr_bits_test.go
+@@ -0,0 +1,9 @@
++// Copyright 2024 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// Export heapAddrBits for testing.
++
++package runtime
++
++const HeapAddrBits = heapAddrBits
+--- a/src/runtime/extern.go
++++ b/src/runtime/extern.go
+@@ -379,6 +379,8 @@
+ // To view possible combinations of GOOS and GOARCH, run "go tool dist list".
+ const GOOS string = goos.GOOS
+ 
++const IsOpenharmony bool = goos.IsOpenharmony == 1
++
+ // GOARCH is the running program's architecture target:
+ // one of 386, amd64, arm, s390x, and so on.
+ const GOARCH string = goarch.GOARCH
+--- /dev/null
++++ b/src/runtime/heap_addr_bits_test.go
+@@ -0,0 +1,24 @@
++// Copyright 2024 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package runtime_test
++
++import (
++	. "runtime"
++	"testing"
++)
++
++func TestHeapAddrBitsValue(t *testing.T) {
++	if GOARCH == "arm64" && IsOpenharmony {
++		if HeapAddrBits != 39 {
++			t.Fatalf("heapAddrBits = %d, want 39", HeapAddrBits)
++		}
++	} else if (GOARCH == "amd64" || GOARCH == "arm64") && GOOS == "linux" {
++		if HeapAddrBits != 48 {
++			t.Fatalf("heapAddrBits = %d, want 48", HeapAddrBits)
++		}
++	} else {
++		t.Skip()
++	}
++}
+--- a/src/runtime/malloc.go
++++ b/src/runtime/malloc.go
+@@ -210,7 +210,7 @@
+ 	// to a 48-bit address space like every other arm64 platform.
+ 	//
+ 	// WebAssembly currently has a limit of 4GB linear memory.
+-	heapAddrBits = (_64bit*(1-goarch.IsWasm)*(1-goos.IsIos*goarch.IsArm64))*48 + (1-_64bit+goarch.IsWasm)*(32-(goarch.IsMips+goarch.IsMipsle)) + 40*goos.IsIos*goarch.IsArm64
++	heapAddrBits = (_64bit*(1-goarch.IsWasm)*(1-goos.IsIos*goarch.IsArm64)*(1-goos.IsOpenharmony*goarch.IsArm64))*48 + (1-_64bit+goarch.IsWasm)*(32-(goarch.IsMips+goarch.IsMipsle)) + 40*goos.IsIos*goarch.IsArm64 + 39*goos.IsOpenharmony*goarch.IsArm64
+ 
+ 	// maxAlloc is the maximum size of an allocation. On 64-bit,
+ 	// it's theoretically possible to allocate 1<<heapAddrBits bytes. On
+--- a/src/runtime/mgcscavenge_test.go
++++ b/src/runtime/mgcscavenge_test.go
+@@ -425,7 +425,7 @@
+ 	}
+ 	// Disable these tests on iOS since we have a small address space.
+ 	// See #46860.
+-	if PageAlloc64Bit != 0 && goos.IsIos == 0 {
++	if PageAlloc64Bit != 0 && goos.IsIos == 0 && goos.IsOpenharmony == 0 {
+ 		tests["ScavAllVeryDiscontiguous"] = setup{
+ 			beforeAlloc: map[ChunkIdx][]BitRange{
+ 				BaseChunkIdx:          {},
+--- a/src/runtime/mpagealloc_test.go
++++ b/src/runtime/mpagealloc_test.go
+@@ -168,7 +168,7 @@
+ 	}
+ 	// Disable these tests on iOS since we have a small address space.
+ 	// See #46860.
+-	if PageAlloc64Bit != 0 && goos.IsIos == 0 {
++	if PageAlloc64Bit != 0 && goos.IsIos == 0 && goos.IsOpenharmony == 0 {
+ 		tests["ExtremelyDiscontiguous"] = test{
+ 			chunks: []ChunkIdx{
+ 				BaseChunkIdx,
+@@ -577,7 +577,7 @@
+ 	}
+ 	// Disable these tests on iOS since we have a small address space.
+ 	// See #46860.
+-	if PageAlloc64Bit != 0 && goos.IsIos == 0 {
++	if PageAlloc64Bit != 0 && goos.IsIos == 0 && goos.IsOpenharmony == 0 {
+ 		const chunkIdxBigJump = 0x100000 // chunk index offset which translates to O(TiB)
+ 
+ 		// This test attempts to trigger a bug wherein we look at unmapped summary
+--- a/src/runtime/mpagecache_test.go
++++ b/src/runtime/mpagecache_test.go
+@@ -377,7 +377,7 @@
+ 	}
+ 	// Disable these tests on iOS since we have a small address space.
+ 	// See #46860.
+-	if PageAlloc64Bit != 0 && goos.IsIos == 0 {
++	if PageAlloc64Bit != 0 && goos.IsIos == 0 && goos.IsOpenharmony == 0 {
+ 		const chunkIdxBigJump = 0x100000 // chunk index offset which translates to O(TiB)
+ 
+ 		// This test is similar to the one with the same name for
+--- a/src/runtime/os_linux.go
++++ b/src/runtime/os_linux.go
+@@ -237,21 +237,25 @@
+ func sysargs(argc int32, argv **byte) {
+ 	n := argc + 1
+ 
+-	// skip over argv, envp to get to auxv
+-	for argv_index(argv, n) != nil {
++	// auxv on argv is not available on musl library/archive.
++	if !libmusl {
++		// skip over argv, envp to get to auxv
++		for argv_index(argv, n) != nil {
++			n++
++		}
++
++		// skip NULL separator
+ 		n++
+-	}
+-
+-	// skip NULL separator
+-	n++
+-
+-	// now argv+n is auxv
+-	auxvp := (*[1 << 28]uintptr)(add(unsafe.Pointer(argv), uintptr(n)*goarch.PtrSize))
+-
+-	if pairs := sysauxv(auxvp[:]); pairs != 0 {
+-		auxv = auxvp[: pairs*2 : pairs*2]
+-		return
+-	}
++
++		// now argv+n is auxv
++		auxvp := (*[1 << 28]uintptr)(add(unsafe.Pointer(argv), uintptr(n)*goarch.PtrSize))
++
++		if pairs := sysauxv(auxvp[:]); pairs != 0 {
++			auxv = auxvp[: pairs*2 : pairs*2]
++			return
++		}
++	}
++
+ 	// In some situations we don't get a loader-provided
+ 	// auxv, such as when loaded as a library on Android.
+ 	// Fall back to /proc/self/auxv.
+@@ -369,8 +373,18 @@
+ }
+ 
+ func goenvs() {
++	if libmusl {
++		goenvs_musl()
++		return
++	}
+ 	goenvs_unix()
+ }
++
++//go:linkname _cgo_is_musl _cgo_is_musl
++var _cgo_is_musl unsafe.Pointer
++
++//go:linkname _cgo_get_environ _cgo_get_environ
++var _cgo_get_environ unsafe.Pointer
+ 
+ // Called to do synchronous initialization of Go code built with
+ // -buildmode=c-archive or -buildmode=c-shared.
+@@ -379,6 +393,10 @@
+ //go:nosplit
+ //go:nowritebarrierrec
+ func libpreinit() {
++	libmusl = asmcgocall(_cgo_is_musl, nil) == 1
++	if libmusl {
++		asmcgocall(_cgo_get_environ, unsafe.Pointer(&muslEnviron))
++	}
+ 	initsig(true)
+ }
+ 
+@@ -544,7 +562,7 @@
+ 		//
+ 		// Just ignore the error in these case. There isn't
+ 		// anything we can do about it anyhow.
+-		if sig != 32 && sig != 33 && sig != 64 {
++		if sig != 32 && sig != 33 && sig != 64 && sig != 43 {
+ 			// Use system stack to avoid split stack overflow on ppc64/ppc64le.
+ 			systemstack(func() {
+ 				throw("sigaction failed")
+--- a/src/runtime/proc.go
++++ b/src/runtime/proc.go
+@@ -798,6 +798,30 @@
+ 		// Similar to goenv_unix but extracts the environment value for
+ 		// GODEBUG directly.
+ 		// TODO(moehrmann): remove when general goenvs() can be called before cpuinit()
++
++		// If the binary is an archive or a library, the operating system is Linux,
++		// and the system uses Musl, then read the environment variables from the
++		// /proc/self/environ file. Iterate over each null-terminated string read
++		// from the file. If any string has the specified prefix, return that string.
++		if libmusl {
++			// mallocinit has not run yet: do not read or allocate /proc buffers.
++			// libpreinit obtains this borrowed C environment pointer before startup.
++			if muslEnviron == nil {
++				return "", false // schedinit will parse env after goenvs instead.
++			}
++			for i := int32(0); ; i++ {
++				p := argv_index(muslEnviron, i)
++				if p == nil {
++					break
++				}
++				value := unsafe.String(p, findnull(p))
++				if stringslite.HasPrefix(value, prefix) {
++					return value[len(prefix):], true
++				}
++			}
++			return "", true
++		}
++
+ 		n := int32(0)
+ 		for argv_index(argv, argc+1+n) != nil {
+ 			n++
+--- a/src/runtime/race_arm64.s
++++ b/src/runtime/race_arm64.s
+@@ -26,20 +26,11 @@
+ 
+ // The race ctx, ThreadState *thr below, is passed in R0 and loaded in racecalladdr.
+ 
+-// Darwin may return unaligned thread pointer. Align it. (See tls_arm64.s)
+-// No-op on other OSes.
+-#ifdef TLS_darwin
+-#define TP_ALIGN	AND	$~7, R0
+-#else
+-#define TP_ALIGN
+-#endif
+-
+ // Load g from TLS. (See tls_arm64.s)
+ #define load_g \
+-	MRS_TPIDR_R0 \
+-	TP_ALIGN \
+-	MOVD    runtime·tls_g(SB), R11 \
+-	MOVD    (R0)(R11), g
++	LOAD_TLS_G_R0 \
++	LOAD_TP_R27 \
++	MOVD    (R0)(R27), g
+ 
+ // func runtime·raceread(addr uintptr)
+ // Called from instrumented code.
+--- /dev/null
++++ b/src/runtime/rt0_openharmony_arm64.s
+@@ -0,0 +1,64 @@
++// Copyright 2024 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++#include "textflag.h"
++#include "cgo/abi_arm64.h"
++
++TEXT _rt0_arm64_openharmony(SB),NOSPLIT|NOFRAME,$0
++	MOVD	0(RSP), R0	// argc
++	ADD	$8, RSP, R1	// argv
++	BL	main(SB)
++
++// When building with -buildmode=c-shared, this symbol is called when the shared
++// library is loaded.
++TEXT _rt0_arm64_openharmony_lib(SB),NOSPLIT,$184
++	// Preserve callee-save registers.
++	SAVE_R19_TO_R28(24)
++	SAVE_F8_TO_F15(104)
++
++	// Initialize g as null in case of using g later e.g. sigaction in cgo_sigaction.go
++	MOVD	ZR, g
++
++	MOVD	R0, _rt0_arm64_openharmony_lib_argc<>(SB)
++	MOVD	R1, _rt0_arm64_openharmony_lib_argv<>(SB)
++
++	// Synchronous initialization.
++	MOVD	$runtime·libpreinit(SB), R4
++	BL	(R4)
++
++	// Create a new thread to do the runtime initialization and return.
++	MOVD	_cgo_sys_thread_create(SB), R4
++	CBZ	R4, nocgo
++	MOVD	$_rt0_arm64_openharmony_lib_go(SB), R0
++	MOVD	$0, R1
++	SUB	$16, RSP		// reserve 16 bytes for sp-8 where fp may be saved.
++	BL	(R4)
++	ADD	$16, RSP
++	B	restore
++
++nocgo:
++	MOVD	$0x800000, R0                     // stacksize = 8192KB
++	MOVD	$_rt0_arm64_openharmony_lib_go(SB), R1
++	MOVD	R0, 8(RSP)
++	MOVD	R1, 16(RSP)
++	MOVD	$runtime·newosproc0(SB),R4
++	BL	(R4)
++
++restore:
++	// Restore callee-save registers.
++	RESTORE_R19_TO_R28(24)
++	RESTORE_F8_TO_F15(104)
++	RET
++
++TEXT _rt0_arm64_openharmony_lib_go(SB),NOSPLIT,$0
++	MOVD	_rt0_arm64_openharmony_lib_argc<>(SB), R0
++	MOVD	_rt0_arm64_openharmony_lib_argv<>(SB), R1
++	MOVD	$runtime·rt0_go(SB),R4
++	B       (R4)
++
++DATA _rt0_arm64_openharmony_lib_argc<>(SB)/8, $0
++GLOBL _rt0_arm64_openharmony_lib_argc<>(SB),NOPTR, $8
++DATA _rt0_arm64_openharmony_lib_argv<>(SB)/8, $0
++GLOBL _rt0_arm64_openharmony_lib_argv<>(SB),NOPTR, $8
++
+--- a/src/runtime/runtime1.go
++++ b/src/runtime/runtime1.go
+@@ -25,6 +25,9 @@
+ 
+ var traceback_cache uint32 = 2 << tracebackShift
+ var traceback_env uint32
++
++var procCmdline = []byte("/proc/self/cmdline\x00")
++var procEnviron = []byte("/proc/self/environ\x00")
+ 
+ // gotraceback returns the current traceback settings.
+ //
+@@ -53,8 +56,9 @@
+ }
+ 
+ var (
+-	argc int32
+-	argv **byte
++	argc        int32
++	argv        **byte
++	muslEnviron **byte
+ )
+ 
+ // nosplit for use in linux startup sysargs.
+@@ -74,6 +78,13 @@
+ 	if GOOS == "windows" {
+ 		return
+ 	}
++
++	// musl-linux library: Read argv from /proc/self/cmdline instead
++	if libmusl {
++		argslice = readNullTerminatedStringsFromFile(procCmdline)
++		return
++	}
++
+ 	argslice = make([]string, argc)
+ 	for i := int32(0); i < argc; i++ {
+ 		argslice[i] = gostringnocopy(argv_index(argv, i))
+@@ -93,6 +104,72 @@
+ 	for i := int32(0); i < n; i++ {
+ 		envs[i] = gostring(argv_index(argv, argc+1+i))
+ 	}
++}
++
++func goenvs_musl() {
++	if muslEnviron != nil {
++		n := int32(0)
++		for argv_index(muslEnviron, n) != nil {
++			n++
++		}
++		envs = make([]string, n)
++		for i := int32(0); i < n; i++ {
++			envs[i] = gostring(argv_index(muslEnviron, i))
++		}
++		return
++	}
++
++	// Read envs from /proc/self/environ instead
++	envs = readNullTerminatedStringsFromFile(procEnviron)
++}
++
++// readNullTerminatedStringsFromFile reads a file specified by the given path
++// and returns a slice of strings. Each string in the slice is null-terminated
++// in the file.
++//
++// Parameters:
++// - path: A null-terminated byte slice representing the file path.
++//
++// Returns:
++// - A slice of strings read from the file, where each string is null-terminated.
++//
++// It opens the file, reads its contents in chunks,
++// and parses the data into a slice of strings based on null-termination.
++//
++// Note: This function will return nil if the file cannot be opened.
++func readNullTerminatedStringsFromFile(path []byte) []string {
++	fd := open(&path[0], 0 /* O_RDONLY */, 0)
++	if fd <= 0 {
++		return nil
++	}
++
++	// Read the file.
++	var data []byte
++	var buf [1024]byte
++	for {
++		n := read(fd, noescape(unsafe.Pointer(&buf[0])), int32(unsafe.Sizeof(buf)))
++		if n <= 0 { // EOF
++			break
++		}
++		data = append(data, buf[:n]...)
++	}
++
++	// Parse the data into a slice of strings.
++	var start int
++	var result = make([]string, 0, 8)
++	for i := 0; i < len(data); i++ {
++		if data[i] == 0 { // null-termination
++			if i > start {
++				result = append(result, gostring(&data[start:i][0]))
++			} else {
++				result = append(result, "")
++			}
++			start = i + 1
++		}
++	}
++
++	closefd(fd)
++	return result
+ }
+ 
+ func environ() []string {
+--- a/src/runtime/runtime2.go
++++ b/src/runtime/runtime2.go
+@@ -1501,6 +1501,9 @@
+ 	isarchive bool // -buildmode=c-archive
+ )
+ 
++// libmusl is set if the Go archive/library is linked against linux musl libc.
++var libmusl bool  // set by os_linux libpreinit
++
+ // Must agree with internal/buildcfg.FramePointerEnabled.
+ const framepointer_enabled = GOARCH == "amd64" || GOARCH == "arm64"
+ 
+--- a/src/runtime/runtime_test.go
++++ b/src/runtime/runtime_test.go
+@@ -23,6 +23,13 @@
+ 	"time"
+ 	"unsafe"
+ )
++
++func getGoos() string {
++	if IsOpenharmony {
++		return "openharmony"
++	}
++	return GOOS
++}
+ 
+ // flagQuick is set by the -quick option to skip some relatively slow tests.
+ // This is used by the cmd/dist test runtime:cpu124.
+--- a/src/runtime/tls_arm64.h
++++ b/src/runtime/tls_arm64.h
+@@ -1,6 +1,10 @@
+ // Copyright 2015 The Go Authors. All rights reserved.
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
++
++#ifdef GOOS_openharmony
++#define TLS_linux
++#endif
+ 
+ #ifdef GOOS_android
+ #define TLS_linux
+@@ -10,7 +14,7 @@
+ #define TLS_linux
+ #endif
+ #ifdef TLS_linux
+-#define MRS_TPIDR_R0 WORD $0xd53bd040 // MRS TPIDR_EL0, R0
++#define MRS_TPIDR_R27 WORD $0xd53bd05b // MRS TPIDR_EL0, R27
+ #endif
+ 
+ #ifdef GOOS_darwin
+@@ -21,19 +25,19 @@
+ #endif
+ #ifdef TLS_darwin
+ #define TLSG_IS_VARIABLE
+-#define MRS_TPIDR_R0 WORD $0xd53bd060 // MRS TPIDRRO_EL0, R0
++#define MRS_TPIDR_R27 WORD $0xd53bd07b // MRS TPIDRRO_EL0, R27
+ #endif
+ 
+ #ifdef GOOS_freebsd
+-#define MRS_TPIDR_R0 WORD $0xd53bd040 // MRS TPIDR_EL0, R0
++#define MRS_TPIDR_R27 WORD $0xd53bd05b // MRS TPIDR_EL0, R27
+ #endif
+ 
+ #ifdef GOOS_netbsd
+-#define MRS_TPIDR_R0 WORD $0xd53bd040 // MRS TPIDRRO_EL0, R0
++#define MRS_TPIDR_R27 WORD $0xd53bd05b // MRS TPIDRRO_EL0, R27
+ #endif
+ 
+ #ifdef GOOS_openbsd
+-#define MRS_TPIDR_R0 WORD $0xd53bd040 // MRS TPIDR_EL0, R0
++#define MRS_TPIDR_R27 WORD $0xd53bd05b // MRS TPIDR_EL0, R27
+ #endif
+ 
+ #ifdef GOOS_windows
+@@ -41,11 +45,42 @@
+ #endif
+ #ifdef TLS_windows
+ #define TLSG_IS_VARIABLE
+-#define MRS_TPIDR_R0 MOVD R18_PLATFORM, R0
++#define MRS_TPIDR_R27 MOVD R18_PLATFORM, R27
+ #endif
+ 
+ // Define something that will break the build if
+ // the GOOS is unknown.
+-#ifndef MRS_TPIDR_R0
+-#define MRS_TPIDR_R0 unknown_TLS_implementation_in_tls_arm64_h
++#ifndef MRS_TPIDR_R27
++#define MRS_TPIDR_R27 unknown_TLS_implementation_in_tls_arm64_h
+ #endif
++
++#ifdef TLS_GD
++// General dynamic TLS model: the assembler lowers second MOVD (that gets the tls
++// variable's offset from thread pointer) to a 4-instruction sequence ADRP;LDR;ADD;BLR
++// (the external linker can sometimes relax it / nop-out some of them).
++// Preserve the AAPCS64 callee-saved R25 across foreign-thread C ABI entries.
++// This leaf macro saves LR at the temporary SP, preserves 16-byte alignment,
++// and does not overwrite the caller's FP at original SP-8. OHOS musl's
++// TLSDESC resolver allocates below its incoming SP and preserves this LR slot.
++#define LOAD_TLS_G_R0 \
++    SUB $16, RSP \
++    MOVD LR, 0(RSP) \
++    MOVD runtime·tls_g(SB), R0 \
++    MOVD 0(RSP), LR \
++    ADD $16, RSP
++#else
++// Get TLS variable's offset (using initial exec or local exec TLS model) from
++// the thread pointer, which can be obtained with LOAD_TP_R27 macro.
++#define LOAD_TLS_G_R0 \
++    MOVD runtime·tls_g(SB), R0
++#endif
++
++#ifdef TLS_darwin
++// Darwin may return unaligned thread pointer. Align it.
++#define LOAD_TP_R27 \
++    MRS_TPIDR_R27 \
++    AND   $-7, R27
++#else
++#define LOAD_TP_R27 \
++    MRS_TPIDR_R27
++#endif
+--- a/src/runtime/tls_arm64.s
++++ b/src/runtime/tls_arm64.s
+@@ -18,12 +18,8 @@
+ #endif
+ #endif
+ 
+-	MRS_TPIDR_R0
+-#ifdef TLS_darwin
+-	// Darwin sometimes returns unaligned pointers
+-	AND	$0xfffffffffffffff8, R0
+-#endif
+-	MOVD	runtime·tls_g(SB), R27
++	LOAD_TLS_G_R0
++	LOAD_TP_R27
+ 	MOVD	(R0)(R27), g
+ 
+ nocgo:
+@@ -39,12 +35,8 @@
+ #endif
+ #endif
+ 
+-	MRS_TPIDR_R0
+-#ifdef TLS_darwin
+-	// Darwin sometimes returns unaligned pointers
+-	AND	$0xfffffffffffffff8, R0
+-#endif
+-	MOVD	runtime·tls_g(SB), R27
++	LOAD_TLS_G_R0
++	LOAD_TP_R27
+ 	MOVD	g, (R0)(R27)
+ 
+ nocgo:
+--- a/src/syscall/exec_linux_test.go
++++ b/src/syscall/exec_linux_test.go
+@@ -30,6 +30,13 @@
+ 	"unsafe"
+ )
+ 
++func getGoos() string {
++	if runtime.IsOpenharmony {
++		return "openharmony"
++	}
++	return runtime.GOOS
++}
++
+ // whoamiNEWUSER returns a command that runs "whoami" with CLONE_NEWUSER,
+ // mapping uid and gid 0 to the actual uid and gid of the test.
+ func whoamiNEWUSER(t *testing.T, uid, gid int, setgroups bool) *exec.Cmd {
+@@ -286,8 +293,8 @@
+ 	// Since we are doing a chroot, we need the binary there,
+ 	// and it must be statically linked.
+ 	testenv.MustHaveGoBuild(t)
+-	if platform.MustLinkExternal(runtime.GOOS, runtime.GOARCH, false) {
+-		t.Skipf("skipping: can't build static binary because %s/%s requires external linking", runtime.GOOS, runtime.GOARCH)
++	if platform.MustLinkExternal(getGoos(), runtime.GOARCH, false) {
++		t.Skipf("skipping: can't build static binary because %s/%s requires external linking", getGoos(), runtime.GOARCH)
+ 	}
+ 	x := filepath.Join(d, "syscall.test")
+ 	t.Cleanup(func() {
+@@ -646,6 +653,11 @@
+ 	// skip on android, due to lack of lookup support
+ 	if runtime.GOOS == "android" {
+ 		t.Skip("skipping test on android; see Issue 27327")
++	}
++
++	// skip on openharmony, due to lack of nobody user
++	if runtime.IsOpenharmony {
++		t.Skip("skipping test on openharmony, due to lack of nobody user")
+ 	}
+ 
+ 	u, err := user.Lookup("nobody")
+--- a/src/testing/benchmark.go
++++ b/src/testing/benchmark.go
+@@ -274,7 +274,11 @@
+ // subbenchmarks. b must not have subbenchmarks.
+ func (b *B) run() {
+ 	labelsOnce.Do(func() {
+-		fmt.Fprintf(b.w, "goos: %s\n", runtime.GOOS)
++		goos := runtime.GOOS
++		if runtime.IsOpenharmony {
++			goos = "openharmony"
++		}
++		fmt.Fprintf(b.w, "goos: %s\n", goos)
+ 		fmt.Fprintf(b.w, "goarch: %s\n", runtime.GOARCH)
+ 		if b.importPath != "" {
+ 			fmt.Fprintf(b.w, "pkg: %s\n", b.importPath)
+--- /dev/null
++++ b/src/time/zoneinfo_openharmony.go
+@@ -0,0 +1,115 @@
++// Copyright 2024 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// Parse the "tzdata" packed timezone file used on Openharmony.
++// The format is lifted from __tz.c in
++// openharmony/third_party_musl/porting/linux/user/src/time in the OHOS.
++
++package time
++
++import (
++	"errors"
++	"syscall"
++)
++
++var platformZoneSources = []string{
++	"/etc/zoneinfo/tzdata",
++}
++
++func initLocal() {
++	// consult $TZ to find the time zone to use.
++	// no $TZ means use the system default /etc/localtime.
++	// $TZ="" means use UTC.
++	// $TZ="foo" or $TZ=":foo" if foo is an absolute path, then the file pointed
++	// by foo will be used to initialize timezone; otherwise, file
++	// /usr/share/zoneinfo/foo will be used.
++
++	tz, ok := syscall.Getenv("TZ")
++	switch {
++	case !ok:
++		z, err := loadLocation("localtime", []string{"/etc"})
++		if err == nil {
++			localLoc = *z
++			localLoc.name = "Local"
++			return
++		}
++	case tz != "":
++		if tz[0] == ':' {
++			tz = tz[1:]
++		}
++		if tz != "" && tz[0] == '/' {
++			if z, err := loadLocation(tz, []string{""}); err == nil {
++				localLoc = *z
++				if tz == "/etc/localtime" {
++					localLoc.name = "Local"
++				} else {
++					localLoc.name = tz
++				}
++				return
++			}
++		} else if tz != "" && tz != "UTC" {
++			if z, err := loadLocation(tz, platformZoneSources); err == nil {
++				localLoc = *z
++				return
++			}
++		}
++	}
++
++	// Fall back to UTC.
++	localLoc.name = "UTC"
++}
++
++func init() {
++	loadTzinfoFromTzdata = ohosLoadTzinfoFromTzdata
++}
++
++func ohosLoadTzinfoFromTzdata(file, name string) ([]byte, error) {
++	const (
++		headersize = 12 + 3*4
++		namesize   = 40
++		entrysize  = namesize + 2*4
++	)
++	if len(name) > namesize {
++		return nil, errors.New(name + " is longer than the maximum zone name length (40 bytes)")
++	}
++	fd, err := open(file)
++	if err != nil {
++		return nil, err
++	}
++	defer closefd(fd)
++
++	buf := make([]byte, headersize)
++	if err := preadn(fd, buf, 0); err != nil {
++		return nil, errors.New("corrupt tzdata file " + file)
++	}
++	d := dataIO{buf, false}
++	if magic := d.read(6); string(magic) != "tzdata" {
++		return nil, errors.New("corrupt tzdata file " + file)
++	}
++	d = dataIO{buf[12:], false}
++	indexOff, _ := d.big4()
++	dataOff, _ := d.big4()
++	indexSize := dataOff - indexOff
++	entrycount := indexSize / entrysize
++	buf = make([]byte, indexSize)
++	if err := preadn(fd, buf, int(indexOff)); err != nil {
++		return nil, errors.New("corrupt tzdata file " + file)
++	}
++	for i := 0; i < int(entrycount); i++ {
++		entry := buf[i*entrysize : (i+1)*entrysize]
++		// len(name) <= namesize is checked at function entry
++		if string(entry[:len(name)]) != name {
++			continue
++		}
++		d := dataIO{entry[namesize:], false}
++		off, _ := d.big4()
++		size, _ := d.big4()
++		buf := make([]byte, size)
++		if err := preadn(fd, buf, int(off+dataOff)); err != nil {
++			return nil, errors.New("corrupt tzdata file " + file)
++		}
++		return buf, nil
++	}
++	return nil, syscall.ENOENT
++}
+--- a/src/time/zoneinfo_unix.go
++++ b/src/time/zoneinfo_unix.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build unix && !ios && !android
++//go:build unix && !ios && !android && !openharmony
+ 
+ // Parse "zoneinfo" time zone file.
+ // This is a fairly standard file format used on OS X, Linux, BSD, Sun, and others.
+--- a/test/fixedbugs/issue10607a.go
++++ b/test/fixedbugs/issue10607a.go
+@@ -31,6 +31,9 @@
+ 	for i, s := range f.Sections {
+ 		if s.Type != elf.SHT_NOTE {
+ 			continue
++		}
++		if s.Name == ".note.ohos.ident" {
++			continue // If the field is .note.ohos.ident, skip the field and do not parse it.
+ 		}
+ 
+ 		d, err := s.Data()
+--- /dev/null
++++ b/test/tls_gd.s
+@@ -0,0 +1,14 @@
++// objcheck -tls=GD
++
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++#define TLSBSS  256
++GLOBL var·tls_g+0(SB), TLSBSS, $8
++
++TEXT ·TlsVarAddr(SB),$0
++// arm64:`.*\bADRP 0\(PC\), R0\s+\[0:8\]R_ARM64_TLS_GD:var.tls_g$`, `.*\bMOVD \(R0\), R27$`, `.*\bADD \$0, R0, R0$`, `.*\bCALL \(R27\)$`, -`.*R[3-91].*`
++	MOVD	var·tls_g(SB), R0
++	RET
++
+--- /dev/null
++++ b/test/tls_ie.s
+@@ -0,0 +1,14 @@
++// objcheck -tls=IE
++
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++#define TLSBSS  256
++GLOBL var·tls_g+0(SB), TLSBSS, $8
++
++TEXT ·TlsVarAddr(SB),$0
++// arm64:`.*\bADRP 0\(PC\), R27\s+\[0:8\]R_ARM64_TLS_IE:var.tls_g$`, `.*\bMOVD \(R27\), R0$`, -`.*R[3-91].*`
++	MOVD	var·tls_g(SB), R0
++	RET
++
+--- /dev/null
++++ b/test/tls_le.s
+@@ -0,0 +1,14 @@
++// objcheck -tls=LE
++
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++#define TLSBSS  256
++GLOBL var·tls_g+0(SB), TLSBSS, $8
++
++TEXT ·TlsVarAddr(SB),$0
++// arm64:`.*\bMOVD \$0, R0\s+\[0:4\]R_ARM64_TLS_LE:var.tls_g$`, -`.*R[3-91].*`
++	MOVD	var·tls_g(SB), R0
++	RET
++

@@ -1,0 +1,12 @@
+{
+  global:
+    CGoRunXrayFromJSON;
+    CGoStopXray;
+    CGoXrayVersion;
+    CGoRuntimeInfo;
+    CGoPing;
+    CGoQueryStats;
+    CGoFree;
+    CGoSetSocketProtectCallback;
+  local: *;
+};
