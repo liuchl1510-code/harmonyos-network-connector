@@ -19,6 +19,8 @@ import { readNodeCatalog, SavedNode } from '../model/NodeCatalog';
 import { fingerprintOutbound, NodeLatencyResult, saveNodeLatency } from '../model/NodeLatency';
 import { readLatencyRequest, readLatencyProof } from '../model/LatencyProtocol';
 import { appendDiagnosticEvent } from '../model/DiagnosticJournal';
+import { readNetworkPolicy } from '../model/NetworkPolicyStore';
+import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
 
 const TAG: string = 'HarmonyVpnLab';
 const DOMAIN: number = 0x0000;
@@ -192,6 +194,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
 
   private async initializeProbe(): Promise<void> {
     try {
+      if (!VPN_CORE_AVAILABLE) { throw new Error('模拟器界面预览不包含 VPN 核心，未创建虚拟网卡。'); }
       if (this.checkPersistentCancellation() || this.stopRequested) {
         return;
       }
@@ -459,7 +462,8 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
       if (this.coreProbe) { await this.coreProbe.resumeConnection(this.context, bootstrap); }
       else {
         this.coreProbe = new CoreProbe();
-        await this.coreProbe.startConnection(this.tunFd, this.context, (fd: number) => this.protectSocket(fd), bootstrap, this.connectionNode?.outboundJson);
+        await this.coreProbe.startConnection(this.tunFd, this.context, (fd: number) => this.protectSocket(fd), bootstrap,
+          this.connectionNode?.outboundJson, this.testKind === 'connection' ? readNetworkPolicy(this.context.filesDir) : undefined);
       }
       if (this.stopRequested || epoch !== this.networkEpoch) { return; }
       this.appliedNetworkKey = target.key; this.retryAt = 0; this.retryCount = 0;

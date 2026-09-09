@@ -1,9 +1,11 @@
 import { common } from '@kit.AbilityKit';
 import { DiagnosticEvent, readDiagnosticEvents } from '../model/DiagnosticJournal';
+import { formContentWidth } from '../model/AdaptiveLayout';
 
 @Entry
 @Component
 struct Diagnostics {
+  @StorageProp('windowWidthVp') windowWidthVp: number = 360;
   @State events: DiagnosticEvent[] = [];
   @State message: string = '';
 
@@ -80,7 +82,7 @@ struct Diagnostics {
           .borderRadius(12).constraintSize({ minHeight: 44 }).padding({ left: 12, right: 12 })
           .onClick(() => { this.getUIContext().getRouter().back(); });
         Text('连接诊断').fontSize(23).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary')).layoutWeight(1);
-      }.width('100%').padding({ left: 20, right: 20, top: 12, bottom: 16 });
+      }.width(formContentWidth(this.windowWidthVp)).padding({ left: 20, right: 20, top: 12, bottom: 16 });
       Scroll() {
         Column({ space: 16 }) {
           Column({ space: 14 }) {
@@ -126,8 +128,9 @@ struct Diagnostics {
               .backgroundColor($r('app.color.surface')).borderRadius(18)
               .border({ width: 1, color: $r('app.color.border') });
           }, (event: DiagnosticEvent, index: number) => `${event.at}-${index}`)
-        }.width('100%').padding({ left: 20, right: 20, bottom: 28 }).alignItems(HorizontalAlign.Start);
+        }.width(formContentWidth(this.windowWidthVp)).padding({ left: 20, right: 20, bottom: 28 })
+          .alignItems(HorizontalAlign.Start);
       }.width('100%').layoutWeight(1).align(Alignment.Top);
-    }.width('100%').height('100%').backgroundColor($r('app.color.page_bg'));
+    }.width('100%').height('100%').alignItems(HorizontalAlign.Center).backgroundColor($r('app.color.page_bg'));
   }
 }

@@ -11,6 +11,7 @@ import { parseNode } from '../model/NodeImport';
 import { buildConnectionConfig } from '../model/ConnectionConfig';
 import { ConnectionSnapshot } from '../model/ConnectionSnapshot';
 import { NodeBootstrap } from '../model/NodeBootstrap';
+import { NetworkPolicy, validateNetworkPolicy } from '../model/NetworkPolicy';
 import { systemDateTime } from '@kit.BasicServicesKit';
 
 interface RealityDiagnostics { show?: boolean; }
@@ -73,6 +74,7 @@ export class CoreProbe {
   private connectionPrepared: boolean = false;
   private connectionSuspended: boolean = false;
   private connectionOutboundJson: string = '';
+  private connectionPolicy?: NetworkPolicy;
   private connectionSocksPort: number = 0;
   private connectionAccumulatedUp: number = 0;
   private connectionAccumulatedDown: number = 0;
@@ -210,9 +212,9 @@ export class CoreProbe {
   // heartbeat scheduling and session duration; this path performs no node probe.
   async startConnection(fd: number, context: common.Context,
     protectSocket: (fd: number) => Promise<void>, bootstrap?: NodeBootstrap,
-    sessionOutboundJson?: string): Promise<void> {
+    sessionOutboundJson?: string, policy?: NetworkPolicy): Promise<void> {
     if (this.connectionStartTask !== undefined) { throw new Error('连接核心正在启动'); }
-    const task = this.startConnectionInternal(fd, context, protectSocket, bootstrap, sessionOutboundJson);
+    const task = this.startConnectionInternal(fd, context, protectSocket, bootstrap, sessionOutboundJson, policy);
     this.connectionStartTask = task;
     try { await task; }
     finally {
@@ -222,7 +224,7 @@ export class CoreProbe {
 
   private async startConnectionInternal(fd: number, context: common.Context,
     protectSocket: (fd: number) => Promise<void>, bootstrap?: NodeBootstrap,
-    sessionOutboundJson?: string): Promise<void> {
+    sessionOutboundJson?: string, policy?: NetworkPolicy): Promise<void> {
     if (this.connectionFinalStop || this.xrayAttempted || this.hevAttempted || this.fixtureAttempted || this.protectorInstalled) {
       throw new Error('请在上一 VPN 扩展进程退出后创建新的连接');
     }
@@ -233,6 +235,7 @@ export class CoreProbe {
       outboundJson = saved.outboundJson;
     }
     this.connectionOutboundJson = parseNode(outboundJson).outboundJson;
+    this.connectionPolicy = policy === undefined ? undefined : validateNetworkPolicy(policy);
     this.connectionMode = true;
     this.connectionActive = false;
     const epoch = ++this.connectionEpoch;
@@ -241,7 +244,7 @@ export class CoreProbe {
     this.metricsPort = ports.metricsPort;
     this.errorPath = `${context.filesDir}/xray-connection-diagnostic.log`;
     // Validate the frozen node/bootstrap before loading any process-lived code.
-    buildConnectionConfig(this.connectionOutboundJson, ports.socksPort, ports.metricsPort, this.errorPath, bootstrap);
+    buildConnectionConfig(this.connectionOutboundJson, ports.socksPort, ports.metricsPort, this.errorPath, bootstrap, this.connectionPolicy);
     const logFile = fs.openSync(this.errorPath, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
     fs.closeSync(logFile);
     this.connectionLogOffset = 0;
@@ -272,7 +275,7 @@ export class CoreProbe {
     epoch: number): Promise<void> {
     this.requireConnectionEpoch(epoch);
     const config = buildConnectionConfig(this.connectionOutboundJson, this.connectionSocksPort,
-      this.metricsPort, this.errorPath, bootstrap);
+      this.metricsPort, this.errorPath, bootstrap, this.connectionPolicy);
     const request = JSON.stringify(new XrayStartRequest(context.filesDir, config));
     const encoded = new util.Base64Helper().encodeToStringSync(new util.TextEncoder().encodeInto(request));
     this.xrayAttempted = true;

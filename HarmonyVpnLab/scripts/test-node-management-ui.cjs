@@ -22,7 +22,8 @@ function compile(relative, page = false) {
         assert(boundary > 0, 'Page build boundary changed: ' + relative);
         source = source.slice(0, boundary) + '\n}\n';
         source = source.replace(/^@Entry\s*$/gm, '').replace(/^@Component\s*$/gm, '')
-            .replace(/^(\s*)@State /gm, '$1').replace(/^struct (\w+) \{/m, 'export class $1 {');
+            .replace(/^(\s*)@State /gm, '$1').replace(/@StorageProp\([^)]*\)\s*/g, '')
+            .replace(/^struct (\w+) \{/m, 'export class $1 {');
     }
     const output = ts.transpileModule(source, {
         compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS },
@@ -31,10 +32,10 @@ function compile(relative, page = false) {
     assert.equal(output.diagnostics.length, 0, 'SDK transpilation failed: ' + relative);
     compiledFiles.set(relative, output.outputText);
 }
-for (const file of ['model/NodeImport.ets', 'model/NodeBatchImport.ets', 'model/SubscriptionFetch.ets', 'model/NodeEditGuard.ets']) compile(file);
+for (const file of ['model/NodeImport.ets', 'model/NodeBatchImport.ets', 'model/SubscriptionFetch.ets', 'model/NodeEditGuard.ets', 'model/BatchLatency.ets', 'model/NodeScanner.ets', 'model/AdaptiveLayout.ets']) compile(file);
 for (const file of ['pages/NodeConfig.ets', 'pages/Subscriptions.ets', 'pages/Nodes.ets']) compile(file, true);
 function execute(relative, imports, timers = {}) {
-    const context = { exports: {}, Error, Date, Uint8Array, ArrayBuffer, Promise, URL, TextDecoder,
+    const context = { VPN_CORE_AVAILABLE: true, exports: {}, Error, Date, Uint8Array, ArrayBuffer, Promise, URL, TextDecoder,
         require(name) { assert(Object.hasOwn(imports, name), 'Unexpected dependency: ' + name); return imports[name]; },
         ...timers };
     vm.runInNewContext(compiledFiles.get(relative), context, { filename: relative });
@@ -56,6 +57,8 @@ const sdk = {
 };
 const single = execute('model/NodeImport.ets', { '@kit.ArkTS': sdk });
 const batch = execute('model/NodeBatchImport.ets', { '@kit.ArkTS': sdk, './NodeImport': single });
+const batchLatency = execute('model/BatchLatency.ets', {});
+const adaptiveLayout = execute('model/AdaptiveLayout.ets', {});
 const firstNode = single.parseNode(FIRST);
 const secondNode = single.parseNode(SECOND);
 const savedNode = (node, id = 'node-first', sourceId = '') => ({ ...clone(node), id, sourceId, modifiedAt: 1 });
@@ -66,10 +69,10 @@ function harness(options = {}) {
             nodes: [savedNode(firstNode, 'node-old')], subscriptions: [] },
         allowed: true, events: [], writes: [], logs: [], receipt: 0, nextId: 1,
         now: 1000, nextTimer: 1, timers: new Map(), requests: [], currentProfile: clone(firstNode),
-        mode: '', readsAfterWrite: 0, scans: [], wallNow: 1789000000000,
+        mode: '', readsAfterWrite: 0, scans: [], scannerModuleLoads: 0, capabilityChecks: 0, wallNow: 1789000000000,
         probeState: { phase: 'idle', kind: 'lifecycle', runId: '', detail: '', updatedAt: 1789000000000 },
         connectionStatus: undefined, command: undefined, commands: [], latencyRequests: [], latencyProofs: [],
-        latencyRecords: [], hashRequests: [], vpnStarts: [], measurements: []
+        latencyRecords: [], hashRequests: [], vpnStarts: [], measurements: [], processAlive: true, processCheckThrows: false
     };
     const timers = {
         setTimeout(callback, delay) { const id = state.nextTimer++; state.timers.set(id, { callback, delay, kind: 'timeout' }); return id; },
@@ -79,7 +82,7 @@ function harness(options = {}) {
         Date: class extends Date { static now() { return state.wallNow++; } }
     };
     const guard = execute('model/NodeEditGuard.ets', {
-        'libvpnbridge.so': { default: { processAlive: () => true } },
+        'libvpnbridge.so': { default: { processAlive: () => { if (state.processCheckThrows) throw RAW_ERROR; return state.processAlive; } } },
         './ProbeState': { readProbeState: () => clone(state.probeState) },
         './ConnectionControl': { readConnectionStatus: () => state.connectionStatus && clone(state.connectionStatus) }
     });
@@ -166,6 +169,10 @@ function harness(options = {}) {
         '@kit.BasicServicesKit': { systemDateTime: { TimeType: { STARTUP: 0 }, getUptime: () => state.now } }
     }, timers);
     const imports = {
+        'libvpnbridge.so': { default: { processAlive: () => { if (state.processCheckThrows) throw RAW_ERROR; return state.processAlive; } } },
+        '../model/BatchLatency': batchLatency,
+        '../model/AdaptiveLayout': adaptiveLayout,
+        '../model/BuildCapabilities': { VPN_CORE_AVAILABLE: true },
         '@kit.AbilityKit': {},
         '@kit.NetworkKit': { vpnExtension: {
             startVpnExtensionAbility(want) {
@@ -240,8 +247,22 @@ function harness(options = {}) {
             updateNodeServerAddress() { allowed(); }
         }
     };
+    let scannerModule;
+    Object.defineProperty(imports, '../model/NodeScanner', { get() {
+        state.scannerModuleLoads++;
+        if (options.scannerModuleThrows) throw RAW_ERROR;
+        scannerModule ??= execute('model/NodeScanner.ets', {
+            '@kit.AbilityKit': {}, '@kit.ScanKit': imports['@kit.ScanKit']
+        });
+        return scannerModule;
+    } });
     function page(name) {
-        const api = execute('pages/' + name + '.ets', imports, timers);
+        const api = execute('pages/' + name + '.ets', imports, { ...timers, canIUse(capability) {
+            state.capabilityChecks++;
+            assert.equal(capability, 'SystemCapability.Multimedia.Scan.ScanBarcode');
+            if (options.capabilityThrows) throw RAW_ERROR;
+            return options.scanCapability !== false;
+        } });
         const instance = new api[name]();
         instance.getUIContext = () => ({ getHostContext: () => ({ filesDir: 'synthetic-memory-only' }), getRouter: () => ({ back() {} }) });
         return instance;
@@ -310,10 +331,35 @@ function casesNodeConfig() {
 
 function casesNodeScan() {
     const cases = [], add = (name, run) => cases.push({ name: 'NodeConfig scan: ' + name, run });
+    add('unsupported device never loads ScanKit and can still paste/import a node', async () => {
+        const h = harness({ scanCapability: false, scannerModuleThrows: true }), p = h.page('NodeConfig');
+        p.aboutToAppear(); assert.equal(p.scanSupported, false); await p.scan();
+        assert.equal(h.state.scannerModuleLoads, 0); assert.equal(h.state.scans.length, 0); assert.equal(p.scanning, false);
+        assert.match(p.message, /不支持系统扫码/);
+        p.input = SECOND; p.save(); assert.equal(h.state.writes.length, 1); assert.equal(p.input, '');
+    });
+    add('capability query failure keeps the import page usable without loading scanner', async () => {
+        const h = harness({ capabilityThrows: true }), p = h.page('NodeConfig'); p.aboutToAppear(); await p.scan();
+        assert.equal(p.scanSupported, false); assert.equal(h.state.scannerModuleLoads, 0); noVisibleSecrets(p, h.state);
+        p.input = SECOND; p.save(); assert.equal(h.state.writes.length, 1);
+    });
+    add('late module load after page disposal cannot start the system scanner', async () => {
+        const h = harness(), p = h.page('NodeConfig'); const pending = p.scan(); p.aboutToDisappear(); await pending;
+        assert.equal(h.state.scans.length, 0); assert.equal(p.scanning, false); assert.equal(p.input, '');
+    });
+    add('connection activation during module loading prevents the scanner call', async () => {
+        const h = harness(), p = h.page('NodeConfig'); const pending = p.scan(); h.state.allowed = false; await pending;
+        assert.equal(h.state.scans.length, 0); assert.equal(p.scanning, false); assert.equal(h.state.writes.length, 0);
+    });
+    add('unavailable scanner module reports a safe failure and does not block paste import', async () => {
+        const h = harness({ scannerModuleThrows: true }), p = h.page('NodeConfig'); await p.scan();
+        assert.equal(h.state.scans.length, 0); assert.equal(p.scanning, false); noVisibleSecrets(p, h.state);
+        p.input = SECOND; p.save(); assert.equal(h.state.writes.length, 1);
+    });
     add('uses QR-only single-result system scanner with album support', async () => {
         const h = harness(), p = h.page('NodeConfig'), before = clone(h.state.catalog);
         p.saveReceipt = '保存回执：old';
-        const pending = p.scan();
+        const pending = p.scan(); await flush();
         assert.equal(p.scanning, true); assert.equal(h.state.scans.length, 1);
         assert.equal(h.state.scans[0].context.filesDir, 'synthetic-memory-only');
         assert.deepEqual(h.state.scans[0].options, { scanTypes: ['QR_CODE_FIXTURE'], enableMultiMode: false, enableAlbum: true });
@@ -327,14 +373,14 @@ function casesNodeScan() {
     });
     add('scanned mixed content still requires the existing partial-import confirmation', async () => {
         const h = harness(), p = h.page('NodeConfig'); const text = SECOND + '\ninvalid-fixture';
-        const pending = p.scan(); h.state.scans[0].resolve({ originalValue: text }); await pending;
+        const pending = p.scan(); await flush(); h.state.scans[0].resolve({ originalValue: text }); await pending;
         assert.equal(p.input, text); assert.equal(h.state.writes.length, 0);
         p.save(); assert.equal(h.state.writes.length, 0); assert.equal(p.partialCount, 1); assert.match(p.saveReceipt, /请确认/);
         p.savePartial(); assert.equal(h.state.writes.length, 1); assert.equal(h.state.receipt, 1);
     });
     add('Base64 QR contents use the real batch parser without automatic persistence', async () => {
         const h = harness(), p = h.page('NodeConfig'); const text = Buffer.from(FIRST + '\n' + SECOND).toString('base64');
-        const pending = p.scan(); h.state.scans[0].resolve({ originalValue: text }); await pending;
+        const pending = p.scan(); await flush(); h.state.scans[0].resolve({ originalValue: text }); await pending;
         assert.equal(p.input, text); assert.match(p.message, /已识别 2 个可用节点/);
         assert.equal(h.state.writes.length, 0); assert.equal(h.state.requests.length, 0);
     });
@@ -345,7 +391,7 @@ function casesNodeScan() {
         assert.equal(p.partialCount, 1); assert.equal(p.pendingNodes.length, 1); assert.equal(h.state.writes.length, 0);
     });
     add('duplicate scan and save are ignored while scanner is pending', async () => {
-        const h = harness(), p = h.page('NodeConfig'); const pending = p.scan(); const receipt = p.saveReceipt;
+        const h = harness(), p = h.page('NodeConfig'); const pending = p.scan(); await flush(); const receipt = p.saveReceipt;
         await p.scan(); p.save(); assert.equal(h.state.scans.length, 1); assert.equal(h.state.writes.length, 0);
         assert.equal(p.saveReceipt, receipt); h.state.scans[0].resolve({ originalValue: SECOND }); await pending;
         assert.equal(p.input, SECOND); assert.equal(h.state.writes.length, 0);
@@ -356,14 +402,14 @@ function casesNodeScan() {
         assert.equal(h.state.writes.length, 0); assert.match(p.message, /扫码未完成/);
     });
     add('numeric cancellation code produces fixed safe text', async () => {
-        const h = harness(), p = h.page('NodeConfig'); const pending = p.scan();
+        const h = harness(), p = h.page('NodeConfig'); const pending = p.scan(); await flush();
         h.state.scans[0].reject(Object.assign(new Error(RAW_ERROR.message), { code: 1000500002 })); await pending;
         assert.equal(p.message, '已取消扫码。'); assert.equal(p.input, ''); assert.equal(p.scanning, false);
         assert.equal(h.state.writes.length, 0); assert.equal(h.state.requests.length, 0); noVisibleSecrets(p, h.state);
     });
     for (const mode of ['scanThrow', 'reject-error', 'reject-plain-object', 'reject-null']) {
         add(mode + ' native failure is never echoed', async () => {
-            const h = harness({ scanThrow: mode === 'scanThrow' }), p = h.page('NodeConfig'); const pending = p.scan();
+            const h = harness({ scanThrow: mode === 'scanThrow' }), p = h.page('NodeConfig'); const pending = p.scan(); await flush();
             if (mode === 'reject-error') h.state.scans[0].reject(RAW_ERROR);
             if (mode === 'reject-plain-object') h.state.scans[0].reject({ code: 12345, message: RAW_ERROR.message });
             if (mode === 'reject-null') h.state.scans[0].reject(null);
@@ -377,7 +423,7 @@ function casesNodeScan() {
         ['empty result', ''], ['missing originalValue', undefined], ['wrong result type', 123]
     ]) {
         add(name + ' cannot trigger HTTP or persistence', async () => {
-            const h = harness(), p = h.page('NodeConfig'); const before = clone(h.state.catalog); const pending = p.scan();
+            const h = harness(), p = h.page('NodeConfig'); const before = clone(h.state.catalog); const pending = p.scan(); await flush();
             h.state.scans[0].resolve({ originalValue: content }); await pending;
             assert.equal(p.input, ''); assert.equal(p.scanning, false); assert.match(p.message, /^扫码未完成/);
             assert.equal(h.state.requests.length, 0); assert.equal(h.state.writes.length, 0); assert.deepEqual(h.state.catalog, before);
@@ -385,27 +431,27 @@ function casesNodeScan() {
         });
     }
     add('late successful result after leaving cannot refill the form', async () => {
-        const h = harness(), p = h.page('NodeConfig'); const pending = p.scan();
+        const h = harness(), p = h.page('NodeConfig'); const pending = p.scan(); await flush();
         p.aboutToDisappear(); const message = p.message; h.state.scans[0].resolve({ originalValue: SECOND }); await pending;
         assert.equal(p.input, ''); assert.equal(p.message, message); assert.equal(p.scanning, false);
         assert.equal(h.state.writes.length, 0); assert.equal(h.state.logs.length, 0);
     });
     add('late failure after leaving cannot replace a newer page message', async () => {
-        const h = harness(), p = h.page('NodeConfig'); const pending = p.scan();
+        const h = harness(), p = h.page('NodeConfig'); const pending = p.scan(); await flush();
         p.aboutToDisappear(); p.aboutToAppear(); const message = p.message; h.state.scans[0].reject(RAW_ERROR); await pending;
         assert.equal(p.input, ''); assert.equal(p.message, message); assert.equal(p.scanning, false); noVisibleSecrets(p, h.state);
     });
     add('old scan completion cannot end a newer scan or overwrite its result', async () => {
-        const h = harness(), p = h.page('NodeConfig'); const old = p.scan(); p.aboutToDisappear(); p.aboutToAppear();
-        const fresh = p.scan(); assert.equal(h.state.scans.length, 2);
+        const h = harness(), p = h.page('NodeConfig'); const old = p.scan(); await flush(); p.aboutToDisappear(); p.aboutToAppear();
+        const fresh = p.scan(); await flush(); assert.equal(h.state.scans.length, 2);
         h.state.scans[0].resolve({ originalValue: FIRST }); await old;
         assert.equal(p.scanning, true); assert.equal(p.input, '');
         h.state.scans[1].resolve({ originalValue: SECOND }); await fresh;
         assert.equal(p.scanning, false); assert.equal(p.input, SECOND); assert.equal(h.state.writes.length, 0);
     });
     add('old scan resolving after fresh completion preserves the fresh input', async () => {
-        const h = harness(), p = h.page('NodeConfig'); const old = p.scan(); p.aboutToDisappear(); p.aboutToAppear();
-        const fresh = p.scan(); h.state.scans[1].resolve({ originalValue: SECOND }); await fresh;
+        const h = harness(), p = h.page('NodeConfig'); const old = p.scan(); await flush(); p.aboutToDisappear(); p.aboutToAppear();
+        const fresh = p.scan(); await flush(); h.state.scans[1].resolve({ originalValue: SECOND }); await fresh;
         h.state.scans[0].resolve({ originalValue: FIRST }); await old;
         assert.equal(p.input, SECOND); assert.equal(p.scanning, false); assert.equal(h.state.writes.length, 0);
     });
@@ -512,6 +558,80 @@ function casesSubscriptions() {
 
 function casesNodes() {
     const cases = [], add = (name, run) => cases.push({ name: 'Nodes: ' + name, run });
+    add('search feedback and clear action preserve catalog, selection and an existing batch', () => {
+        const h = harness(), p = h.page('Nodes');
+        h.state.catalog.nodes = Array.from({ length: 70 }, (_, i) => savedNode(i % 2 ? firstNode : secondNode, 'id-' + i));
+        p.aboutToAppear(); p.limit = 100; p.search = 'trojan';
+        assert.match(p.searchResultText(), /匹配 35 个/); assert.match(p.batchButtonText(), /35/);
+        const before = clone(h.state.catalog), batch = { active: 'synthetic unchanged batch' }; p.batchQueue = batch; p.batchActive = true;
+        p.clearSearch(); assert.equal(p.search, ''); assert.equal(p.limit, 50); assert.match(p.searchResultText(), /50 \/ 70/);
+        assert.match(p.batchButtonText(), /70/); assert.equal(p.batchQueue, batch); assert.equal(p.batchActive, true);
+        assert.deepEqual(h.state.catalog, before); assert.equal(h.state.writes.length, 0); assert.equal(h.state.vpnStarts.length, 0);
+    });
+    add('detection explanation starts collapsed and toggles without changing a node or starting work', () => {
+        const h = harness(), p = h.page('Nodes'); p.aboutToAppear(); const before = clone(h.state.catalog);
+        assert.equal(p.latencyHelpExpanded, false); p.toggleLatencyHelp(); assert.equal(p.latencyHelpExpanded, true);
+        p.toggleLatencyHelp(); assert.equal(p.latencyHelpExpanded, false);
+        assert.deepEqual(h.state.catalog, before); assert.equal(h.state.writes.length, 0); assert.equal(h.state.vpnStarts.length, 0);
+    });
+    add('responsive node information preserves useful width beside the fixed action area', () => {
+        const h = harness(), p = h.page('Nodes');
+        for (const width of [240, 320, 360, 600, 679, 680, 707.2, 840, 1024, 1280, 1920]) {
+            p.windowWidthVp = width;
+            const info = p.nodeInformationWidth(), frame = adaptiveLayout.nodeListContentWidth(width);
+            assert(Number.isFinite(info) && info > 0 && info < frame);
+            if (p.wideNodeRows()) assert(info >= 300, 'Wide row leaves too little space for a long node name');
+        }
+        p.windowWidthVp = 360; assert.equal(p.wideNodeRows(), false);
+        p.windowWidthVp = 707.2; assert.equal(p.wideNodeRows(), true);
+        p.windowWidthVp = 1280; assert.equal(p.wideNodeRows(), true);
+    });
+    add('actual UI keeps one set of node controls, native data menus and all connection guards', () => {
+        const sdkRoot = path.join(process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio', 'sdk/default/openharmony/ets/build-tools/ets-loader');
+        const options = ts.readConfigFile(path.join(sdkRoot, 'tsconfig.json'), ts.sys.readFile).config.compilerOptions;
+        const file = path.join(project, 'entry/src/main/ets/pages/Nodes.ets'), sourceText = fs.readFileSync(file, 'utf8');
+        const source = ts.createSourceFile(file, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.ETS, options);
+        assert.equal(source.parseDiagnostics.length, 0, 'SDK ArkTS UI syntax');
+        const ids = [];
+        function visit(node) {
+            if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'id') ids.push(node);
+            ts.forEachChild(node, visit);
+        }
+        visit(source);
+        function attributes(idExpression) {
+            const matches = ids.filter(call => call.arguments[0]?.getText(source) === idExpression); assert.equal(matches.length, 1, idExpression + ' must occur once');
+            let base = matches[0];
+            while (ts.isCallExpression(base) && ts.isPropertyAccessExpression(base.expression)) base = base.expression.expression;
+            assert(ts.isEtsComponentExpression(base)); const result = new Map(); let node = base;
+            while (node.parent && ts.isPropertyAccessExpression(node.parent) && node.parent.expression === node && ts.isCallExpression(node.parent.parent)) {
+                const access = node.parent, call = access.parent; result.set(access.name.text, call.arguments); node = call;
+            }
+            return result;
+        }
+        const more = attributes('`nodeMore-${node.id}`');
+        assert.equal(more.get('bindMenu')[0].getText(source), 'this.nodeMenuItems(node)');
+        assert.equal(more.get('enabled')[0].getText(source), 'this.editable');
+        assert.equal(attributes('`testNodeLatency-${node.id}`').get('enabled')[0].getText(source), 'VPN_CORE_AVAILABLE && this.editable && !this.preparing && !this.testingId');
+        assert.equal(attributes('`selectNode-${node.id}`').get('enabled')[0].getText(source), 'node.id === this.activeId || this.editable');
+        assert.equal(attributes("'testFilteredNodes'").get('enabled')[0].getText(source), 'VPN_CORE_AVAILABLE && this.editable && this.filtered().length > 0');
+        for (const id of ['`nodeMore-${node.id}`', '`testNodeLatency-${node.id}`', '`selectNode-${node.id}`']) {
+            const size = attributes(id).get('constraintSize')[0];
+            const minimum = size.properties.find(prop => prop.name.getText(source) === 'minHeight');
+            assert(Number(minimum.initializer.text) >= 44, id + ' must remain easy to tap');
+        }
+        const row = attributes('`nodeRow-${node.id}`'), color = row.get('backgroundColor')[0];
+        assert(ts.isConditionalExpression(color)); assert.equal(color.whenTrue.arguments[0].text, 'app.color.accent_soft');
+        for (const id of ["'clearNodeSearch'", "'nodeSearchResultCount'", "'nodeLatencyScopeNotice'", "'toggleNodeLatencyHelp'", "'nodeLatencyHelp'"]) attributes(id);
+        const perNode = ids.filter(call => call.arguments[0].getText(source).includes('node.id'));
+        const rendered = [];
+        for (const node of [{ id: 'first' }, { id: 'second' }]) {
+            for (const call of perNode) {
+                const expression = call.arguments[0].getText(source);
+                rendered.push(new Function('node', 'return ' + expression).call({ activeId: 'first' }, node));
+            }
+        }
+        assert.equal(new Set(rendered).size, rendered.length, 'Wide/narrow rows introduce duplicate node IDs');
+    });
     add('load filter pagination and source labels follow real methods', () => {
         const h = harness(), p = h.page('Nodes');
         h.state.catalog.nodes = Array.from({ length: 70 }, (_, i) => savedNode(i % 2 ? firstNode : secondNode, 'id-' + i, i % 2 ? 'source-a' : ''));
@@ -559,6 +679,7 @@ function activateLatency(h, p) {
     const request = h.state.latencyRequests.at(-1); assert(request);
     h.state.probeState = { ...h.state.probeState, runId: request.runId, kind: 'node-latency', phase: 'active' };
     h.state.connectionStatus = { runId: request.runId, phase: 'active', reconnectCount: 0, servicePid: 123 };
+    h.state.processAlive = true;
     p.pollLatency();
     return request;
 }
@@ -569,6 +690,7 @@ function proofFor(request, changes = {}) {
 function finishLatency(h, p, phase = 'stopped') {
     h.state.probeState = { ...h.state.probeState, phase };
     h.state.connectionStatus = { runId: h.state.probeState.runId, phase: 'destroyed', cleanupConfirmed: true, servicePid: 123 };
+    h.state.processAlive = false; // This helper models actual process exit, not onDestroy alone.
     p.pollLatency();
 }
 
@@ -745,9 +867,187 @@ function runNodeConfigReceiptTests() {
     for (const test of cases) test.run();
     return cases.length;
 }
+
+function casesBatchLatency() {
+    const cases = [], add = (name, run) => cases.push({ name: 'Nodes batch: ' + name, run });
+    function setup(options = {}) {
+        const h = harness(options), p = h.page('Nodes');
+        h.state.catalog.nodes.push(savedNode(secondNode, 'node-second'));
+        p.aboutToAppear(); return { h, p };
+    }
+    function recordCurrent(h, changes = {}) {
+        const request = h.state.latencyRequests.at(-1);
+        const node = h.state.catalog.nodes.find(item => item.id === request.nodeId);
+        h.state.latencyRecords = h.state.latencyRecords.filter(item => item.nodeId !== request.nodeId);
+        h.state.latencyRecords.push(latencyRecord(node, { runId: request.runId, ...changes }));
+        h.state.probeState = { ...h.state.probeState, phase: 'stopped' };
+        return request;
+    }
+    add('previous session reconnect count cannot cancel startup before this run publishes its heartbeat', async () => {
+        const { h, p } = setup(); const before = clone(h.state.catalog);
+        h.state.probeState = { ...h.state.probeState, runId: 'previous-connection', kind: 'connection', phase: 'stopped' };
+        h.state.connectionStatus = { runId: 'previous-connection', phase: 'destroyed', cleanupConfirmed: true,
+            servicePid: 555, reconnectCount: 2 };
+        h.state.processAlive = false;
+        // startVpnExtensionAbility resolves before the new service writes status.
+        await p.startBatch(); p.pollLatency(); p.pollLatency(); await flush();
+        assert.equal(h.state.vpnStarts.length, 1); assert.equal(p.batchActive, true); assert.equal(p.batchQueue.phase, 'running');
+        assert.equal(h.state.command.action, 'start'); assert.equal(h.state.commands.some(command => command.action === 'stop'), false);
+        assert.equal(h.state.measurements.length, 0); assert.equal(p.batchQueue.completed, 0);
+        activateLatency(h, p); assert.equal(h.state.measurements.length, 1);
+        recordCurrent(h); finishLatency(h, p); await flush();
+        assert.equal(h.state.vpnStarts.length, 2); assert.equal(p.batchActive, true); assert.equal(p.batchQueue.completed, 1);
+        activateLatency(h, p); h.state.connectionStatus.reconnectCount = 1; p.pollLatency(); await flush();
+        assert.equal(p.batchActive, false); assert.equal(h.state.command.action, 'stop'); assert.equal(h.state.vpnStarts.length, 2);
+        assert.deepEqual(h.state.catalog, before); assert.equal(h.state.writes.length, 0);
+    });
+    add('serial runs wait for own cleanup, retain fingerprints/selection and finish fixed snapshot', async () => {
+        const { h, p } = setup(); const before = clone(h.state.catalog);
+        await p.startBatch(); const first = activateLatency(h, p);
+        assert.equal(h.state.vpnStarts.length, 1); assert.equal(p.batchActive, true); assert.equal(p.editable, false);
+        await p.startLatency('node-second'); p.select('node-second'); p.renameId = 'node-old'; p.renameText = 'changed'; p.rename(); p.remove('node-old');
+        assert.equal(h.state.writes.length, 0); assert.equal(h.state.vpnStarts.length, 1);
+        recordCurrent(h); h.state.connectionStatus.phase = 'stopped'; h.state.connectionStatus.cleanupConfirmed = true;
+        p.pollLatency(); await flush(); assert.equal(h.state.vpnStarts.length, 1); assert.equal(p.testingId, first.nodeId);
+        h.state.connectionStatus.phase = 'destroyed'; p.pollLatency(); p.pollLatency(); await flush();
+        assert.equal(h.state.vpnStarts.length, 1); assert.equal(p.batchQueue.completed, 0); assert.equal(p.editable, false);
+        h.state.processAlive = false; p.pollLatency(); p.pollLatency(); await flush();
+        assert.equal(h.state.vpnStarts.length, 2); assert.equal(h.state.latencyRequests[1].nodeId, 'node-second');
+        assert.equal(h.state.latencyRequests[1].outboundFingerprint, outboundHash(secondNode.outboundJson));
+        activateLatency(h, p); recordCurrent(h, { status: 'failed', durationMs: 0, reason: 'https' }); finishLatency(h, p); await flush();
+        assert.equal(p.batchActive, false); assert.equal(p.testingId, ''); assert.match(p.batchProgress, /2\/2.*检测结束/);
+        assert.deepEqual(h.state.catalog, before); assert.equal(p.editable, true); assert.equal(h.state.vpnStarts.length, 2);
+    });
+    add('visible search snapshot ignores later search changes and expansion limit', async () => {
+        const { h, p } = setup(); p.search = 'trojan'; p.limit = 1; await p.startBatch();
+        assert.equal(h.state.latencyRequests[0].nodeId, 'node-second'); p.search = '';
+        activateLatency(h, p); recordCurrent(h); finishLatency(h, p); await flush();
+        assert.equal(h.state.vpnStarts.length, 1); assert.equal(p.batchQueue.targets.length, 1); assert.equal(p.batchActive, false);
+    });
+    add('cancel during snapshot or page hide never launches after late fingerprint', async () => {
+        for (const hide of [false, true]) {
+            const { h, p } = setup({ hashDeferred: true }); const task = p.startBatch();
+            assert.equal(h.state.hashRequests.length, 1);
+            if (hide) p.onPageHide(); else p.cancelLatency();
+            h.state.hashRequests[0].resolve(outboundHash(firstNode.outboundJson)); await task;
+            p.onPageShow(); p.pollLatency(); await flush();
+            assert.equal(h.state.vpnStarts.length, 0); assert.equal(p.batchActive, false); assert.equal(p.preparing, false);
+        }
+    });
+    for (const action of ['cancel', 'hide', 'foreign-command', 'foreign-state', 'selection-changed', 'recovery']) {
+        add(action + ' stops queue and ignores late result/cleanup', async () => {
+            const { h, p } = setup(); await p.startBatch(); const first = activateLatency(h, p);
+            if (action === 'cancel') p.cancelLatency();
+            if (action === 'hide') p.onPageHide();
+            if (action === 'foreign-command') h.state.command.runId = 'foreign';
+            if (action === 'foreign-state') h.state.probeState.runId = 'foreign';
+            if (action === 'selection-changed') h.state.catalog.activeNodeId = 'node-second';
+            if (action === 'recovery') h.state.connectionStatus.reconnectCount = 1;
+            p.pollLatency(); assert.equal(p.batchActive, false);
+            h.state.measurements[0].resolve(proofFor(first)); await flush();
+            recordCurrent(h); h.state.probeState.runId = first.runId;
+            h.state.connectionStatus = { runId: first.runId, phase: 'destroyed', cleanupConfirmed: true, servicePid: 123 };
+            p.pollLatency(); await flush();
+            assert.equal(p.testingId, first.nodeId); assert.equal(p.cancelling, true); assert.equal(p.editable, false);
+            assert.match(p.message, /清理|等待/); assert(!p.message.includes('进程已退出'));
+            h.state.processAlive = false; h.state.processCheckThrows = true; p.pollLatency();
+            assert.equal(p.cancelling, true); assert(!p.message.includes('进程已退出'));
+            h.state.processCheckThrows = false; finishLatency(h, p); p.onPageShow(); await flush();
+            assert.equal(h.state.vpnStarts.length, 1); assert.equal(h.state.latencyProofs.length, 0);
+            assert.equal(p.testingId, ''); assert.equal(p.cancelling, false);
+            assert.match(p.message, /批量检测已停止.*进程已退出/); assert(!p.message.includes('正在清理'));
+            if (['cancel', 'hide'].includes(action)) assert.match(p.message, /未启动后续节点/);
+            else assert.match(p.message, /请检查/);
+        });
+    }
+    add('authorization rejection stops entire queue and leaves safe retry', async () => {
+        const { h, p } = setup({ vpnDeferred: true }); const task = p.startBatch(); await flush();
+        assert.equal(h.state.vpnStarts.length, 1); h.state.vpnStarts[0].reject(RAW_ERROR); await task; p.pollLatency();
+        assert.equal(p.batchActive, false); assert.equal(p.testingId, ''); assert.equal(h.state.vpnStarts.length, 1);
+        assert.equal(p.editable, true); assert.equal(p.cancelling, false); assert.match(p.message, /VPN 授权/); noVisibleSecrets(p, h.state);
+    });
+    add('hide during pending VPN authorization leaves a stop command and no late successor', async () => {
+        const { h, p } = setup({ vpnDeferred: true }); const task = p.startBatch(); await flush();
+        const request = h.state.latencyRequests[0]; p.onPageHide();
+        assert.equal(h.state.command.action, 'stop'); assert.equal(p.batchActive, false);
+        h.state.vpnStarts[0].resolve(); await task;
+        h.state.probeState = { ...h.state.probeState, runId: request.runId, phase: 'stopped' };
+        h.state.connectionStatus = { runId: request.runId, phase: 'destroyed', cleanupConfirmed: true, servicePid: 123 };
+        h.state.processAlive = false;
+        p.onPageShow(); await flush(); assert.equal(h.state.vpnStarts.length, 1); assert.equal(p.testingId, '');
+    });
+    add('cleanup failure stays locked, confirmed process exit permits the next verified result', async () => {
+        const { h, p } = setup(); await p.startBatch(); activateLatency(h, p); recordCurrent(h);
+        h.state.connectionStatus.phase = 'destroyed'; h.state.connectionStatus.cleanupConfirmed = false;
+        p.pollLatency(); await flush(); assert.equal(h.state.vpnStarts.length, 1); assert.equal(p.editable, false);
+        h.state.processAlive = false; p.pollLatency(); await flush();
+        assert.equal(h.state.vpnStarts.length, 2); assert.equal(h.state.latencyRequests[1].nodeId, 'node-second');
+    });
+    add('process inspection failure cannot advance a cleaned batch session or unlock its UI', async () => {
+        const { h, p } = setup(); await p.startBatch(); activateLatency(h, p); recordCurrent(h);
+        h.state.connectionStatus.phase = 'destroyed'; h.state.connectionStatus.cleanupConfirmed = true;
+        h.state.processAlive = false; h.state.processCheckThrows = true;
+        p.pollLatency(); p.pollLatency(); await flush();
+        assert.equal(h.state.vpnStarts.length, 1); assert.equal(p.batchQueue.completed, 0);
+        assert.equal(p.batchActive, true); assert.equal(p.editable, false); assert.equal(p.testingId, 'node-old');
+        noVisibleSecrets(p, h.state);
+        h.state.processCheckThrows = false; p.pollLatency(); await flush();
+        assert.equal(h.state.vpnStarts.length, 2); assert.equal(p.batchQueue.completed, 1);
+    });
+    add('batch remembers observed PID when later terminal heartbeat omits it', async () => {
+        const { h, p } = setup(); await p.startBatch(); activateLatency(h, p); recordCurrent(h);
+        h.state.connectionStatus = { runId: h.state.probeState.runId, phase: 'destroyed', cleanupConfirmed: true };
+        p.pollLatency(); await flush(); assert.equal(h.state.vpnStarts.length, 1); assert.equal(p.batchQueue.completed, 0);
+        h.state.processAlive = false; p.pollLatency(); await flush();
+        assert.equal(h.state.vpnStarts.length, 2); assert.equal(p.batchQueue.completed, 1);
+    });
+    add('single-node cleanup cannot unlock a new batch until remembered PID exits', async () => {
+        const { h, p } = setup(); await p.startLatency('node-old'); activateLatency(h, p); recordCurrent(h);
+        h.state.connectionStatus.phase = 'destroyed'; h.state.connectionStatus.cleanupConfirmed = true;
+        p.pollLatency(); await p.startBatch(); await p.startLatency('node-second');
+        assert.equal(p.testingId, 'node-old'); assert.equal(p.editable, false); assert.equal(h.state.vpnStarts.length, 1);
+        delete h.state.connectionStatus.servicePid; h.state.processCheckThrows = true; h.state.processAlive = false;
+        p.pollLatency(); assert.equal(p.editable, false); assert.equal(p.testingId, 'node-old');
+        h.state.processCheckThrows = false; p.pollLatency(); await flush();
+        assert.equal(p.testingId, ''); assert.equal(p.editable, true);
+        await p.startBatch(); assert.equal(h.state.vpnStarts.length, 2); assert.equal(p.batchActive, true);
+    });
+    add('recreated node page also blocks startup on a previous terminal live PID', async () => {
+        const { h } = setup();
+        h.state.probeState = { ...h.state.probeState, runId: 'old-run', phase: 'stopped', kind: 'node-latency' };
+        h.state.connectionStatus = { runId: 'old-run', phase: 'destroyed', cleanupConfirmed: true, servicePid: 123 };
+        const p = h.page('Nodes'); p.aboutToAppear();
+        assert.equal(p.editable, false); await p.startBatch(); await p.startLatency('node-old'); assert.equal(h.state.vpnStarts.length, 0);
+        h.state.processAlive = false; h.state.processCheckThrows = true; p.pollLatency();
+        assert.equal(p.editable, false); await p.startLatency('node-old'); assert.equal(h.state.vpnStarts.length, 0);
+        h.state.processCheckThrows = false; p.pollLatency(); assert.equal(p.editable, true);
+        await p.startBatch(); assert.equal(h.state.vpnStarts.length, 1);
+    });
+    add('changed next-node configuration aborts before another VPN start', async () => {
+        const { h, p } = setup(); await p.startBatch(); activateLatency(h, p); recordCurrent(h);
+        h.state.catalog.nodes[1].outboundJson = firstNode.outboundJson;
+        finishLatency(h, p); await flush(); assert.equal(p.batchActive, false); assert.equal(h.state.vpnStarts.length, 1);
+    });
+    for (const change of [{ runId: 'old' }, { outboundFingerprint: '0'.repeat(64) }, { status: 'cancelled', reason: 'stopped' }]) {
+        add('stale/unconfirmed result cannot advance: ' + JSON.stringify(change), async () => {
+            const { h, p } = setup(); await p.startBatch(); activateLatency(h, p); recordCurrent(h, change); finishLatency(h, p); await flush();
+            assert.equal(p.batchActive, false); assert.equal(h.state.vpnStarts.length, 1);
+        });
+    }
+    add('sorting changes only view with failures last, stable ties and restorable catalog order', () => {
+        const { h, p } = setup(); h.state.catalog.nodes.push(savedNode(firstNode, 'node-third'));
+        p.nodes = clone(h.state.catalog.nodes); const before = clone(h.state.catalog);
+        p.latencies = [latencyRecord(p.nodes[0], { durationMs: 400 }), latencyRecord(p.nodes[1], { durationMs: 100 }),
+            latencyRecord(p.nodes[2], { status: 'failed', durationMs: 0, reason: 'https' })];
+        p.sortByLatency = true; assert.deepEqual(clone(p.filtered()).map(n => n.id), ['node-second', 'node-old', 'node-third']);
+        p.sortByLatency = false; assert.deepEqual(clone(p.filtered()).map(n => n.id), before.nodes.map(n => n.id));
+        assert.deepEqual(h.state.catalog, before); assert.equal(p.activeId, before.activeNodeId); assert.equal(h.state.writes.length, 0);
+    });
+    return cases;
+}
 async function main() {
     const passed = [], failed = [];
-    for (const test of [...casesNodeConfig(), ...casesNodeScan(), ...casesSubscriptions(), ...casesNodes(), ...casesNodeLatency()]) {
+    for (const test of [...casesNodeConfig(), ...casesNodeScan(), ...casesSubscriptions(), ...casesNodes(), ...casesNodeLatency(), ...casesBatchLatency()]) {
         try { await test.run(); passed.push(test.name); }
         catch (error) { failed.push({ name: test.name, error: error.message }); }
     }

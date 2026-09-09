@@ -46,19 +46,45 @@ class DriverError extends Error { constructor(code) { super(code); this.code = c
 function ensure(value, code) { if (!value) throw new DriverError(code); }
 const flag = value => value === true || value === 'true';
 
+function parseCommandLine(args) {
+  let mode = 'Inspect', target = '', modeSeen = false;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--target') {
+      ensure(!target && i + 1 < args.length && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(args[i + 1]), 'INVALID_TARGET');
+      target = args[++i];
+    } else {
+      ensure(!modeSeen && MODES.includes(args[i]), 'INVALID_MODE');
+      mode = args[i]; modeSeen = true;
+    }
+  }
+  return { mode, target };
+}
+
+function selectUsbTarget(listing, requested = '', current = '') {
+  ensure(!requested || /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(requested), 'INVALID_TARGET');
+  const connected = listing.split(/\r?\n/).filter(line => /\sUSB\s+Connected\s/.test(line))
+    .map(line => line.trim().split(/\s+/)[0]);
+  const candidates = requested ? connected.filter(id => id === requested) : connected;
+  ensure(candidates.length === 1, requested ? 'TARGET_NOT_USB_CONNECTED' : 'EXPECTED_ONE_USB_CONNECTED_DEVICE');
+  const next = candidates[0];
+  ensure(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(next) && (!current || current === next), 'DEVICE_CHANGED_OR_INVALID');
+  return next;
+}
+
 // Project immediately to fixed UI metadata. In particular, never access text
 // on node names, addresses, input fields, results, receipts, or dynamic row IDs.
 function projectLayout(tree) {
   const controls = [], scrolls = [];
   let blocked = false;
-  function visit(node) {
+  function visit(node, parentSidebar = false) {
     const a = node?.attributes;
+    const inSidebar = parentSidebar || a?.id === 'appSideNavigation';
     if (a) {
       const visible = flag(a.visible);
       if (visible && (['Dialog', 'AlertDialog', 'SystemDialog'].includes(a.type) ||
           /keyguard|screenlock|lockscreen|biometric|permissiondialog/i.test(String(a.id || '')) ||
           ['renameNodeInput', 'confirmDeleteNode', 'startVpnProbe'].includes(a.id))) blocked = true;
-      if (a.type === 'Scroll' && visible) scrolls.push({ bounds: a.bounds });
+      if (a.type === 'Scroll' && visible && !inSidebar) scrolls.push({ bounds: a.bounds });
       if (FIXED_IDS.has(a.id)) {
         const item = { id: a.id, visible, enabled: flag(a.enabled), bounds: a.bounds };
         if (a.bundleName && a.bundleName !== BUNDLE) blocked = true;
@@ -79,7 +105,8 @@ function projectLayout(tree) {
         controls.push(item);
       }
     }
-    for (const child of node?.children || []) visit(child);
+    // Keep visiting sidebar controls and overlays; exclude only their Scrolls.
+    for (const child of node?.children || []) visit(child, inSidebar);
   }
   visit(tree);
   return { controls, scrolls, blocked };
@@ -125,7 +152,7 @@ function rect(node) {
   return values;
 }
 
-function createDriver(mode) {
+function createDriver(mode, targetDevice = '') {
   ensure(MODES.includes(mode), 'INVALID_MODE');
   let device;
   const deadline = performance.now() + 60000;
@@ -146,11 +173,7 @@ function createDriver(mode) {
   }
   const shell = (...args) => command(['-t', device, 'shell', ...args]);
   function verifyDevice() {
-    const matches = command(['list', 'targets', '-v']).split(/\r?\n/).filter(line => /\sUSB\s+Connected\s/.test(line));
-    ensure(matches.length === 1, 'EXPECTED_ONE_USB_CONNECTED_DEVICE');
-    const next = matches[0].trim().split(/\s+/)[0];
-    ensure(/^[A-Za-z0-9._:-]+$/.test(next) && (!device || device === next), 'DEVICE_CHANGED_OR_INVALID');
-    device = next;
+    device = selectUsbTarget(command(['list', 'targets', '-v']), targetDevice, device);
   }
   function readLayout() {
     verifyDevice();
@@ -313,14 +336,17 @@ function createDriver(mode) {
   return { run };
 }
 
-module.exports = { DriverError, MODES, PAGE_IDS, CLICK_IDS, projectLayout, pageOf, safeState, rect };
+module.exports = { DriverError, MODES, PAGE_IDS, CLICK_IDS, projectLayout, pageOf, safeState, rect, parseCommandLine, selectUsbTarget };
 if (require.main === module) {
-  const mode = process.argv[2] || 'Inspect';
-  if (!MODES.includes(mode) || process.argv.length > 3) {
-    process.stderr.write('Invalid mode. See MODES in test-product-ui-device.cjs.\n');
+  let options;
+  try { options = parseCommandLine(process.argv.slice(2)); }
+  catch (_) {
+    process.stderr.write('Usage: node test-product-ui-device.cjs [Mode] [--target USB_DEVICE_ID]\n');
     process.exitCode = 1;
-  } else {
-    createDriver(mode).run().then(result => process.stdout.write(JSON.stringify(result) + '\n')).catch(error => {
+  }
+  if (options) {
+    const { mode, target } = options;
+    createDriver(mode, target).run().then(result => process.stdout.write(JSON.stringify(result) + '\n')).catch(error => {
       process.stderr.write(JSON.stringify({ mode, stage: 'failed', stoppedIssuingActions: true,
         failure: error instanceof DriverError ? error.code : 'DRIVER_FAILED' }) + '\n');
       process.exitCode = 1;

@@ -3,6 +3,9 @@ import { window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import native from 'libvpnbridge.so';
 import { applyAppearance, readAppearance } from '../model/Appearance';
+import { normalizedWindowWidth } from '../model/AdaptiveLayout';
+import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
+import { deviceInfo } from '@kit.BasicServicesKit';
 
 interface SmokeResult {
   passed: boolean;
@@ -16,8 +19,12 @@ export default class EntryAbility extends UIAbility {
   private runtimeMode: string = '';
   private contentReady: boolean = false;
   private uiFontScaleTest: number = 0;
+  private mainWindow?: window.Window;
+  private resizeListener?: (size: window.Size) => void;
+  private windowSizeTest: string = '';
 
   onCreate(want: Want): void {
+    AppStorage.setOrCreate('windowWidthVp', 360);
     this.readUiFontTest(want);
     const mode = want.parameters?.['runtimeSmoke'];
     if (mode === 'fixtures' || mode === 'go') {
@@ -41,6 +48,10 @@ export default class EntryAbility extends UIAbility {
     if (this.context.applicationInfo.debug && typeof scale === 'string' && ['1', '1.3', '2'].includes(scale)) {
       this.uiFontScaleTest = Number(scale);
     }
+    const size = want.parameters?.['uiWindowSize'];
+    if (this.context.applicationInfo.debug && typeof size === 'string' && /^[0-9]{3,4}x[0-9]{3,4}$/.test(size)) {
+      this.windowSizeTest = size;
+    }
   }
 
   private applyUiFontTest(): void {
@@ -50,9 +61,26 @@ export default class EntryAbility extends UIAbility {
       this.context.getApplicationContext().setFontSizeScale(this.uiFontScaleTest);
       hilog.info(0x0000, 'HarmonyVpnLab', 'UI_FONT_SCALE_TEST scale=%{public}s', this.uiFontScaleTest.toString());
     }
+    if (this.context.applicationInfo.debug && this.mainWindow && this.windowSizeTest && deviceInfo.deviceType === '2in1') {
+      const dimensions = this.windowSizeTest.split('x').map((value: string) => Number(value));
+      this.windowSizeTest = '';
+      if (dimensions[0] >= 320 && dimensions[0] <= 1600 && dimensions[1] >= 320 && dimensions[1] <= 1200) {
+        const ui = this.mainWindow.getUIContext();
+        // Debug-only QA of this app's PC window; never change display/system settings.
+        void this.mainWindow.resizeAsync(Math.round(ui.vp2px(dimensions[0])), Math.round(ui.vp2px(dimensions[1])))
+          .then(() => { hilog.info(0x0000, 'HarmonyVpnLab', 'UI_WINDOW_RESIZE_TEST width=%{public}d height=%{public}d', dimensions[0], dimensions[1]); })
+          .catch(() => { hilog.warn(0x0000, 'HarmonyVpnLab', 'UI_WINDOW_RESIZE_TEST_UNAVAILABLE'); });
+      }
+    }
   }
 
   private async runRuntimeChecks(mode: string): Promise<void> {
+    if (!VPN_CORE_AVAILABLE) {
+      AppStorage.set('runtimeSmokeStatus', '仅界面预览');
+      AppStorage.set('runtimeSmokeDetail', '此模拟器构建不包含原生转发与运行时探针。');
+      AppStorage.set('runtimeSmokeFinished', true);
+      return;
+    }
     const runId = Date.now().toString();
     hilog.info(0x0000, 'HarmonyVpnLab', 'RUNTIME_SMOKE_BEGIN runId=%{public}s mode=%{public}s', runId, mode);
     try {
@@ -79,6 +107,7 @@ export default class EntryAbility extends UIAbility {
     }
   }
   onWindowStageCreate(windowStage: window.WindowStage): void {
+    this.mainWindow = windowStage.getMainWindowSync();
     // The diagnostic page never loads Index.refreshState, which could resume
     // an earlier HTTP test and interfere with this isolated runtime check.
     const page: string = this.runtimeMode.length > 0 ? 'pages/RuntimeSmoke' : 'pages/Home';
@@ -88,9 +117,33 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       this.contentReady = true;
+      this.attachWindowSize();
       try { applyAppearance(this.context, readAppearance(this.context.filesDir)); this.applyUiFontTest(); }
       catch (_) { hilog.warn(0x0000, 'HarmonyVpnLab', 'APPEARANCE_APPLY_FAILED'); }
       hilog.info(0x0000, 'HarmonyVpnLab', 'UI_READY');
     });
+  }
+
+  private attachWindowSize(): void {
+    const main = this.mainWindow;
+    if (!main || this.resizeListener) { return; }
+    const update = (size: window.Size): void => {
+      try {
+        const width = normalizedWindowWidth(main.getUIContext().px2vp(size.width));
+        AppStorage.setOrCreate('windowWidthVp', Math.round(width * 10) / 10);
+      } catch (_) { /* Retain the last valid window width during destruction. */ }
+    };
+    try {
+      const rect = main.getWindowProperties().windowRect;
+      update({ width: rect.width, height: rect.height });
+      main.on('windowSizeChange', update);
+      this.resizeListener = update;
+    } catch (_) { hilog.warn(0x0000, 'HarmonyVpnLab', 'WINDOW_SIZE_LISTENER_UNAVAILABLE'); }
+  }
+
+  onWindowStageDestroy(): void {
+    try { if (this.mainWindow && this.resizeListener) { this.mainWindow.off('windowSizeChange', this.resizeListener); } }
+    catch (_) { /* The platform may already have destroyed the window. */ }
+    this.resizeListener = undefined; this.mainWindow = undefined; this.contentReady = false;
   }
 }

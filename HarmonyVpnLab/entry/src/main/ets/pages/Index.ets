@@ -9,6 +9,7 @@ import { readNodeProfile } from '../model/NodeProfile';
 import { describeError } from '../model/ErrorInfo';
 import { ConnectionCommand, isConnectionKind, writeConnectionCommand } from '../model/ConnectionControl';
 import { subscribeVpnAuthorization, unsubscribeVpnAuthorization } from '../model/VpnAuthorization';
+import { formContentWidth } from '../model/AdaptiveLayout';
 
 interface FixtureReply {
   token: string;
@@ -18,6 +19,7 @@ interface FixtureReply {
 @Entry
 @Component
 struct Index {
+  @StorageProp('windowWidthVp') windowWidthVp: number = 360;
   @State nativeResult: string = '等待原生检查';
   @State nativeReady: boolean = false;
   @State phase: string = 'idle';
@@ -294,7 +296,7 @@ struct Index {
 
         Text('上方三个模式使用本机受限地址段。节点联网测试需要先导入配置，目前不接管其他应用，也不代表 DNS、IPv6 和长期运行已验证。')
           .fontSize(13).fontColor('#52627A').lineHeight(21);
-      }.width('100%').padding({ left: 24, right: 24, top: 24, bottom: 24 });
-    }.width('100%').height('100%').backgroundColor('#F5F7FA');
+      }.width(formContentWidth(this.windowWidthVp)).padding({ left: 24, right: 24, top: 24, bottom: 24 });
+    }.width('100%').height('100%').align(Alignment.Top).backgroundColor('#F5F7FA');
   }
 }

@@ -13,10 +13,16 @@ import { subscribeVpnAuthorization, unsubscribeVpnAuthorization } from '../model
 import { readPhysicalNetwork, resolvePhysicalIpv4 } from '../model/PhysicalNetwork';
 import { AppTabBar } from '../components/AppTabBar';
 import { openMainTab } from '../model/MainNavigation';
+import { AppSideNav } from '../components/AppSideNav';
+import { useSideNavigation, primaryContentWidth, formContentWidth, homeUsesColumns } from '../model/AdaptiveLayout';
+import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
+import { readNetworkPolicy } from '../model/NetworkPolicyStore';
+import { networkPolicyLabel } from '../model/NetworkPolicy';
 
 @Entry
 @Component
 struct Home {
+  @StorageProp('windowWidthVp') windowWidthVp: number = 360;
   @State phase: string = 'idle';
   @State detail: string = '';
   @State hasNode: boolean = false;
@@ -38,9 +44,12 @@ struct Home {
   @State networkKind: string = '';
   @State reconnectCount: number = 0;
   @State developerTools: boolean = false;
+  @State routingSummary: string = '全部代理';
+  @State routingHint: string = 'DNS 通过节点加密查询';
   private poll: number = -1;
   private authorizationSubscription: number = -1;
   private checkGeneration: number = 0;
+  private startGeneration: number = 0;
 
   private context(): common.UIAbilityContext {
     return this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -60,6 +69,7 @@ struct Home {
           if (isConnectionKind(current.kind) && current.phase === 'starting' && command?.ownerEpoch === CONNECTION_UI_EPOCH) {
             writeConnectionCommand(this.context().filesDir, new ConnectionCommand(current.runId, 'stop'));
             writeProbeState(this.context().filesDir, new ProbeState('failed', '未获得 VPN 授权。', current.runId, current.kind));
+            this.startGeneration++; this.requesting = false;
             this.closed = true;
             this.refresh();
           }
@@ -100,9 +110,10 @@ struct Home {
   }
 
   private statusHint(): string {
+    if (!VPN_CORE_AVAILABLE) { return '此构建用于界面与交互验证。'; }
     if (!this.hasNode) { return '添加一个节点，开始使用。'; }
     switch (this.phase) {
-      case 'active': return 'IPv4 流量通过当前节点连接。';
+      case 'active': return '按当前网络设置转发 IPv4 流量。';
       case 'starting': return '正在建立连接，请稍候。';
       case 'recovering': return '网络已变化，正在恢复连接。';
       case 'waiting-network': return '等待 Wi-Fi 或移动网络，也可以随时断开。';
@@ -125,6 +136,33 @@ struct Home {
     this.hasNode = node !== undefined;
     this.protocol = node?.protocol.toUpperCase() ?? '';
     this.nodeName = node?.name ?? '';
+    this.refreshNetworkSummary();
+  }
+
+  private refreshNetworkSummary(): void {
+    try {
+      this.routingSummary = networkPolicyLabel(readNetworkPolicy(this.context().filesDir));
+      this.routingHint = 'DNS 通过节点加密查询';
+    } catch (_) {
+      this.routingSummary = '网络设置需要检查';
+      this.routingHint = '打开设置并重新保存后再连接';
+    }
+  }
+
+  private async primaryAction(): Promise<void> {
+    if (this.requesting || this.phase === 'diagnostic') { return; }
+    if (this.busy()) { await this.disconnect(); return; }
+    if (!this.hasNode) {
+      try { await this.getUIContext().getRouter().pushUrl({ url: 'pages/NodeConfig' }); }
+      catch (_) { this.detail = '导入页面暂时无法打开，请从节点页重试。'; }
+      return;
+    }
+    await this.connect();
+  }
+
+  private openNetworkSettings(): void {
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/NetworkSettings' })
+      .catch(() => { this.routingHint = '页面暂时无法打开，请从设置页重试。'; });
   }
 
   private refresh(): void {
@@ -159,6 +197,19 @@ struct Home {
     this.phase = state.phase;
     this.detail = state.detail;
     const status = readConnectionStatus(filesDir);
+    if (state.phase === 'starting' && this.now - state.updatedAt > 25000 &&
+      status?.runId !== state.runId && command?.runId === state.runId && command.ownerEpoch === CONNECTION_UI_EPOCH) {
+      // API 24 has no authorization-result observer. No service has reported
+      // this request, and the extension's 20-second admission window expired.
+      // Cancel before allowing a retry; a late authorization cannot create TUN.
+      writeConnectionCommand(filesDir, new ConnectionCommand(state.runId, 'stop'));
+      this.phase = 'failed';
+      this.detail = command.action === 'stop' ? '本次连接请求已取消。' : '未收到 VPN 启动结果，请确认授权后重试。';
+      writeProbeState(filesDir, new ProbeState(this.phase, this.detail, state.runId, state.kind));
+      this.startGeneration++; this.requesting = false;
+      this.closed = true;
+      return;
+    }
     if (status?.runId === state.runId && (status.reconnectCount ?? 0) !== this.reconnectCount) {
       this.checkGeneration++; this.checking = false; this.exitMarker = '';
       this.checkResult = '网络状态已变化，请重新检查连接。';
@@ -214,11 +265,16 @@ struct Home {
   }
 
   private async connect(kind: string = 'connection'): Promise<void> {
+    if (!VPN_CORE_AVAILABLE) { this.detail = '模拟器界面预览不包含 VPN 转发核心。'; return; }
     if (this.busy() || this.requesting || !this.hasNode || !this.closed) { return; }
     this.requesting = true;
+    const generation = ++this.startGeneration;
+    let startedRunId: string = '';
     try {
       try { this.notificationsEnabled = await prepareConnectionNotifications(this.context()); } catch (_) { this.notificationsEnabled = false; }
+      if (generation !== this.startGeneration) { return; }
       const runId = Date.now().toString();
+      startedRunId = runId;
       writeConnectionCommand(this.context().filesDir, new ConnectionCommand(runId, 'start'));
       writeProbeState(this.context().filesDir, new ProbeState('starting', '正在建立 VPN 和代理 DNS。', runId, kind));
       this.runId = runId;
@@ -231,15 +287,17 @@ struct Home {
       await vpnExtension.startVpnExtensionAbility({
         bundleName: 'com.example.harmonyvpnlab', abilityName: 'VpnProbeAbility', parameters: { runId, kind }
       });
+      if (generation !== this.startGeneration) { return; }
       hilog.info(0x0000, 'HarmonyVpnLab', 'CONNECTION_START_REQUESTED runId=%{public}s kind=%{public}s', runId, kind);
     } catch (error) {
+      if (generation !== this.startGeneration) { return; }
       const current = readProbeState(this.context().filesDir);
-      if (current.runId === this.runId && current.phase === 'starting') {
+      if (current.runId === startedRunId && current.phase === 'starting') {
         writeConnectionCommand(this.context().filesDir, new ConnectionCommand(current.runId, 'stop'));
         writeProbeState(this.context().filesDir, new ProbeState('failed', '连接未完成：' + describeError(error), current.runId, current.kind));
       }
       this.refresh();
-    } finally { this.requesting = false; }
+    } finally { if (generation === this.startGeneration) { this.requesting = false; } }
   }
 
   private async disconnect(): Promise<void> {
@@ -343,6 +401,8 @@ struct Home {
   }
 
   build() {
+    Row() {
+      if (useSideNavigation(this.windowWidthVp) && !this.developerTools) { AppSideNav({ current: 'home' }); }
     Column() {
       Scroll() {
         Column({ space: 20 }) {
@@ -354,18 +414,46 @@ struct Home {
             }.width('100%');
           } else {
             Row({ space: 12 }) {
-              Image($r('app.media.ic_shield')).width(28).height(28).fillColor($r('app.color.accent'));
-              Text('Harmony VPN').fontSize(28).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
-                .layoutWeight(1).maxLines(2);
+              if (!useSideNavigation(this.windowWidthVp)) {
+                Image($r('app.media.ic_shield')).width(28).height(28).fillColor($r('app.color.accent'));
+              }
+              Column({ space: 5 }) {
+                Text(useSideNavigation(this.windowWidthVp) ? '连接' : 'Harmony VPN')
+                  .fontSize(28).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary')).maxLines(2);
+                Text('管理你的连接与网络偏好').fontSize(13).fontColor($r('app.color.text_secondary'));
+              }.layoutWeight(1).alignItems(HorizontalAlign.Start);
             }.width('100%').padding({ top: 8, bottom: 4 });
           }
-          this.connectionHero();
+          if (!VPN_CORE_AVAILABLE) {
+            Text('模拟器界面预览：此构建不包含 VPN 转发核心，连接与节点检测不可用。')
+              .id('simulatorPreviewNotice').width('100%').fontSize(14).lineHeight('22fp')
+              .padding(16).fontColor($r('app.color.warning')).backgroundColor($r('app.color.surface')).borderRadius(16);
+          }
           if (this.developerTools) {
+            this.connectionHero();
             this.developerContent();
           } else {
-            this.nodeCard();
+            if (homeUsesColumns(this.windowWidthVp)) {
+              Row({ space: 24 }) {
+                Column({ space: 20 }) {
+                  this.connectionHero();
+                  if (this.busy()) { this.connectionCheckCard(); }
+                  this.connectionFootnote();
+                }.layoutWeight(1).alignItems(HorizontalAlign.Start);
+                Column({ space: 20 }) {
+                  if (this.hasNode) { this.nodeCard(); }
+                  this.networkSettingsCard();
+                  this.trafficCard();
+                }.layoutWeight(1).alignItems(HorizontalAlign.Start);
+              }.id('homeTwoColumns').width('100%').alignItems(VerticalAlign.Top);
+            } else {
+            this.connectionHero();
+            if (this.hasNode) { this.nodeCard(); }
+            this.networkSettingsCard();
             this.trafficCard();
             if (this.busy()) { this.connectionCheckCard(); }
+            this.connectionFootnote();
+            }
             if (this.phase === 'failed' || this.phase === 'unknown') {
               Column({ space: 10 }) {
                 Text(this.detail).fontSize(14).fontColor($r('app.color.text_secondary'));
@@ -374,20 +462,26 @@ struct Home {
                   .onClick(() => { this.getUIContext().getRouter().pushUrl({ url: 'pages/Diagnostics' }); });
               }.width('100%').padding(18).backgroundColor($r('app.color.surface')).borderRadius(20);
             }
-            Text('IPv4 代理 · DNS 通过节点 · IPv6 暂时阻断')
-              .fontSize(12).fontColor($r('app.color.text_secondary')).textAlign(TextAlign.Center).width('100%');
           }
-        }.width('100%').padding({ top: 20, left: 20, right: 20, bottom: 24 }).alignItems(HorizontalAlign.Start);
+        }.id('homeContent').width(this.developerTools ? formContentWidth(this.windowWidthVp) : primaryContentWidth(this.windowWidthVp))
+          .padding({ top: 20, left: 20, right: 20, bottom: 24 }).alignItems(HorizontalAlign.Start);
       }.width('100%').layoutWeight(1).scrollBar(BarState.Off).align(Alignment.Top);
-      if (!this.developerTools) { AppTabBar({ current: 'home' }); }
+      if (!this.developerTools && !useSideNavigation(this.windowWidthVp)) { AppTabBar({ current: 'home' }); }
+    }.layoutWeight(1).height('100%');
     }.id('homePage').width('100%').height('100%').backgroundColor($r('app.color.page_bg'));
+  }
+
+  @Builder
+  private connectionFootnote() {
+    Text(VPN_CORE_AVAILABLE ? 'IPv4 代理 · DNS 通过节点 · IPv6 暂时阻断' : '界面预览不改变设备网络')
+      .fontSize(12).fontColor($r('app.color.text_secondary')).textAlign(TextAlign.Center).width('100%');
   }
 
   @Builder
   connectionHero() {
     Column({ space: 14 }) {
       Row({ space: 8 }) {
-        Circle().width(8).height(8).fill(this.statusTone());
+        Stack() {}.width(8).height(8).backgroundColor(this.statusTone()).borderRadius(4).accessibilityLevel('no');
         Text(this.label()).id('connectionState').fontSize(24).fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary')).constraintSize({ maxWidth: '90%' }).maxLines(2);
       }.width('100%').justifyContent(FlexAlign.Center);
@@ -395,16 +489,16 @@ struct Home {
         LoadingProgress().width(64).height(64).color($r('app.color.accent')).accessibilityText('连接状态更新中');
       } else {
         Stack() {
-          Circle().width(80).height(80).fill($r('app.color.accent_soft'));
           Image($r('app.media.ic_power')).width(38).height(38).fillColor($r('app.color.accent'));
-        }.width(80).height(80).accessibilityLevel('no');
+        }.width(80).height(80).backgroundColor($r('app.color.accent_soft')).borderRadius(40).accessibilityLevel('no');
       }
       Text(this.statusHint()).fontSize(14).fontColor($r('app.color.text_secondary')).textAlign(TextAlign.Center);
-      Button(this.busy() ? '断开' : '连接').id('toggleConnection').width('100%').constraintSize({ minHeight: 54 })
+      Button(!this.hasNode && !this.busy() ? '添加节点' : this.busy() ? '断开' : '连接').id('toggleConnection').width('100%').constraintSize({ minHeight: 54 })
         .fontSize(19).fontWeight(FontWeight.Medium).borderRadius(18)
         .fontColor($r('app.color.on_accent')).backgroundColor($r('app.color.accent'))
-        .enabled(this.phase !== 'diagnostic' && !this.requesting && (this.busy() || (this.hasNode && this.closed)))
-        .onClick(() => { if (this.busy()) { this.disconnect(); } else { this.connect(); } });
+        .enabled(this.phase !== 'diagnostic' && !this.requesting &&
+          ((!this.hasNode && !this.busy()) || (VPN_CORE_AVAILABLE && (this.busy() || (this.hasNode && this.closed)))))
+        .onClick(() => { this.primaryAction(); });
       if (this.busy() && this.phase !== 'diagnostic') {
         Text(this.networkLabel()).id('connectionNetwork').fontSize(12).fontColor($r('app.color.text_secondary'));
       }
@@ -416,9 +510,13 @@ struct Home {
         Button('恢复清理').id('recoverConnection').fontColor($r('app.color.danger'))
           .backgroundColor($r('app.color.surface_secondary')).onClick(() => { this.disconnect(); });
       }
-      if (!this.notificationsEnabled) {
+      if (VPN_CORE_AVAILABLE && !this.notificationsEnabled) {
         Text('连接通知未启用，可在系统设置中为本应用开启通知。')
           .fontSize(12).fontColor($r('app.color.warning'));
+      }
+      if (!this.hasNode && !this.busy()) {
+        Text('已有节点链接或二维码？添加后即可开始。').fontSize(12)
+          .fontColor($r('app.color.text_secondary')).textAlign(TextAlign.Center);
       }
     }.padding(24).width('100%').backgroundColor($r('app.color.surface')).borderRadius(28);
   }
@@ -435,7 +533,10 @@ struct Home {
             .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis });
           Text(this.hasNode ? this.protocol : '扫码或粘贴分享链接').fontSize(12).fontColor($r('app.color.text_secondary'));
         }.layoutWeight(1).alignItems(HorizontalAlign.Start);
-        Image($r('app.media.ic_chevron')).width(18).height(18).fillColor($r('app.color.text_secondary'));
+        Column({ space: 4 }) {
+          Text('切换').fontSize(12).fontColor($r('app.color.accent'));
+          Image($r('app.media.ic_chevron')).width(16).height(16).fillColor($r('app.color.accent'));
+        }.accessibilityLevel('no');
       }.width('100%').padding(20);
     }.id('openNodeConfig').width('100%').backgroundColor($r('app.color.surface')).borderRadius(20)
       .enabled(!this.requesting).accessibilityText('查看节点列表')
@@ -443,10 +544,28 @@ struct Home {
   }
 
   @Builder
+  private networkSettingsCard() {
+    Button({ type: ButtonType.Normal }) {
+      Row({ space: 14 }) {
+        Image($r('app.media.ic_settings')).width(24).height(24).fillColor($r('app.color.accent'));
+        Column({ space: 7 }) {
+          Text('网络设置').fontSize(12).fontColor($r('app.color.text_secondary'));
+          Text(this.routingSummary).id('homeRoutingSummary').fontSize(17).fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary')).width('100%');
+          Text(this.routingHint).fontSize(12).lineHeight('18fp').fontColor($r('app.color.text_secondary')).width('100%');
+        }.layoutWeight(1).alignItems(HorizontalAlign.Start);
+        Image($r('app.media.ic_chevron')).width(18).height(18).fillColor($r('app.color.text_secondary'));
+      }.width('100%').padding(20);
+    }.id('openHomeNetworkSettings').width('100%').backgroundColor($r('app.color.surface')).borderRadius(20)
+      .enabled(!this.requesting).accessibilityText('网络设置，' + this.routingSummary)
+      .onClick(() => { this.openNetworkSettings(); });
+  }
+
+  @Builder
   trafficCard() {
     Column({ space: 16 }) {
       Row() {
-        Text(this.startedAt <= 0 ? '流量统计' : this.busy() && this.phase !== 'diagnostic' ? '本次连接' : '上次连接')
+        Text(this.startedAt <= 0 ? '代理流量' : this.busy() && this.phase !== 'diagnostic' ? '本次连接' : '上次连接')
           .fontSize(13).fontColor($r('app.color.text_secondary'));
         Blank();
         if (this.busy() && this.phase !== 'diagnostic' && this.startedAt > 0) {

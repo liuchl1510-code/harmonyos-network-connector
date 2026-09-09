@@ -1,4 +1,5 @@
 import { vpnExtension } from '@kit.NetworkKit';
+import { deviceInfo } from '@kit.BasicServicesKit';
 
 type AuthorizationListener = (allowed: boolean) => void;
 
@@ -13,6 +14,9 @@ let nextSubscription: number = 0;
 const listeners: Map<number, AuthorizationListener> = new Map();
 
 export function subscribeVpnAuthorization(listener: AuthorizationListener): number {
+  // Authorization observers were introduced in API 26. Older systems still
+  // support starting the VPN; callers reconcile the service state and timeout.
+  if (deviceInfo.sdkApiVersion < 26 || typeof vpnExtension.createVpnObserver !== 'function') { return -1; }
   if (!observer) { observer = vpnExtension.createVpnObserver(); }
   if (!registered) {
     observer.onAuthorizationResult((allowed: boolean) => {

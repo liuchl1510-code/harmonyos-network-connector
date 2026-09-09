@@ -1,6 +1,11 @@
+import { formContentWidth } from '../model/AdaptiveLayout';
+import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
+
 @Entry
 @Component
 struct About {
+  @StorageProp('windowWidthVp') windowWidthVp: number = 360;
+
   build() {
     Scroll() {
       Column({ space: 24 }) {
@@ -15,12 +20,16 @@ struct About {
             .width(72).height(72).textAlign(TextAlign.Center)
             .backgroundColor($r('app.color.accent_soft')).borderRadius(22);
           Text('Harmony VPN').fontSize(26).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'));
-          Text('版本 0.10.0').id('appVersion').fontSize(14).fontColor($r('app.color.text_secondary'));
+          Text(VPN_CORE_AVAILABLE ? '版本 0.13.0' : '版本 0.13.0 · 界面预览').id('appVersion').fontSize(14).fontColor($r('app.color.text_secondary'));
           Text('管理节点，连接你的网络。').fontSize(14).fontColor($r('app.color.text_secondary'));
         }.padding(28).width('100%').backgroundColor($r('app.color.surface')).borderRadius(22);
 
         Column({ space: 18 }) {
           Text('开源组件').fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
+          if (!VPN_CORE_AVAILABLE) {
+            Text('以下为正式版使用的组件；当前界面预览包未包含 Xray 和 Hev。').fontSize(14)
+              .fontColor($r('app.color.warning')).lineHeight('22fp');
+          }
           this.dependency('Xray-core', '26.6.1', '代理连接核心 · Mozilla Public License 2.0');
           Divider().color($r('app.color.border'));
           this.dependency('Hev SOCKS5 Tunnel', '2.9.0', '虚拟网卡流量转发 · MIT License');
@@ -42,8 +51,8 @@ struct About {
             .fontSize(14).lineHeight('23fp').fontColor($r('app.color.text_secondary'));
         }.padding(20).width('100%').alignItems(HorizontalAlign.Start)
           .backgroundColor($r('app.color.surface')).borderRadius(20);
-      }.width('100%').padding(24).alignItems(HorizontalAlign.Start);
-    }.id('aboutPage').width('100%').height('100%').backgroundColor($r('app.color.page_bg'));
+      }.width(formContentWidth(this.windowWidthVp)).padding(24).alignItems(HorizontalAlign.Start);
+    }.id('aboutPage').width('100%').height('100%').align(Alignment.Top).backgroundColor($r('app.color.page_bg'));
   }
 
   @Builder

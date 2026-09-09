@@ -1,6 +1,11 @@
 # 鸿蒙 VPN 验证工程
 
 这是鸿蒙原生 VPN 移植的验证工程。当前已集成 ArkTS 界面、C++ 桥接、Hev 2.9.0 和 Xray 26.6.1。
+
+**0.13.0/code34 细化首页、节点列表、设置与编辑体验。** 首页首次使用可直接添加节点，网络设置可直达，宽屏增加配置区；节点列表采用紧凑行、当前标记与筛选数量，检测说明默认折叠；设置分为“连接与数据”和“帮助与说明”，外观选项保留选中勾选并减少重复提示；节点编辑增加未保存离开保护、固定反馈区及端口数字输入与校验。API 24 兼容代码已补充版本/能力判断、启动超时和请求代次隔离。签名构建与有界模拟器页面观察已完成，编辑确认和非法端口完整 GUI 流程尚未完成验收，仅有离线验证；真实平板安装与联网按用户要求暂停，尚未验收。实现与证据见[阶段十三记录](docs/phase13-product-refinement.md)。
+
+**0.12.0 新增手机、平板与 2in1 窗口自适应。** 表单最多 840 vp 并居中；窗口达到 1024 vp 时主入口使用 176 vp 侧导航；首页可用主体达到 680 vp 时显示双栏。PC 缺少系统扫码能力时不加载该模块，仍可粘贴分享链接/单 outbound JSON，或从设置恢复节点备份。x86_64 模拟器包仅预览界面，不包含 VPN 核心。该版本的已测范围与折叠/旋转限制见[阶段十二记录](docs/phase12-adaptive-layout-verification.md)。
+**0.11.1 新增分流与 DNS 设置、完整节点编辑、JSON 导出/节点库备份恢复、批量依次 HTTPS 检测和列表耗时排序。** 默认网络行为沿用全部代理；自定义规则与 DNS 在下一次普通连接时生效，节点检测始终使用独立默认配置。真机验收中修复了参数化菜单不展开、跨会话重连计数误用、下一条检测过早启动的问题。C++ 桥接和原生核心未修改。使用方法及验证范围见[阶段十一记录](docs/phase11-network-node-tools.md)。
 **0.10.0 完成原生界面与交互整理。** 底部提供连接、节点、设置三个入口；支持系统/浅色/深色外观、系统字体跟随与最大2倍字号；开发工具、诊断、关于和隐私说明独立归纳。节点采用紧凑列表和原生菜单，检测结果在大字体下完整显示。详见[界面与回归记录](docs/phase10-product-ui-verification.md)。
 **0.9.0 新增逐节点 HTTPS 耗时检测和连接诊断记录。** 两条真实节点、取消后重试、完全断网恢复和离线中停止已通过真机验证；另完成30分钟/61样本的后台为主观测，四次DNS/HTTPS复查及最终清理通过。临时检测仅接管本应用，保留当前选中节点，完成或取消后自动清理；历史结果与配置 SHA-256 指纹绑定。范围及限制见[阶段九记录](docs/phase9-latency-stability-verification.md)。
 **0.8.1 新增域名预解析、手动重连和网络切换恢复。** 已在真机通过三次核心重连，以及 Wi-Fi → 移动数据 → Wi-Fi 后的 DNS/HTTPS 检查；恢复时保留 VPN 网卡和 Hev。用户暂时没有域名节点，因此域名验证限于实际核心拨号逻辑和手机物理网络 DNS 接口。详见[网络恢复记录](docs/phase8-network-recovery-verification.md)。
@@ -11,20 +16,31 @@
 
 **历史验证：0.1.2 的生命周期阶段已通过。** 原生调用、正常创建/释放、提前停止、拒绝授权及重新授权恢复均已实际验证。详见 [第一阶段验证记录](docs/phase1-verification.md)。
 
-后续进度：0.3.0 已构建并安装，包含[节点本地导入](docs/node-import-support.md)和单应用节点 HTTPS 验证入口。详见[核心集成记录](docs/phase2-verification.md)。
+历史核心集成：0.3.0 包含[节点本地导入](docs/node-import-support.md)和单应用节点 HTTPS 验证入口。详见[核心集成记录](docs/phase2-verification.md)。
 
-当前版本：0.10.0。已移植 Go 1.26.7 的 OHOS 支持并集成真实 Xray 26.6.1，满足服务端默认最低 26.3.27 的要求。逐 socket 保护、运行时时钟和保存读回校验继续保留。0.8.1 用第9个包装层ABI直接读取当前核心统计，移除了不支持重复启动的HTTP metrics模块。0.6.4 修复授权观察器回收卡死并通过一次锁屏恢复；0.6.8 修复 Hev 可写事件空转。历史CPU采样不是续航测量，版本/测试范围分别记录。
+当前版本：0.13.0/code34。完整核心构建继续使用 Go 1.26.7 的 OHOS 适配和真实 Xray 26.6.1，满足服务端默认最低 26.3.27 的要求。逐 socket 保护、运行时时钟和保存读回校验继续保留。0.8.1 用第9个包装层ABI直接读取当前核心统计，移除了不支持重复启动的HTTP metrics模块。0.6.4 修复授权观察器回收卡死并通过一次锁屏恢复；0.6.8 修复 Hev 可写事件空转。历史CPU采样不是续航测量，版本/测试范围分别记录。
 
 ## 已确认的环境
 
 - DevEco Studio 26.0.0 Release（26.0.0.821）。
 - 本机配套 HarmonyOS SDK 26.0.0.105，API 26。
+- 公开构建配置最低兼容 HarmonyOS 6.1.1（API 24），compile/target 为 API 26；最低版本声明不等同于真实平板验收。
 - USB 真机：华为 Pura 80 Ultra，设备报告型号 LMR-AL10；系统参数报告 OpenHarmony-7.0.0.105，API 26。
-- 本工程仅构建 arm64-v8a；普通 INTERNET、GET_NETWORK_INFO 权限，无 MANAGE_VPN 系统权限。
+- 完整转发核心目标为 arm64-v8a；`-SimulatorUI` 另构建 x86_64 界面预览，不含转发核心。
+- manifest 声明 phone、tablet、2in1，支持全屏/分屏/浮窗；界面声明不代表这些设备的 VPN 已通过。
+- 普通 INTERNET、GET_NETWORK_INFO 权限，无 MANAGE_VPN 系统权限。
 
 ## 构建
 
 首次公开源码克隆不包含原生库，请先按[源码构建指南](docs/public-build.md)运行 `prepare-native.ps1`。不使用个人签名的构建检查采用 `build.ps1 -NoSign`；下文保留本地签名开发流程。
+
+仅检查手机/平板/电脑/折叠屏的布局时，使用独立预览变体：
+
+```powershell
+pwsh -File .\scripts\build.ps1 -SimulatorUI -NoSign
+```
+
+预览版不需要准备 ARM64 库，0.13.0 构建的版本标记为 `0.13.0-ui-preview`，产物写入 `build/artifacts/simulator-ui/`。连接、节点联网检测和开发验证入口均不可用；节点编辑、粘贴导入、备份恢复和外观仍可检查。安装到模拟器需自己的签名配置，命令见[预览构建指南](docs/public-build.md#4-x86_64-模拟器界面预览)。当前脚本的构建模式仍是 debug，本轮预览验收状态以阶段十三记录为准。
 
 在此工程目录执行 PowerShell 7 命令：
 
@@ -96,7 +112,7 @@ HAP 构建产物会复制到本目录 `build/artifacts/`。
 
 ## 本地节点导入
 
-在底部“节点”→右上角“添加”→“扫码或粘贴节点”，粘贴分享链接、Base64列表、单个出站JSON，或点击“扫描节点二维码”扫描3X-UI二维码；识别后点击“解析并保存”。支持格式及拒绝项见[导入范围](docs/node-import-support.md)。输入保存后清空，不写入日志。已有当前节点保持选中，可在列表中“选用”。连接运行/清理期间可以浏览列表，修改仍被锁定。
+在“节点”→“添加”→“扫码或粘贴节点”，粘贴分享链接、Base64列表、单个出站JSON；有系统扫码能力的设备也可扫描3X-UI二维码或从系统扫码页选取图片，识别后点击“解析并保存”。PC 不提供系统扫码或图片识码，界面给出粘贴/JSON/备份恢复指引。支持格式及拒绝项见[导入范围](docs/node-import-support.md)。输入保存后清空，不写入日志。已有当前节点保持选中，可在列表中“选用”。连接运行/清理期间可以浏览列表，修改仍被锁定。
 
 节点只保存在本应用私有目录，尚未实现应用层配置加密。单节点二维码不需要订阅地址。实际持有 HTTPS 订阅 URL 时，可通过“管理订阅”获取预览后保存。订阅支持同样的链接/JSON文本，拒绝自动重定向和Clash YAML；无自动后台刷新。目录最多500节点、20来源，保存采用原子替换，更新失败保留原数据。
 
@@ -120,12 +136,18 @@ HAP 构建产物会复制到本目录 `build/artifacts/`。
 ## 代码入口
 
 - `entry/src/main/ets/pages/Home.ets`：持续连接界面、连接检查与重连状态。
+- `entry/src/main/ets/model/AdaptiveLayout.ets`：按窗口 vp 宽度选择侧导航、双栏和内容上限。
+- `entry/src/main/ets/entryability/EntryAbility.ets`：窗口尺寸监听和 `windowWidthVp` 更新。
+- `entry/src/main/ets/model/BuildCapabilities.ets`：区分完整核心与界面预览；预览脚本只在隔离暂存中改为 false。
+- `entry/src/main/ets/model/NodeScanner.ets`：在能力检查后动态加载系统扫码。
 - `entry/src/main/ets/pages/Index.ets`：短时探针、授权观察、状态轮询。
 - `entry/src/main/ets/vpn/VpnProbeAbility.ets`：VPN 扩展、持续连接和受限测试路由、清理。
 - `entry/src/main/ets/model/ConnectionConfig.ets`：代理 DNS 与 IPv6 黑洞路由。
 - `entry/src/main/ets/model/ConnectionControl.ets`：跨进程连接命令与状态。
 - `entry/src/main/ets/model/ProbeState.ets`：跨进程状态文件。
 - `entry/src/main/cpp/napi_init.cpp`：N-API 和原生 FD 检查。
+
+多端贡献的构建与回归入口见[贡献者检查](docs/public-build.md#5-多端界面贡献者检查)。本地截图画廊可用 `node scripts/make-adaptive-report.cjs` 重建，输出 `build/phase12-emulators/report.html`；截图、QA 临时数据与原始日志不随 Git 发布。
 
 ## 后续源码参考
 

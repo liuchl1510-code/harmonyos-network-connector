@@ -7,6 +7,7 @@ const MAX_NODES: number = 500;
 const MAX_SUBSCRIPTIONS: number = 20;
 const MAX_OUTBOUND_BYTES: number = 65536;
 const MAX_FILE_BYTES: number = 4 * 1024 * 1024;
+const MAX_BACKUP_BYTES: number = 5 * 1024 * 1024;
 const CATALOG_ERROR: string = '节点库损坏或无法读取，已停止操作，请保留原文件。';
 
 export class SavedNode {
@@ -56,6 +57,14 @@ export class NodeImportResult {
     this.duplicates = duplicates;
     this.activeNodeId = activeNodeId;
   }
+}
+
+class NodeCatalogBackup {
+  format: string = 'harmony-vpn-node-backup';
+  schemaVersion: number = 1;
+  exportedAt: number = Date.now();
+  catalog: NodeCatalog;
+  constructor(catalog: NodeCatalog) { this.catalog = catalog; }
 }
 
 function byteLength(text: string): number {
@@ -299,6 +308,69 @@ export function updateActiveNode(filesDir: string, node: ImportedNode): void {
   saved.outboundJson = normalized.outboundJson;
   saved.modifiedAt = Date.now();
   writeCatalog(filesDir, catalog);
+}
+
+// The editor writes one selected identity, never whichever node became active
+// while the form was open. A changed catalog requires a fresh review of the form.
+export function updateCatalogNode(filesDir: string, id: string, node: ImportedNode,
+  expectedRevision: number): void {
+  assertNodeManagementAllowed(filesDir);
+  const normalized = normalizeNode(node);
+  const catalog = readNodeCatalog(filesDir);
+  if (!wholeNumber(expectedRevision) || catalog.revision !== expectedRevision) {
+    throw new Error('节点库已发生变化，请返回列表后重新打开编辑。');
+  }
+  const saved = requireNode(catalog, id);
+  if (catalog.nodes.some((entry: SavedNode) => entry.id !== id && entry.outboundJson === normalized.outboundJson)) {
+    throw new Error('相同配置的节点已存在，请直接选择该节点。');
+  }
+  saved.name = normalized.name;
+  saved.protocol = normalized.protocol;
+  saved.outboundJson = normalized.outboundJson;
+  saved.modifiedAt = Date.now();
+  writeCatalog(filesDir, catalog);
+}
+
+// Export is read-only and retains the entire validated outbound, including
+// supported nested fields which the basic editor does not display.
+export function exportCatalogNode(filesDir: string, id: string): string {
+  const catalog = readNodeCatalog(filesDir);
+  return requireNode(catalog, id).outboundJson;
+}
+
+export function exportNodeCatalogBackup(filesDir: string): string {
+  const text = JSON.stringify(new NodeCatalogBackup(readNodeCatalog(filesDir)));
+  if (byteLength(text) > MAX_BACKUP_BYTES) { throw new Error('节点备份超过 5 MiB，未导出。'); }
+  return text;
+}
+
+// Pure validation for a preview. Never write a catalog or start a subscription
+// request while inspecting an imported file, and do not recover partial content.
+export function previewNodeCatalogBackup(text: string): NodeCatalog {
+  try {
+    if (typeof text !== 'string' || text.length === 0 || text.length > MAX_BACKUP_BYTES ||
+      byteLength(text) > MAX_BACKUP_BYTES) { throw new Error('invalid'); }
+    const backup = JSON.parse(text) as NodeCatalogBackup;
+    exactKeys(backup, ['format', 'schemaVersion', 'exportedAt', 'catalog']);
+    if (backup.format !== 'harmony-vpn-node-backup' || backup.schemaVersion !== 1 ||
+      !wholeNumber(backup.exportedAt)) { throw new Error('invalid'); }
+    const catalog = validateCatalog(backup.catalog);
+    if (byteLength(JSON.stringify(catalog)) > MAX_FILE_BYTES) { throw new Error('invalid'); }
+    return catalog;
+  } catch (_) { throw new Error('备份格式无效、节点不受支持或文件超过限制，原有配置未改变。'); }
+}
+
+export function restoreNodeCatalogBackup(filesDir: string, text: string, expectedRevision: number): void {
+  assertNodeManagementAllowed(filesDir);
+  const incoming = previewNodeCatalogBackup(text);
+  const current = readNodeCatalog(filesDir);
+  if (!wholeNumber(expectedRevision) || current.revision !== expectedRevision) {
+    throw new Error('预览后节点库已发生变化，请重新选择备份并确认。');
+  }
+  // Keep local revision ordering while restoring IDs, names, subscriptions and
+  // active selection from the accepted backup. writeCatalog atomically replaces.
+  incoming.revision = current.revision;
+  writeCatalog(filesDir, incoming);
 }
 
 function saveSubscriptionOnCatalog(catalog: NodeCatalog, id: string, name: string, url: string): string {

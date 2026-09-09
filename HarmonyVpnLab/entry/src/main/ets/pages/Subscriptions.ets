@@ -5,10 +5,12 @@ import { parseNodeBatch } from '../model/NodeBatchImport';
 import { SubscriptionSource, SavedNode, readNodeCatalog, saveSubscriptionWithNodes, deleteSubscription } from '../model/NodeCatalog';
 import { assertNodeManagementAllowed, isNodeManagementAllowed } from '../model/NodeEditGuard';
 import { fetchSubscription, normalizeSubscriptionUrl } from '../model/SubscriptionFetch';
+import { formContentWidth } from '../model/AdaptiveLayout';
 
 @Entry
 @Component
 struct Subscriptions {
+  @StorageProp('windowWidthVp') windowWidthVp: number = 360;
   @State sources: SubscriptionSource[] = [];
   @State nodes: SavedNode[] = [];
   @State name: string = '';
@@ -90,7 +92,7 @@ struct Subscriptions {
           .borderRadius(12).constraintSize({ minHeight: 44 }).padding({ left: 12, right: 12 })
           .onClick(() => { this.epoch++; this.busy = false; this.clearPreview(); this.address = ''; this.getUIContext().getRouter().back(); });
         Text('订阅管理').fontSize(23).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary')).layoutWeight(1);
-      }.width('100%').padding({ left: 20, right: 20, top: 12, bottom: 16 });
+      }.width(formContentWidth(this.windowWidthVp)).padding({ left: 20, right: 20, top: 12, bottom: 16 });
       Scroll() {
         Column({ space: 18 }) {
           Column({ space: 8 }) {
@@ -204,8 +206,8 @@ struct Subscriptions {
           }, (source: SubscriptionSource) => source.id)
           Text('更新失败或未确认预览时保留原节点。订阅地址保存在应用私有目录，不写入调试日志。')
             .fontSize(13).fontColor($r('app.color.text_secondary'));
-        }.width('100%').padding({ left: 20, right: 20, bottom: 28 }).alignItems(HorizontalAlign.Start);
+        }.width(formContentWidth(this.windowWidthVp)).padding({ left: 20, right: 20, bottom: 28 }).alignItems(HorizontalAlign.Start);
       }.width('100%').layoutWeight(1).align(Alignment.Top);
-    }.width('100%').height('100%').backgroundColor($r('app.color.page_bg'));
+    }.width('100%').height('100%').alignItems(HorizontalAlign.Center).backgroundColor($r('app.color.page_bg'));
   }
 }

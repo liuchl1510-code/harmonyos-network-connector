@@ -4,7 +4,7 @@
     "type": "entry",
     "description": "$string:module_desc",
     "mainElement": "EntryAbility",
-    "deviceTypes": ["phone"],
+    "deviceTypes": ["phone", "tablet", "2in1"],
     "deliveryWithInstall": true,
     "installationFree": false,
     "pages": "$profile:main_pages",
@@ -17,6 +17,9 @@
       "startWindowIcon": "$media:app_icon",
       "startWindowBackground": "$color:start_window_background",
       "exported": true,
+      "supportWindowMode": ["fullscreen", "split", "floating"],
+      "minWindowWidth": 320,
+      "minWindowHeight": 320,
       "skills": [{ "entities": ["entity.system.home"], "actions": ["ohos.want.action.home"] }]
     }],
     "extensionAbilities": [{

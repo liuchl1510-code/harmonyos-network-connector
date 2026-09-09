@@ -10,7 +10,7 @@ const project = path.resolve(__dirname, '..');
 const etsRoot = path.join(project, 'entry/src/main/ets');
 const ts = require(path.join(process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio',
   'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
-const sourceNames = ['vpn/CoreProbe.ets', 'model/ConnectionConfig.ets', 'model/ConnectionSnapshot.ets', 'model/NodeBootstrap.ets'];
+const sourceNames = ['vpn/CoreProbe.ets', 'model/ConnectionConfig.ets', 'model/ConnectionSnapshot.ets', 'model/NodeBootstrap.ets', 'model/NetworkPolicy.ets'];
 const sources = new Map(sourceNames.map(name => [name, fs.readFileSync(path.join(etsRoot, name), 'utf8')]));
 function deferred() { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; }
 async function flush() { for (let i = 0; i < 40; i++) await Promise.resolve(); }
@@ -39,7 +39,8 @@ function scenario() {
     return exported;
   }
   const bootstrap = load('model/NodeBootstrap.ets');
-  const config = load('model/ConnectionConfig.ets', { './NodeBootstrap': bootstrap });
+  const policy = load('model/NetworkPolicy.ets', { './NodeBootstrap': bootstrap });
+  const config = load('model/ConnectionConfig.ets', { './NodeBootstrap': bootstrap, './NetworkPolicy': policy });
   const snapshot = load('model/ConnectionSnapshot.ets');
   const native = {
     getFreePorts: () => { s.calls.push('ports'); return JSON.stringify({ socksPort: 18900, metricsPort: 18901 }); },
@@ -93,11 +94,13 @@ function scenario() {
     '../model/NodeProfile': { readNodeProfile: () => { s.profileReads++; return { outboundJson: outbound }; } },
     '../model/NodeImport': { parseNode: value => ({ outboundJson: value }) }, '../model/ErrorInfo': { describeError: () => 'synthetic' },
     '../model/ConnectionConfig': config, '../model/ConnectionSnapshot': snapshot, '../model/NodeBootstrap': bootstrap,
+    '../model/NetworkPolicy': policy,
     '@kit.NetworkKit': { http: { createHttp: () => { s.httpRequests++; throw new Error('Stats must not make an HTTP request'); } }, socket: {} }
   }).CoreProbe;
   s.probe = new CoreProbe(); s.context = { filesDir: '/synthetic' };
   s.pin = ip => new bootstrap.NodeBootstrap('node.example.test', ip);
-  s.start = () => s.probe.startConnection(7000, s.context, async () => {}, s.pin('192.0.2.1'), outbound);
+  s.newPolicy = () => new policy.NetworkPolicy();
+  s.start = p => s.probe.startConnection(7000, s.context, async () => {}, s.pin('192.0.2.1'), outbound, p);
   s.resume = (ip = '192.0.2.2') => s.probe.resumeConnection(s.context, s.pin(ip));
   s.appendDiagnostics = () => { const name = '/synthetic/xray-connection-diagnostic.log';
     s.files.set(name, s.files.get(name) + 'app/dispatcher: taking detour [dns-out]\napp/dispatcher: taking detour [block-ipv6]\n'); };
@@ -106,6 +109,18 @@ function scenario() {
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 const count = (s, value) => s.calls.filter(item => item === value).length;
+
+test('routing and DNS freeze at start and survive recovery despite caller mutation', async () => {
+  const s = scenario(), p = s.newPolicy(); p.mode = 'rules'; p.bypassLan = true;
+  p.block = ['full:blocked.example.test']; p.dnsUrl = 'https://dns.example.test/dns-query';
+  await s.start(p); const first = s.configs[0];
+  p.mode = 'global'; p.block.push('other.example.test'); p.dnsUrl = 'https://1.1.1.1/dns-query';
+  await s.probe.suspendConnection(); await s.resume();
+  assert.equal(s.configs[1].dns.servers[0].address, first.dns.servers[0].address);
+  assert.deepEqual(s.configs[1].routing, first.routing);
+  assert.equal(s.configs[1].inbounds[0].sniffing.routeOnly, true);
+  await s.probe.stop();
+});
 test('three recoveries preserve Hev TUN ports credentials duration and cumulative traffic', async () => {
   const s = scenario(); await s.start();
   const startedAt = (await s.probe.readConnectionSnapshot()).startedAt;

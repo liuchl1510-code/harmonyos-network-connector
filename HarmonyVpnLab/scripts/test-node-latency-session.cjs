@@ -54,7 +54,7 @@ function scenario(options = {}) {
   const target = { id: 'test-node', name: 'synthetic target', protocol: 'vless', outboundJson: outbound('192.0.2.22') };
   const catalog = { activeNodeId: active.id, nodes: options.missingNode ? [active] : [active, target] };
   const context = { filesDir: '/synthetic-latency' };
-  const shared = { fs: fakeFs, Date: FakeDate, ImportedNode, PhysicalNetwork,
+  const shared = { VPN_CORE_AVAILABLE: true, fs: fakeFs, Date: FakeDate, ImportedNode, PhysicalNetwork,
     systemDateTime: { TimeType: { STARTUP: 0 }, getUptime: () => clock.uptime },
     util: { generateRandomUUID: () => 'synthetic-' + uuid++, TextEncoder: class { encodeInto(text) { return new TextEncoder().encode(text); } } },
     cryptoFramework: { createMd(algorithm) {

@@ -10,7 +10,7 @@ const root = path.resolve(__dirname, '..');
 const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio';
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
 const names = ['model/ConnectionControl.ets', 'model/ConnectionSnapshot.ets', 'model/ConnectionNotification.ets',
-  'model/ProbeState.ets', 'model/NodeBootstrap.ets', 'model/VpnAuthorization.ets', 'vpn/VpnProbeAbility.ets', 'pages/Home.ets', 'pages/Index.ets'];
+  'model/ProbeState.ets', 'model/NodeBootstrap.ets', 'model/NetworkPolicy.ets', 'model/VpnAuthorization.ets', 'vpn/VpnProbeAbility.ets', 'pages/Home.ets', 'pages/Index.ets'];
 const sources = new Map(names.map(name => [name, fs.readFileSync(path.join(root, 'entry/src/main/ets', name), 'utf8')]));
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 async function flush() { for (let i = 0; i < 35; i++) await Promise.resolve(); }
@@ -58,7 +58,7 @@ function scenario(options = {}) {
   class FakeDate extends Date { static now() { return clock.now; } }
   const silent = { info() {}, error() {}, warn() {} };
   const context = { filesDir: '/synthetic-vpn', openLink: async () => {} };
-  const shared = { fs: fakeFs, Date: FakeDate, systemDateTime: { TimeType: { STARTUP: 0 }, getUptime: () => clock.now }, hilog: silent, describeError: () => 'synthetic-error',
+  const shared = { VPN_CORE_AVAILABLE: !options.preview, deviceInfo: { sdkApiVersion: options.sdkApiVersion ?? 26 }, fs: fakeFs, Date: FakeDate, systemDateTime: { TimeType: { STARTUP: 0 }, getUptime: () => clock.now }, hilog: silent, describeError: () => 'synthetic-error',
     AppStorage: {
       get: key => appStorage.get(key),
       set(key, value) { if (!appStorage.has(key)) return false; appStorage.set(key, value); return true; },
@@ -72,6 +72,7 @@ function scenario(options = {}) {
     clearTimeout: id => timers.delete(id),
     console: { info() {}, log() {}, warn() {}, error() {} },
     readNodeProfile: () => selectedNode,
+    readNetworkPolicy: () => options.readNetworkPolicy ? options.readNetworkPolicy() : undefined,
     nodeServerAddress: node => JSON.parse(node.outboundJson).settings.vnext[0].address,
     PhysicalNetwork, PhysicalNetworkWatcher: class {
       async start(listener) { calls.watcherStart++; physical.listener = listener; if (options.watcherStart) await options.watcherStart(); }
@@ -95,7 +96,7 @@ function scenario(options = {}) {
     if (name === 'pages/Home.ets' || name === 'pages/Index.ets') {
       const pageName = name === 'pages/Home.ets' ? 'Home' : 'Index';
       source = source.slice(0, source.indexOf('\n  build() {')) + '\n}\n';
-      source = source.replace(/@Entry\s*\n|@Component\s*\n/g, '').replace(/@State /g, '').replace('struct ' + pageName, 'export class ' + pageName);
+      source = source.replace(/@Entry\s*\n|@Component\s*\n/g, '').replace(/@State /g, '').replace(/@StorageProp\([^)]*\)\s*/g, '').replace('struct ' + pageName, 'export class ' + pageName);
     }
     const result = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true });
     assert.equal(result.diagnostics.length, 0, 'transpile ' + name);
@@ -112,6 +113,7 @@ function scenario(options = {}) {
   };
   Object.assign(shared, load('model/ProbeState.ets'));
   Object.assign(shared, load('model/NodeBootstrap.ets'));
+  Object.assign(shared, load('model/NetworkPolicy.ets'));
   const notificationManager = {
     isNotificationEnabled: () => options.notificationEnabled ? options.notificationEnabled() : Promise.resolve(true),
     requestEnableNotification: async () => {},
@@ -136,7 +138,7 @@ function scenario(options = {}) {
   let service;
   let authorizationCallback;
   const vpnExtension = { createVpnConnection: () => connection,
-    startVpnExtensionAbility: async () => {},
+    startVpnExtensionAbility: async want => { if (options.startVpnRequest) await options.startVpnRequest(want); },
     stopVpnExtensionAbility: async () => { calls.serviceStop++; if (options.autoDestroy !== false) service?.onDestroy(); },
     createVpnObserver: () => {
       calls.observerCreate++;
@@ -145,6 +147,7 @@ function scenario(options = {}) {
         offAuthorizationResult() { calls.observerOff++; authorizationCallback = undefined; }
       };
     } };
+  if (options.missingObserver) delete vpnExtension.createVpnObserver;
   const http = { RequestMethod: { GET: 0 }, HttpDataType: { STRING: 0 }, createHttp: () => ({
     request: () => { calls.transfer++; return options.httpRequest ? options.httpRequest() : Promise.resolve({ responseCode: 200, result: 'h=www.cloudflare.com\nip=synthetic\n' }); },
     destroy() {} }) };
@@ -270,6 +273,109 @@ test('Home hide/disappear never writes stop or stops extension', async () => {
   const s = scenario(); s.activate(); s.home.aboutToAppear(); await flush();
   s.home.onPageHide(); s.home.aboutToDisappear();
   assert.equal(s.command().action, 'start'); assert.equal(s.calls.serviceStop, 0);
+});
+
+test('API 24 creates no unsupported observer and still launches the service', async () => {
+  const s = scenario({ sdkApiVersion: 24, missingObserver: true });
+  s.home.aboutToAppear(); s.index.aboutToAppear(); await flush();
+  assert.equal(s.home.authorizationSubscription, -1); assert.equal(s.index.authorizationSubscription, -1);
+  assert.equal(s.calls.observerCreate, 0); assert.equal(s.calls.observerOn, 0);
+  await s.launch(); assert.equal(s.calls.create, 1); assert.equal(s.calls.coreStart, 1);
+});
+
+test('missing observer factory on an API 26 device does not break subscriptions', async () => {
+  const s = scenario({ missingObserver: true });
+  assert.equal(s.shared.subscribeVpnAuthorization(() => assert.fail('must not invent authorization')), -1);
+  assert.equal(s.calls.observerCreate, 0);
+});
+
+test('unstarted request expires without claiming an authorization denial or creating TUN', async () => {
+  const s = scenario({ sdkApiVersion: 24, missingObserver: true }); s.prepare();
+  s.clock.now += 25000; s.home.refresh(); assert.equal(s.command().action, 'start');
+  s.clock.now++; s.home.refresh();
+  assert.equal(s.command().action, 'stop'); assert.equal(s.home.phase, 'failed'); assert.equal(s.home.closed, true);
+  assert.match(s.home.detail, /未收到 VPN 启动结果/); assert.equal(s.calls.create, 0);
+  s.service.onCreate({ parameters: { runId: 'run-one', kind: 'connection' } });
+  await s.service.initialization; await flush();
+  assert.equal(s.calls.create, 0); assert.equal(s.calls.coreStart, 0);
+});
+
+test('pending cancellation settles after admission timeout and remains retryable', async () => {
+  const s = scenario({ sdkApiVersion: 24 }); s.prepare(); s.home.refresh();
+  await s.home.disconnect(); assert.equal(s.command().action, 'stop');
+  s.clock.now += 25001; s.home.refresh();
+  assert.equal(s.home.phase, 'failed'); assert.equal(s.home.closed, true); assert.match(s.home.detail, /已取消/);
+  s.home.hasNode = true; await s.home.connect();
+  assert.equal(s.command().action, 'start'); assert.notEqual(s.command().runId, 'run-one');
+});
+
+test('unstarted timeout never closes a service that already reported the request', async () => {
+  const s = scenario({ sdkApiVersion: 24 }); s.prepare();
+  s.shared.writeConnectionStatus(s.context.filesDir, new s.shared.ConnectionStatus('run-one', 'starting', undefined, false, 4242));
+  s.clock.now += 25001; s.home.refresh();
+  assert.equal(s.command().action, 'start'); assert.equal(s.home.closed, false); assert.equal(s.home.phase, 'unknown');
+});
+
+test('pending API 24 start expires and late rejection cannot stop the retry', async () => {
+  const first = deferred(), second = deferred(); let calls = 0;
+  const s = scenario({ sdkApiVersion: 24, missingObserver: true, startVpnRequest: () => ++calls === 1 ? first.promise : second.promise });
+  s.home.closed = true; s.home.hasNode = true;
+  const firstConnect = s.home.connect(); await flush();
+  const oldRun = s.command().runId; assert.equal(s.home.requesting, true); assert.equal(s.home.phase, 'starting');
+  s.clock.now += 25001; s.home.refresh();
+  assert.equal(s.home.requesting, false); assert.equal(s.home.closed, true); assert.equal(s.command().action, 'stop');
+  const secondConnect = s.home.connect(); await flush();
+  const newRun = s.command().runId; assert.notEqual(newRun, oldRun); assert.equal(s.home.requesting, true);
+  first.reject(new Error('old delayed rejection')); await firstConnect; await flush();
+  assert.equal(s.command().runId, newRun); assert.equal(s.command().action, 'start');
+  assert.equal(s.home.requesting, true); assert.equal(s.home.phase, 'starting');
+  second.resolve(); await secondConnect; assert.equal(s.home.requesting, false);
+});
+
+test('API 26 authorization refusal also invalidates a still-pending start promise', async () => {
+  const pending = deferred(); const s = scenario({ startVpnRequest: () => pending.promise });
+  s.home.aboutToAppear(); await flush(); s.home.closed = true;
+  const connecting = s.home.connect(); await flush(); assert.equal(s.home.requesting, true);
+  s.emitAuthorization(false); assert.equal(s.home.requesting, false); assert.equal(s.home.closed, true);
+  const writes = s.calls.commandWrites.length; pending.reject(new Error('late denied start')); await connecting;
+  assert.equal(s.calls.commandWrites.length, writes); assert.equal(s.home.phase, 'failed');
+});
+
+test('unstarted timeout cannot cancel another UI process owner', async () => {
+  const s = scenario({ sdkApiVersion: 24 }); s.prepare();
+  s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'start', 'different-owner'));
+  s.clock.now += 25001; s.home.refresh();
+  assert.equal(s.command().action, 'start'); assert.equal(s.home.phase, 'interrupted');
+});
+
+test('Home first-run primary action opens import without a VPN start', async () => {
+  const s = scenario(), routes = [];
+  s.home.getUIContext = () => ({ getHostContext: () => s.context, getRouter: () => ({ pushUrl: async want => routes.push(want.url) }) });
+  s.home.hasNode = false; s.home.closed = true; await s.home.primaryAction();
+  assert.deepEqual(routes, ['pages/NodeConfig']); assert.equal(s.calls.commandWrites.length, 0); assert.equal(s.calls.create, 0);
+});
+
+test('Home primary action preserves request and preview-core guards', async () => {
+  const s = scenario({ preview: true }); s.home.hasNode = true; s.home.closed = true;
+  await s.home.primaryAction(); assert.equal(s.calls.commandWrites.length, 0); assert.equal(s.calls.create, 0);
+  s.home.hasNode = false; s.home.requesting = true;
+  s.home.getUIContext = () => { assert.fail('requesting primary action must not navigate'); };
+  await s.home.primaryAction();
+});
+
+test('Home network summary refreshes saved preferences without changing the session', async () => {
+  let policy = { mode: 'global', bypassLan: false }; const s = scenario({ readNetworkPolicy: () => policy });
+  s.activate(); const writes = s.calls.commandWrites.length;
+  s.home.onPageShow(); assert.equal(s.home.routingSummary, '全部代理');
+  policy = { mode: 'rules', bypassLan: true }; s.home.onPageShow();
+  assert.equal(s.home.routingSummary, '规则分流 · 绕过局域网'); assert.equal(s.calls.commandWrites.length, writes);
+  assert.equal(s.calls.create, 0); assert.equal(s.calls.serviceStop, 0);
+});
+
+test('Home unreadable policy summary does not masquerade as the default configuration', async () => {
+  const s = scenario({ readNetworkPolicy: () => { throw new Error('synthetic unreadable policy'); } });
+  s.home.refreshProfile(); assert.equal(s.home.routingSummary, '网络设置需要检查');
+  assert.equal(s.calls.commandWrites.length, 0);
 });
 
 test('Home foreground cycles retain one native observer and one poll', async () => {

@@ -10,9 +10,10 @@ const root = path.resolve(__dirname, '..');
 const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio';
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
 const appearanceSource = fs.readFileSync(path.join(root, 'entry/src/main/ets/model/Appearance.ets'), 'utf8');
-const settingsSource = fs.readFileSync(path.join(root, 'entry/src/main/ets/pages/Settings.ets'), 'utf8')
-  .split('  build() {')[0].replace(/@Entry\s*/g, '').replace(/@Component\s*/g, '')
-  .replace(/@State\s*/g, '').replace('struct Settings', 'export class Settings') + '\n}';
+const settingsFullSource = fs.readFileSync(path.join(root, 'entry/src/main/ets/pages/Settings.ets'), 'utf8');
+const settingsSource = settingsFullSource.split('  build() {')[0].replace(/@Entry\s*/g, '').replace(/@Component\s*/g, '')
+  .replace(/@State\s*/g, '').replace(/@StorageProp\([^)]*\)\s*/g, '')
+  .replace('struct Settings', 'export class Settings') + '\n}';
 function compile(source) {
   const result = ts.transpileModule(source, {
     compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true
@@ -27,7 +28,7 @@ const destination = `${dir}/appearance.json`;
 const colors = { COLOR_MODE_NOT_SET: -1, COLOR_MODE_DARK: 0, COLOR_MODE_LIGHT: 1 };
 const saveError = '外观设置未保存，请重试。';
 const applyError = '外观暂时无法切换，请重试。';
-function fixture() {
+function fixture(options = {}) {
   const files = new Map();
   const handles = new Map();
   const state = { fd: 0, fail: '', shortWrite: Infinity, forcedWrite: undefined, statSize: undefined,
@@ -61,6 +62,7 @@ function fixture() {
     if (name === '@kit.ArkTS') return { util: { generateRandomUUID: crypto.randomUUID,
       TextEncoder: class { encodeInto(value) { return new Uint8Array(Buffer.from(value, 'utf8')); } } } };
     if (name === '../model/Appearance') return api;
+    if (name === '../model/BuildCapabilities') return { VPN_CORE_AVAILABLE: options.coreAvailable !== false };
     if (name === '../components/AppTabBar') return {};
     throw Error(`Unexpected import ${name}`);
   };
@@ -68,12 +70,13 @@ function fixture() {
   const pages = {};
   const appStorage = new Map();
   let backCount = 0;
+  const openedPages = [];
   vm.runInNewContext(settingsCode, { exports: pages, require: imports,
     AppStorage: { setOrCreate: (key, value) => appStorage.set(key, value) } });
   const page = new pages.Settings();
   page.getUIContext = () => ({ getHostContext: () => context,
-    getRouter: () => ({ back: () => { backCount++; }, pushUrl: () => Promise.resolve() }) });
-  return { api, files, handles, state, context, page, appStorage, backs: () => backCount,
+    getRouter: () => ({ back: () => { backCount++; }, pushUrl: target => { openedPages.push(target.url); return Promise.resolve(); } }) });
+  return { api, files, handles, state, context, page, appStorage, openedPages, backs: () => backCount,
     seed: value => files.set(destination, Buffer.from(typeof value === 'string' ? value : JSON.stringify(value))) };
 }
 const cases = [];
@@ -171,5 +174,39 @@ test('Settings does not save a mode when the SDK cannot apply it', () => {
 test('Developer tools request uses the agreed storage signal and returns to Home', () => {
   const f = fixture(); f.page.openDeveloperTools();
   assert.equal(f.appStorage.get('openDeveloperTools'), true); assert.equal(f.backs(), 1);
+});
+test('UI preview build rejects developer tools while ordinary settings and backup remain available', () => {
+  const f = fixture({ coreAvailable: false }); f.page.openDeveloperTools();
+  assert.equal(f.appStorage.has('openDeveloperTools'), false); assert.equal(f.backs(), 0); assert.match(f.page.message, /界面预览/);
+  f.page.chooseAppearance('dark'); assert.equal(f.api.readAppearance(dir), 'dark');
+  for (const page of ['NetworkSettings', 'NodeBackup', 'About', 'Privacy']) f.page.openPage(page);
+  assert.deepEqual(f.openedPages, ['pages/NetworkSettings', 'pages/NodeBackup', 'pages/About', 'pages/Privacy']);
+});
+
+test('Appearance choices retain stable IDs and accessible selection without a repeated selection caption', () => {
+  assert.deepEqual([...settingsFullSource.matchAll(/this\.appearanceOption\('([^']+)'/g)].map(match => match[1]),
+    ['system', 'light', 'dark']);
+  const option = settingsFullSource.split('private appearanceOption(')[1].split('private navigationRow(')[0];
+  assert(option.includes('.id(`appearance-${mode}`)'));
+  assert(option.includes('.accessibilityText(`${label}，${this.appearance === mode ? \'已选择\' : \'未选择\'}`)'));
+  assert.match(option, /if \(this\.appearance === mode\)\s*\{\s*Text\('✓'\)/);
+  assert(!option.includes("Text(this.appearance === mode ? '已选择' : '选择')"));
+  assert(!option.includes('.maxLines('), 'large-font labels may wrap naturally');
+  assert(option.includes('.onClick(() => { this.chooseAppearance(mode); })'));
+});
+
+test('Settings groups existing destinations into connection/data and help without changing route IDs', () => {
+  const connectionStart = settingsFullSource.indexOf("Text('连接与数据')");
+  const helpStart = settingsFullSource.indexOf("Text('帮助与说明')");
+  const developerStart = settingsFullSource.indexOf("Text('开发工具')");
+  assert(connectionStart > 0 && helpStart > connectionStart && developerStart > helpStart);
+  function destinations(source) {
+    return [...source.matchAll(/this\.navigationRow\('[^']+', '[^']+', '([^']+)', '([^']+)'\)/g)]
+      .map(match => [match[1], match[2]]);
+  }
+  assert.deepEqual(destinations(settingsFullSource.slice(connectionStart, helpStart)),
+    [['openNetworkSettings', 'NetworkSettings'], ['openNodeBackup', 'NodeBackup']]);
+  assert.deepEqual(destinations(settingsFullSource.slice(helpStart, developerStart)),
+    [['openSettingsDiagnostics', 'Diagnostics'], ['openAbout', 'About'], ['openPrivacy', 'Privacy']]);
 });
 console.log(JSON.stringify({ suite: 'appearance', passed: cases.length, cases }, null, 2));

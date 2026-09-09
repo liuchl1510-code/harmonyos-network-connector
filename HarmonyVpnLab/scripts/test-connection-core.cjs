@@ -14,7 +14,8 @@ function load(relative, imports = {}) {
   return module.exports;
 }
 const bootstrapModule = load('entry/src/main/ets/model/NodeBootstrap.ets');
-const configModule = load('entry/src/main/ets/model/ConnectionConfig.ets', { './NodeBootstrap': bootstrapModule });
+const policyModule = load('entry/src/main/ets/model/NetworkPolicy.ets', { './NodeBootstrap': bootstrapModule });
+const configModule = load('entry/src/main/ets/model/ConnectionConfig.ets', { './NodeBootstrap': bootstrapModule, './NetworkPolicy': policyModule });
 const snapshotModule = load('entry/src/main/ets/model/ConnectionSnapshot.ets');
 const uuid = 'd83b7e56-c9d8-4ce7-b8fb-90a784b40c60';
 const fixtures = [];
@@ -251,6 +252,7 @@ function harness(options = {}) {
     '../model/ErrorInfo': { describeError: () => 'synthetic error' },
     '../model/ConnectionConfig': configModule,
     '../model/NodeBootstrap': bootstrapModule,
+    '../model/NetworkPolicy': policyModule,
     '../model/ConnectionSnapshot': snapshotModule,
     '@kit.CoreFileKit': { fileIo }
   };

@@ -1,6 +1,10 @@
+import { formContentWidth } from '../model/AdaptiveLayout';
+
 @Entry
 @Component
 struct Privacy {
+  @StorageProp('windowWidthVp') windowWidthVp: number = 360;
+
   build() {
     Scroll() {
       Column({ space: 20 }) {
@@ -13,13 +17,13 @@ struct Privacy {
           .id('privacyScope').fontSize(14).lineHeight('23fp').fontColor($r('app.color.text_secondary'));
 
         this.explanation('保存在设备上的内容',
-          '节点配置、订阅地址、节点检测结果、连接诊断记录和外观偏好保存在应用私有目录。节点配置可能包含连接凭据，订阅地址可能包含访问令牌。目前没有为这些配置增加应用层加密。');
+          '节点配置、订阅地址、网络设置、节点检测结果、连接诊断记录和外观偏好保存在应用私有目录。节点配置可能包含连接凭据，订阅地址可能包含访问令牌。目前没有为这些配置增加应用层加密。导出的节点和备份文件也包含这些凭据，请妥善保管。');
 
         this.explanation('节点与订阅请求',
-          '连接 VPN 时，应用会访问你选择的节点服务器，并通过节点转发接管的网络流量。点击获取订阅或检查更新时，应用访问你提供的 HTTPS 订阅地址。节点服务和订阅服务会接收到对应的连接或请求。');
+          '连接 VPN 时，应用会访问你选择的节点服务器。全部代理模式通过节点转发接管的 IPv4 流量；规则分流模式会按你保存的规则选择代理、直连或阻断。直连流量使用当前物理网络出口。点击获取订阅或检查更新时，应用访问你提供的 HTTPS 订阅地址。');
 
         this.explanation('DNS 如何工作',
-          '连接时，接管的域名解析经节点发送到 Cloudflare 的 DNS over HTTPS 服务（1.1.1.1）。节点服务器本身使用域名时，连接前需先通过当前物理网络解析到 IPv4 地址。当前模式不会代理 IPv6 流量。');
+          '连接时，接管的域名解析经节点发送到你在设置中选择的 DNS over HTTPS 服务，默认是 Cloudflare（1.1.1.1）。DNS URL 中的域名交给远端节点解析。节点服务器本身使用域名时，连接前需先通过当前物理网络解析到 IPv4 地址。IPv6 目前捕获后阻断。节点检测使用独立的默认 DNS 和全部代理配置。');
 
         this.explanation('主动连接检查',
           '点击“检查连接”或检测节点 HTTPS 耗时时，应用访问 Cloudflare 的 www.cloudflare.com/cdn-cgi/trace，用于确认连接可用并测量一次完整 HTTPS 请求耗时。请求会向该服务呈现网络出口地址。节点检测不保存响应正文或出口 IP；连接检查仅在界面显示当前会话的出口校验标记。浏览器检查会打开同一服务的页面。');
@@ -29,8 +33,8 @@ struct Privacy {
 
         this.explanation('你可以管理的内容',
           '断开连接并完成清理后，可在节点页改名或删除节点；在订阅页可更新或删除订阅。删除订阅会同时删除属于它的节点，手动导入的节点保留。更新失败或尚未确认预览时，原节点保持不变。删除节点或订阅不等同于清空历史检测与诊断记录。');
-      }.width('100%').padding(24).alignItems(HorizontalAlign.Start);
-    }.id('privacyPage').width('100%').height('100%').backgroundColor($r('app.color.page_bg'));
+      }.width(formContentWidth(this.windowWidthVp)).padding(24).alignItems(HorizontalAlign.Start);
+    }.id('privacyPage').width('100%').height('100%').align(Alignment.Top).backgroundColor($r('app.color.page_bg'));
   }
 
   @Builder

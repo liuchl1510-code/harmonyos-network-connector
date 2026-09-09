@@ -1,21 +1,39 @@
 param(
     [ValidateSet('Inspect','StartApp','StartGlobal','Start','Check','Ipv6','Resolve','Reconnect','Stop','Browser')][string]$Mode='Inspect',
-    [string]$HdcPath='C:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe'
+    [string]$HdcPath='C:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe',
+    [string]$TargetDevice=''
 )
 $ErrorActionPreference='Stop'
 $taskProject=Split-Path -Parent $PSScriptRoot
 $taskOutput=Join-Path $taskProject 'build\connection-tests'
 New-Item -ItemType Directory -Force -Path $taskOutput | Out-Null
-$taskTargets=@(& $HdcPath list targets -v | Where-Object {$_ -match '\sUSB\s+Connected\s'})
-if($taskTargets.Count -ne 1){throw 'Expected one USB Connected phone.'}
-$taskDevice=($taskTargets[0] -split '\s+')[0]
+function Select-ConnectionTarget([string[]]$Lines, [string]$Requested='', [string]$Current='') {
+    if($Requested -and $Requested -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$'){throw 'Invalid target device identifier.'}
+    $taskConnected=@($Lines | Where-Object {$_ -match '\sUSB\s+Connected\s'} | ForEach-Object {($_.Trim() -split '\s+')[0]})
+    if($Requested){$taskCandidates=@($taskConnected | Where-Object {$_ -ceq $Requested})}else{$taskCandidates=@($taskConnected)}
+    if($taskCandidates.Count -ne 1){throw $(if($Requested){'Requested target is not uniquely USB Connected.'}else{'Expected one USB Connected device.'})}
+    $taskNext=$taskCandidates[0]
+    if($taskNext -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]*$' -or ($Current -and $Current -cne $taskNext)){throw 'Device changed or identifier is invalid.'}
+    return $taskNext
+}
+$taskDevice=Select-ConnectionTarget -Lines @(& $HdcPath list targets -v) -Requested $TargetDevice
+function Confirm-ConnectionDevice {
+    Select-ConnectionTarget -Lines @(& $HdcPath list targets -v) -Requested $TargetDevice -Current $taskDevice | Out-Null
+}
 $taskStamp=Get-Date -Format 'yyyyMMdd-HHmmss'
 
-function Flatten-ConnectionNodes($taskNode) {
-    if($taskNode.attributes){Write-Output $taskNode.attributes}
-    foreach($taskChild in $taskNode.children){Flatten-ConnectionNodes $taskChild}
+function Flatten-ConnectionNodes($taskNode, [bool]$ParentSidebar=$false) {
+    $taskSidebar=$ParentSidebar -or $taskNode.attributes.id -eq 'appSideNavigation'
+    if($taskNode.attributes){
+        if($taskNode.attributes.type -eq 'Scroll'){
+            $taskNode.attributes | Add-Member -NotePropertyName connectionSidebar -NotePropertyValue $taskSidebar -Force
+        }
+        Write-Output $taskNode.attributes
+    }
+    foreach($taskChild in $taskNode.children){Flatten-ConnectionNodes $taskChild $taskSidebar}
 }
 function Read-ConnectionLayout {
+    Confirm-ConnectionDevice
     $taskRemote='/data/local/tmp/harmonyvpnlab-connection-layout.json'
     try {
         & $HdcPath -t $taskDevice shell uitest dumpLayout -p $taskRemote | Out-Null
@@ -46,7 +64,7 @@ function Click-ConnectionControl([string]$taskId) {
                 & $HdcPath -t $taskDevice shell uitest uiInput click ([int](($taskBounds[0]+$taskBounds[2])/2)) ([int](($taskBounds[1]+$taskBounds[3])/2)) | Out-Null
                 return
             }
-            $taskScroll=@($taskNodes | Where-Object {$_.type -eq 'Scroll' -and $_.visible -eq 'true'})
+            $taskScroll=@($taskNodes | Where-Object {$_.type -eq 'Scroll' -and $_.visible -eq 'true' -and !$_.connectionSidebar})
             if($taskScroll.Count -ne 1){throw 'Expected the connection page scroll view.'}
             $taskBounds=@([regex]::Matches($taskScroll[0].bounds,'-?\d+') | ForEach-Object {[int]$_.Value})
             $taskX=[int](($taskBounds[0]+$taskBounds[2])/2)
@@ -63,7 +81,7 @@ if($Mode -in @('StartApp','StartGlobal','Ipv6','Resolve','Browser')) {
     $taskInitialNodes=Read-ConnectionLayout
     if(@($taskInitialNodes | Where-Object {$_.id -eq 'homePage'}).Count -gt 0 -and
        @($taskInitialNodes | Where-Object {$_.id -eq 'backFromDeveloperTools'}).Count -eq 0) {
-        & 'C:\Program Files\Huawei\DevEco Studio\tools\node\node.exe' (Join-Path $PSScriptRoot 'test-product-ui-device.cjs') Developer
+        & 'C:\Program Files\Huawei\DevEco Studio\tools\node\node.exe' (Join-Path $PSScriptRoot 'test-product-ui-device.cjs') Developer --target $taskDevice
         if($LASTEXITCODE -ne 0){throw 'Cannot open developer tools safely.'}
     }
 }

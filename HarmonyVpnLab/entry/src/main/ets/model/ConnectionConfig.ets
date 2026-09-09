@@ -1,5 +1,6 @@
 // Pure configuration construction, also used by offline synthetic acceptance.
 import { NodeBootstrap, isBootstrapIpv4Address, normalizeBootstrapHost } from './NodeBootstrap';
+import { NetworkPolicy, validateNetworkPolicy, policyRoutingRules } from './NetworkPolicy';
 
 export const CONNECTION_DNS_ADDRESS: string = '198.18.0.1';
 export const CONNECTION_DOH_URL: string = 'https://1.1.1.1/dns-query';
@@ -71,7 +72,8 @@ function checkConnectionBootstrapOptions(stream: ConnectionStream | undefined): 
 }
 
 export function buildConnectionConfig(outboundJson: string, socksPort: number,
-  metricsPort: number, errorPath: string, bootstrap?: NodeBootstrap): string {
+  metricsPort: number, errorPath: string, bootstrap?: NodeBootstrap, networkPolicy?: NetworkPolicy): string {
+  const policy = validateNetworkPolicy(networkPolicy ?? new NetworkPolicy());
   if (!Number.isInteger(socksPort) || !Number.isInteger(metricsPort) || socksPort < 1 || socksPort > 65535 ||
     metricsPort < 1 || metricsPort > 65535 || socksPort === metricsPort) {
     throw new Error('连接核心端口配置无效');
@@ -95,44 +97,54 @@ export function buildConnectionConfig(outboundJson: string, socksPort: number,
     !isConnectionIpv4Address(bootstrap.ipv4) || (isIpv4 && bootstrap.ipv4 !== host))) {
     throw new Error('节点 IPv4 预解析结果与当前节点不匹配');
   }
-  let hostsJSON = '';
+  const hostEntries: string[] = [];
   if (!isIpv4) {
     if (bootstrap === undefined) { throw new Error('域名节点需要先完成 IPv4 预解析'); }
     // Preserve the original endpoint so default SNI, WS Host and gRPC authority
     // remain intact. DialSystem changes only its local destination value to IP.
-    hostsJSON = `"hosts":{${JSON.stringify('full:' + host)}:${JSON.stringify(bootstrap.ipv4)}},`;
+    hostEntries.push(`${JSON.stringify('full:' + host)}:${JSON.stringify(bootstrap.ipv4)}`);
     if (outbound.streamSettings === undefined) { outbound.streamSettings = {}; }
     if (outbound.streamSettings.sockopt === undefined) { outbound.streamSettings.sockopt = {}; }
     // UseIPv4 falls through to system DNS after a lookup failure; ForceIPv4 does not.
     outbound.streamSettings.sockopt.domainStrategy = 'ForceIPv4';
   }
+  const hostsJSON = hostEntries.length > 0 ? `"hosts":{${hostEntries.join(',')}},` : '';
+  const rules = policyRoutingRules(policy);
+  const rulesJSON = rules.length > 0 ? rules.map((rule) => JSON.stringify(rule)).join(',') + ',' : '';
+  const extraOutbounds = policy.mode === 'rules' ?
+    ',{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"ForceIPv4"}},' +
+    '{"tag":"rule-block","protocol":"blackhole","settings":{}}' : '';
+  const sniffingJSON = policy.mode === 'rules' ?
+    ',"sniffing":{"enabled":true,"destOverride":["http","tls"],"routeOnly":true}' : '';
   outbound.tag = 'nodeProxy';
   if (outbound.streamSettings?.realitySettings) {
     outbound.streamSettings.realitySettings.show = false;
   }
   // The ordinary HTTPS scheme invokes Xray's routing dispatcher. +local would
   // bypass it and is deliberately absent. A match-all server rule and the sole
-  // fixed IP endpoint keep DNS selection independent of system DNS/hosts.
-  // This first IPv4 client serves A records, empty AAAA and empty non-IP replies.
+  // proxy rule keep DNS selection independent of system DNS/hosts. Xray's DoH
+  // dispatcher uses SkipDNSResolve, so a URL hostname is sent to the remote node.
+  // This IPv4 client serves A records, empty AAAA and empty non-IP replies.
   // No DNS 'direct' rule is present, so non-IP questions cannot create a local
   // UDP/TCP fallback connection from the DNS outbound.
   return `{"log":{"loglevel":"info","access":"none","error":${JSON.stringify(errorPath)}},` +
     `"stats":{},"policy":{"system":{"statsOutboundUplink":true,"statsOutboundDownlink":true}},` +
     `"dns":{"tag":"dns-via-node","queryStrategy":"UseIPv4","useSystemHosts":false,${hostsJSON}` +
     `"disableFallback":true,"disableFallbackIfMatch":true,"servers":[{` +
-    `"address":"${CONNECTION_DOH_URL}","domains":["regexp:.*"],"skipFallback":true,"queryStrategy":"UseIPv4"}]},` +
+    `"address":${JSON.stringify(policy.dnsUrl)},"domains":["regexp:.*"],"skipFallback":true,"queryStrategy":"UseIPv4"}]},` +
     `"inbounds":[{"tag":"connection-in","listen":"127.0.0.1","port":${socksPort},` +
-    `"protocol":"socks","settings":{"auth":"noauth","udp":true}}],` +
+    `"protocol":"socks","settings":{"auth":"noauth","udp":true}${sniffingJSON}}],` +
     `"outbounds":[${JSON.stringify(outbound)},` +
     `{"tag":"dns-out","protocol":"dns","settings":{"rules":[` +
     `{"action":"return","qType":"28","rCode":0},` +
     `{"action":"hijack","qType":"1"},{"action":"return","rCode":0}]}},` +
     `{"tag":"block-ipv6","protocol":"blackhole","settings":{}},` +
-    `{"tag":"block-virtual","protocol":"blackhole","settings":{}}],` +
+    `{"tag":"block-virtual","protocol":"blackhole","settings":{}}${extraOutbounds}],` +
     `"routing":{"domainStrategy":"AsIs","rules":[` +
     `{"type":"field","ip":["::/0"],"outboundTag":"block-ipv6"},` +
     `{"type":"field","inboundTag":["dns-via-node"],"outboundTag":"nodeProxy"},` +
     `{"type":"field","inboundTag":["connection-in"],"network":"tcp,udp","port":"53","outboundTag":"dns-out"},` +
     `{"type":"field","inboundTag":["connection-in"],"ip":["198.18.0.0/30"],"outboundTag":"block-virtual"},` +
+    rulesJSON +
     `{"type":"field","inboundTag":["connection-in"],"network":"tcp,udp","outboundTag":"nodeProxy"}]}}`;
 }
