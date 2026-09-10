@@ -1,4 +1,5 @@
 import { common } from '@kit.AbilityKit';
+import { deviceInfo } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { vpnExtension } from '@kit.NetworkKit';
 import native from 'libvpnbridge.so';
@@ -14,6 +15,13 @@ import { AppTabBar } from '../components/AppTabBar';
 import { AppSideNav } from '../components/AppSideNav';
 import { useSideNavigation, nodeListContentWidth } from '../model/AdaptiveLayout';
 import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
+
+class HistoryFingerprint {
+  outboundJson: string;
+  value: string = '';
+  pending: Promise<string> | undefined = undefined;
+  constructor(outboundJson: string) { this.outboundJson = outboundJson; }
+}
 
 @Entry
 @Component
@@ -46,20 +54,24 @@ struct Nodes {
   private cancelling: boolean = false;
   private pageEpoch: number = 0;
   private resultEpoch: number = 0;
+  private firstShowLoaded: boolean = false;
+  private historyFingerprints: Map<string, HistoryFingerprint> = new Map<string, HistoryFingerprint>();
 
   private context(): common.UIAbilityContext { return this.getUIContext().getHostContext() as common.UIAbilityContext; }
-  aboutToAppear(): void { this.reload(); }
+  aboutToAppear(): void { this.reload(); this.firstShowLoaded = true; }
   onPageShow(): void {
     this.pageVisible = true;
-    this.reload();
+    if (this.firstShowLoaded) { this.firstShowLoaded = false; }
+    else { this.reload(); }
     this.pollLatency();
     if (this.timer < 0) { this.timer = setInterval(() => { this.pollLatency(); }, 500); }
   }
   onPageHide(): void {
+    this.firstShowLoaded = false;
     this.pageVisible = false; this.cancelLatency(); this.resultEpoch++;
     if (this.timer >= 0) { clearInterval(this.timer); this.timer = -1; }
   }
-  aboutToDisappear(): void { this.onPageHide(); }
+  aboutToDisappear(): void { this.onPageHide(); this.historyFingerprints.clear(); }
 
   private canEdit(): boolean {
     return this.catalogReadable && this.pageVisible && !this.preparing && !this.testingId && !this.batchActive && this.canStartLatencyService();
@@ -105,14 +117,46 @@ struct Nodes {
     this.latencies = [];
     try {
       const records = readNodeLatencies(this.context().filesDir);
+      const nodesById: Map<string, SavedNode> = new Map<string, SavedNode>();
+      for (const node of this.nodes) {
+        const id = node.id;
+        if (!nodesById.has(id)) { nodesById.set(id, node); }
+      }
+      // A restored/reused identity is safe to reuse only with identical complete
+      // outbound text. Metadata-only edits leave its deterministic hash valid.
+      this.historyFingerprints.forEach((cached: HistoryFingerprint, id: string) => {
+        if (nodesById.get(id)?.outboundJson !== cached.outboundJson) { this.historyFingerprints.delete(id); }
+      });
       const matched: NodeLatencyResult[] = [];
       for (const record of records) {
-        const node = this.nodes.find((item: SavedNode) => item.id === record.nodeId);
-        if (node && await fingerprintOutbound(node.outboundJson) === record.outboundFingerprint) { matched.push(record); }
+        const node = nodesById.get(record.nodeId);
+        if (node && await this.historyFingerprint(node) === record.outboundFingerprint) { matched.push(record); }
         if (epoch !== this.resultEpoch) { return; }
       }
       if (epoch === this.resultEpoch) { this.latencies = matched; }
     } catch (_) { if (epoch === this.resultEpoch) { this.latencies = []; this.message = '历史检测记录无法读取，节点数据已保留。'; } }
+  }
+
+  private async historyFingerprint(node: SavedNode): Promise<string> {
+    const id = node.id;
+    let cached = this.historyFingerprints.get(id);
+    if (!cached || cached.outboundJson !== node.outboundJson) {
+      cached = new HistoryFingerprint(node.outboundJson);
+      this.historyFingerprints.set(id, cached);
+    }
+    if (cached.value) { return cached.value; }
+    if (!cached.pending) {
+      const owned = cached;
+      owned.pending = fingerprintOutbound(owned.outboundJson).then((value: string): string => {
+        owned.value = value; owned.pending = undefined; return value;
+      }).catch((): string => {
+        owned.pending = undefined;
+        throw new Error('历史记录指纹计算未完成。');
+      });
+    }
+    const pending = cached.pending;
+    if (!pending) { throw new Error('历史记录指纹计算未完成。'); }
+    return pending;
   }
 
   private latencyText(id: string): string {
@@ -342,9 +386,14 @@ struct Nodes {
     const query = this.search.trim().toLowerCase();
     const nodes = this.nodes.filter((node: SavedNode) => node.name.toLowerCase().includes(query) || node.protocol.includes(query));
     if (this.sortByLatency) {
+      const resultsById: Map<string, NodeLatencyResult> = new Map<string, NodeLatencyResult>();
+      for (const result of this.latencies) {
+        const id = result.nodeId;
+        if (!resultsById.has(id)) { resultsById.set(id, result); }
+      }
       nodes.sort((left: SavedNode, right: SavedNode): number => {
-        const leftResult = this.latencies.find((item: NodeLatencyResult) => item.nodeId === left.id);
-        const rightResult = this.latencies.find((item: NodeLatencyResult) => item.nodeId === right.id);
+        const leftResult = resultsById.get(left.id);
+        const rightResult = resultsById.get(right.id);
         const leftRank = latencySortRank(leftResult?.status ?? '', leftResult?.durationMs ?? 0);
         const rightRank = latencySortRank(rightResult?.status ?? '', rightResult?.durationMs ?? 0);
         return leftRank === rightRank ? 0 : leftRank < rightRank ? -1 : 1;
@@ -423,7 +472,7 @@ struct Nodes {
               .fontSize(13).lineHeight('20fp').fontColor($r('app.color.warning')).width('100%');
           }
           Row({ space: 8 }) {
-            TextInput({ text: this.search, placeholder: '搜索名称或协议' }).id('nodeSearch').constraintSize({ minHeight: 44 })
+            TextInput({ text: this.search, placeholder: '搜索名称或协议' }).enableKeyboardOnFocus(deviceInfo.deviceType !== '2in1').id('nodeSearch').constraintSize({ minHeight: 44 })
               .fontSize(15).fontColor($r('app.color.text_primary')).placeholderColor($r('app.color.text_secondary'))
               .backgroundColor($r('app.color.surface_secondary')).borderRadius(12).layoutWeight(1)
               .onChange((value: string) => { this.search = value; this.limit = 50; });
@@ -524,7 +573,7 @@ struct Nodes {
                       .margin({ left: this.wideNodeRows() ? 12 : 0, top: this.wideNodeRows() ? 0 : 6 });
                   }.width('100%');
                   if (this.renameId === node.id) {
-                    TextInput({ text: this.renameText, placeholder: '节点名称' }).id('renameNodeInput').maxLength(64)
+                    TextInput({ text: this.renameText, placeholder: '节点名称' }).enableKeyboardOnFocus(deviceInfo.deviceType !== '2in1').id('renameNodeInput').maxLength(64)
                       .constraintSize({ minHeight: 42 }).fontSize(14).fontColor($r('app.color.text_primary'))
                       .placeholderColor($r('app.color.text_secondary')).backgroundColor($r('app.color.surface_secondary'))
                       .onChange((value: string) => { this.renameText = value; });

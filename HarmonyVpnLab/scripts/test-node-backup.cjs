@@ -244,7 +244,7 @@ async function test(name, fn) { await fn(); passed.push(name); }
   });
   await test('page navigation rejects late picker selection/save and clears preview text', async () => {
     for (const method of ['preview', 'save']) {
-      for (const lifecycle of ['aboutToDisappear', 'onPageHide', 'onBackPress']) {
+      for (const lifecycle of ['aboutToDisappear', 'onBackPress', 'back']) {
         const f = fixture(); f.page.aboutToAppear(); f.state.pending = deferred();
         const pending = method === 'save' ? f.page.save(false) : f.page.preview();
         f.page[lifecycle](); f.state.pending.resolve([URI]); await pending;
@@ -254,6 +254,28 @@ async function test(name, fn) { await fn(); passed.push(name); }
     }
     const f = fixture(); f.page.aboutToAppear(); await f.page.preview();
     f.page.onBackPress(); assert.equal(f.page.pendingText, ''); f.page.restore(); assert.equal(f.state.restored.length, 0);
+  });
+  await test('ordinary backgrounding during a document picker preserves the requested save or preview', async () => {
+    for (const method of ['preview', 'save']) {
+      const f = fixture(); f.page.aboutToAppear(); f.state.pending = deferred();
+      const pending = method === 'save' ? f.page.save(false) : f.page.preview();
+      f.page.onPageHide(); assert.equal(f.page.busy, true); f.page.onPageShow();
+      f.state.pending.resolve([URI]); await pending;
+      assert.equal(f.state.opens, 1); assert.equal(f.page.busy, false); f.clean();
+      if (method === 'save') assert.equal(f.files.get(URI).toString(), TEXT);
+      else { assert.equal(f.page.previewReady, true); assert.equal(f.page.pendingText, TEXT); }
+      assert.equal(f.state.restored.length, 0, 'Picker success never performs an automatic restore');
+    }
+  });
+  await test('backgrounding keeps an existing preview but does not bypass a changed revision or connection guard', async () => {
+    for (const changed of ['none', 'revision', 'connection']) {
+      const f = fixture(); f.page.aboutToAppear(); await f.page.preview(); const revision = f.page.pendingRevision;
+      f.page.onPageHide(); assert.equal(f.page.previewReady, true); assert.equal(f.page.pendingRevision, revision);
+      if (changed === 'revision') f.state.revision++;
+      if (changed === 'connection') f.state.allowed = false;
+      f.page.onPageShow(); assert.equal(f.state.restored.length, 0); f.page.restore();
+      assert.equal(f.state.restored.length, changed === 'none' ? 1 : 0);
+    }
   });
   await test('single-node route exports that node and picker cancellation is friendly', async () => {
     const f = fixture(); f.state.route = { nodeId: 'node-before' }; f.page.aboutToAppear();

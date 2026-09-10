@@ -2,11 +2,11 @@
 
 使用 ArkTS / ArkUI 构建的鸿蒙原生节点管理与 IPv4 代理客户端，集成 Xray 26.6.1、Hev SOCKS5 Tunnel 2.9.0 和本地适配的 Go 1.26.7 工具链。
 
-应用显示名称为 **Harmony VPN**，当前版本为 **0.13.0/code34**。这是独立的开发项目，参考 v2rayNG 的功能与分享链接格式，不是 v2rayNG 或华为的官方客户端。完整 Android 功能对等和商店发布尚未完成。
+应用显示名称为 **Harmony VPN**，当前版本为 **0.14.0/code35**。这是独立的开发项目，参考 v2rayNG 的功能与分享链接格式，不是 v2rayNG 或华为的官方客户端。完整 Android 功能对等和商店发布尚未完成。
 
-0.13.0 细化了日常操作：首页首次使用可直接添加节点，并提供网络设置入口与宽屏配置区；节点列表采用紧凑行、当前标记与筛选数量，检测说明默认折叠；设置按用途分组并压缩外观选项；节点编辑增加未保存离开保护、固定反馈区及端口数字输入与校验。签名构建和有界模拟器页面观察已完成；编辑确认、非法端口完整 GUI 流程因输入法尝试中断而尚未完成验收，仅有对应离线验证。详情见[阶段十三记录](HarmonyVpnLab/docs/phase13-product-refinement.md)。
+0.14.0 完善了节点导入、订阅与网络设置的未保存保护和错误反馈，修复编辑页取消返回后输入回退的问题，并加快大节点列表的排序响应。分流模式按钮在窄窗口、大字号下可以换行。两种调试构建已核验，模拟器已完成表单输入/丢弃流程、500 节点合成列表对照及平板 20 分钟界面观察；手机 60 分钟观察本轮未完成，仅保留约 20 分钟的部分样本。实现与验证边界见[阶段十四记录](HarmonyVpnLab/docs/phase14-autonomous-refinement.md)。
 
-本次公开源码更新同时包含 0.11–0.13 的改进，见[完整变更日志](CHANGELOG.md)。
+各版本变化与验证边界见[完整变更日志](CHANGELOG.md)。本轮未修改原生转发核心，真实设备安装与 VPN 联网继续暂停。
 
 ## 当前功能
 
@@ -14,6 +14,7 @@
 - 连接、节点、设置三个主入口，浅色/深色/跟随系统外观，最大 2 倍系统字号适配。
 - 支持设备上的系统扫码、粘贴和批量导入，节点搜索、选择、参数/单 outbound JSON 编辑与删除。PC 缺少系统扫码能力时保留粘贴、JSON 和节点备份恢复入口。
 - 单节点 JSON 导出、节点与订阅备份、预览确认后恢复。
+- 编辑、导入、订阅与网络设置的未保存返回确认；失败保留输入，提交后的读回异常单独提示。
 - 逐节点及批量依次 HTTPS 请求耗时检测，可取消并按耗时排序，结果与配置指纹绑定。
 - 全部代理或自定义域名/IPv4 分流、绕过局域网、可配置的代理内 HTTPS DNS。
 - 网络变化后的恢复、等待网络时正常断开。
@@ -25,13 +26,13 @@ IPv6 当前进入 VPN 后被阻断，尚未提供 IPv6 代理。节点凭据保�
 
 ## 界面
 
-以下为 **0.13.0 最终 x86_64 界面预览包**的原始截图，仅使用示例节点。预览包不含 VPN 核心，因此连接和检测按钮禁用；截图不代表联网验收。
+以下为 **0.14.0 x86_64 界面预览包**的原始截图，仅使用示例节点。预览包不含 VPN 核心，因此连接和检测按钮禁用；截图不代表联网或文件保存/恢复验收。
 
-| 手机：节点管理 | 平板：连接首页 | 电脑：深色模式 |
+| PC 窄窗口：2 倍字号 | 平板：2 倍字号 | 平板：连接首页 |
 | --- | --- | --- |
-| <img src="docs/images/0.13-phone-nodes.jpeg" alt="手机节点页，包含两个仅用于界面验证的示例节点" width="220" /> | <img src="docs/images/0.13-tablet-home.jpeg" alt="平板的侧导航与双栏首页，标注为不能联网的界面预览" width="360" /> | <img src="docs/images/0.13-pc-home-dark.jpeg" alt="鸿蒙电脑窗口中的深色首页，标注为不能联网的界面预览" width="360" /> |
+| <img src="docs/images/0.14-pc-network-font2.jpeg" alt="PC 模拟器窄窗口与两倍字号下，分流模式按钮按需换行" width="220" /> | <img src="docs/images/0.14-tablet-network-font2.jpeg" alt="平板模拟器两倍字号下的分流与 DNS 设置" width="320" /> | <img src="docs/images/0.14-tablet-home.jpeg" alt="平板模拟器首页，预览包连接能力禁用" width="360" /> |
 
-最终包和完整验证范围见[阶段十三记录](HarmonyVpnLab/docs/phase13-product-refinement.md)。在保留了 16 张最终包 QA 原图的本地工作区，可运行 `node HarmonyVpnLab/scripts/make-adaptive-report.cjs phase13` 生成画廊；原始构建目录不随源码发布。
+包参数与当前验证进度见[阶段十四记录](HarmonyVpnLab/docs/phase14-autonomous-refinement.md)。0.13 的历史截图和 16 张最终包记录仍见[阶段十三](HarmonyVpnLab/docs/phase13-product-refinement.md)；原始构建目录不随源码发布。
 
 ## 工程与构建
 
@@ -63,6 +64,9 @@ pwsh -File .\scripts\build.ps1 -SimulatorUI -NoSign
 
 已在华为 Pura 80 Ultra、HarmonyOS 7、API 26 上进行限定范围真机验证。各版本的实现、验收项目与边界分别记录，不能把历史验证视为新增功能的验收。
 
+0.14 已通过 23/23 套件离线回归；后续表单、持续观察及诊断脚本分别通过 46/46、45/45、15/15 项纯模拟安全检查，与历史计数分开记录。最终 C4 的实际 25 步 GUI 和 27 张界面截图单独留存。手机 60 分钟观察本轮未完成，阶段记录保留部分样本、历史导航失败及空闲/界面检查对照；不作无泄漏、完整长时稳定性或内存改善结论。
+
+- [0.14.0 表单保护、列表优化与模拟器观察](HarmonyVpnLab/docs/phase14-autonomous-refinement.md)
 - [0.13.0 产品细化与验证范围](HarmonyVpnLab/docs/phase13-product-refinement.md)
 - [0.12.0 多端自适应与模拟器界面验证](HarmonyVpnLab/docs/phase12-adaptive-layout-verification.md)
 - [0.11.1 分流、编辑备份与批量检测](HarmonyVpnLab/docs/phase11-network-node-tools.md)

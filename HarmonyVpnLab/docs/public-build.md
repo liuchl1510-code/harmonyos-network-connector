@@ -1,6 +1,6 @@
 # 从源码构建（Windows / ARM64 完整核心与 x86_64 界面预览）
 
-Git 仓库只提供源代码、固定版本记录、补丁和许可证文本。`entry/libs/arm64-v8a/*.so`、HAP、下载的上游源码、编译器缓存和个人签名资料均不随 Git 发布。当前应用版本为 0.13.0/code34；公开构建配置的最低兼容版本为 `6.1.1(24)`，compile/target SDK 仍为 `26.0.0`。API 24 真机安装与联网已按用户要求暂停，兼容配置不等于验收通过。先按目标选择构建变体：
+Git 仓库只提供源代码、固定版本记录、补丁和许可证文本。`entry/libs/arm64-v8a/*.so`、HAP、下载的上游源码、编译器缓存和个人签名资料均不随 Git 发布。当前应用版本为 0.14.0/code35；公开构建配置的最低兼容版本为 `6.1.1(24)`，compile/target SDK 仍为 `26.0.0`。API 24 真机安装与联网已按用户要求暂停，兼容配置不等于验收通过。先按目标选择构建变体：
 
 | 变体 | 用途 | 是否准备原生核心 | 产物与限制 |
 | --- | --- | --- | --- |
@@ -94,7 +94,7 @@ pwsh -NoProfile -File .\scripts\build.ps1 `
 - 将 ABI 设为 x86_64，启用 `HARMONY_UI_PREVIEW`，排除原生转发库和其他 ABI 文件。
 - 仅在暂存副本中将 `VPN_CORE_AVAILABLE` 改为 false，并给版本名追加 `-ui-preview`；不改源码树中的完整核心开关。
 - 编译后检查 HAP 中的原生库均为 ELF64/x86_64，且不包含 Xray、Hev、Go smoke 或 C smoke 库。
-- 把结果单独写入 `build/artifacts/simulator-ui/`，按当前版本（例如 `versioned/0.13.0-ui-preview/`）和哈希归档。
+- 把结果单独写入 `build/artifacts/simulator-ui/`，按当前版本（例如 `versioned/0.14.0-ui-preview/`）和哈希归档。
 
 安装到模拟器时，使用自己已经配置好的签名 profile 文件，省略 `-NoSign`：
 
@@ -125,21 +125,27 @@ node .\scripts\test-adaptive-secondary-pages.cjs
 模拟器 UI 脚本需要显式选择模拟器目标，不能省略目标或把 USB 真机当作默认目标。例如，替换下方占位值后检查首页：
 
 ```powershell
-node .\scripts\test-adaptive-emulator.cjs '<选定模拟器的 HDC 地址>' Home phone-home phase13
+node .\scripts\test-adaptive-emulator.cjs '<选定模拟器的 HDC 地址>' Home phone-home phase14
 ```
 
-脚本只接受约定的本机模拟器地址；其 `SeedCatalog` / `SeedSamples` 使用合成节点并要求空节点库。不要为 UI QA 导入真实节点或私人备份。上述命令将安全投影 JSON 和同名 JPEG 写入 `build/phase13-emulators/`。生成本地画廊：
+脚本只接受约定的本机模拟器地址；其 `SeedCatalog` / `SeedSamples` 使用合成节点并要求空节点库。不要为 UI QA 导入真实节点或私人备份。上述命令将安全投影 JSON 和同名 JPEG 写入 `build/phase14-emulators/`。生成本地画廊：
 
 ```powershell
-node .\scripts\make-adaptive-report.cjs phase13
+node .\scripts\make-adaptive-report.cjs phase14
 ```
 
-在已有本地 QA 原图时，打开 `build/phase13-emulators/report.html` 可筛选设备和查看原图。报告保留截图原像素，忽略启动、锁屏、调试和原始 AX 记录。`appBounds` 是 px；横向溢出为空只覆盖本次可见、被记录的控件。每次改变阈值或重新构建后，应记录安装包哈希和对应截图，不能把同版本号的早期候选都归入最终包。当前记录及未通过项见[阶段十三](phase13-product-refinement.md)；使用 `phase12` 参数可查看[阶段十二历史记录](phase12-adaptive-layout-verification.md)的本地画廊。
+在已有本地 QA 原图时，打开 `build/phase14-emulators/report.html` 可筛选设备和查看原图。报告保留截图原像素，忽略启动、锁屏、调试和原始 AX 记录。`appBounds` 是 px；横向溢出为空只覆盖本次可见、被记录的控件。每次改变阈值或重新构建后，应记录安装包哈希和对应截图，不能把同版本号的早期候选都归入最终包。当前记录及未通过项见[阶段十四](phase14-autonomous-refinement.md)；使用 `phase13` 或 `phase12` 参数可分别查看[阶段十三](phase13-product-refinement.md)、[阶段十二](phase12-adaptive-layout-verification.md)的历史画廊。
 
 验收顺序是先完成模拟器 UI；**真实 API24 平板的安装与 VPN 联网验证当前按用户要求暂停**，恢复验收时还需单独核对系统与签名条件。真实鸿蒙 PC 尚未联网验收：ARM64 电脑可走现有完整核心构建路径，仍需实机验证；当前 Go amd64 TLS/运行时限制只对应 x86_64 核心，不能泛化为所有 PC。全天稳定性、续航及完整折叠/旋转链路也不因 UI 包可运行而自动通过。
 
-## 已完成的公开构建检查
+## 0.14.0 本地构建与验证范围
 
-以下是 2026-09-08 首次公开源码准备的历史检查，不是 0.12.0 新包的联网或冷构建记录：使用全新源代码副本与全新原生缓存执行上述准备流程，五个 ARM64 库、Go 编译器检查、Xray socket 保护与统计重启检查、未签名 HAP 编译均通过。最终 HAP 40,089,169字节，SHA256 `a38f00a6ec295bb21e3e52a3f34a967a1d5162486415cdd1d5e73d1e7ccf20ae`。该文件只作本地构建验证，没有作为发行安装包上传。
+当前 `0.14.0/code35` 的 ARM64 完整核心和 C4 x86_64 预览包均已完成源码/暂存一致性、签名及变体隔离核验，都是本地 debug 调试签名包。C4 已有 25 步表单 GUI、27 张界面截图、500 节点合成排序对照/夹具恢复及平板 20 分钟导航记录；23 套件离线回归与后续 46/46、45/45、15/15 项脚本安全检查分别保留各自版本归属。
+
+C4 手机的 60 分钟导航观察本轮未完成：仅留下 65 个同进程、同包样本，实际跨度 1218.65 秒，没有完成摘要，中断原因未确认。上述检查不构成真实设备、VPN 联网、端到端文件保存/恢复或完整长时稳定性验收。两包 SHA、历史 C3 对照和完整限定见[阶段十四记录](phase14-autonomous-refinement.md)；HAP 与本地 `build/` 证据均不随源码发布。
+
+## 已完成的公开构建检查（历史）
+
+以下是 2026-09-08 首次公开源码准备的历史检查，不代表当前版本的联网或冷构建记录：使用全新源代码副本与全新原生缓存执行上述准备流程，五个 ARM64 库、Go 编译器检查、Xray socket 保护与统计重启检查、未签名 HAP 编译均通过。最终 HAP 40,089,169字节，SHA256 `a38f00a6ec295bb21e3e52a3f34a967a1d5162486415cdd1d5e73d1e7ccf20ae`。该文件只作本地构建验证，没有作为发行安装包上传。
 
 公开且不含个人路径的结果见[publication-validation.json](publication-validation.json)。失败后的 HAP 重试使用新的暂存项目，只复用本次验证目录内的工具缓存；没有复用历史个人签名项目。新编译器补丁只清理了生成注释中的本机路径，功能修改及125个文件的哈希校验仍保留。

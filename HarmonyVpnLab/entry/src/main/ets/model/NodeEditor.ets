@@ -4,9 +4,9 @@ import { ImportedNode, parseNode } from './NodeImport';
 interface EditorUser { id: string; flow?: string; }
 interface EditorServer { address: string; port: number; users?: EditorUser[]; password?: string; method?: string; }
 interface EditorSettings { vnext?: EditorServer[]; servers?: EditorServer[]; }
-interface EditorTls { serverName?: string; fingerprint?: string; alpn?: string[]; }
+interface EditorTls { serverName?: string; fingerprint?: string; alpn?: string[] | string; }
 interface EditorReality { serverName: string; fingerprint: string; publicKey: string; shortId: string; spiderX?: string; }
-interface EditorWs { path?: string; host?: string; }
+interface EditorWs { path?: string; host?: string; headers?: Record<string, string>; }
 interface EditorGrpc { serviceName?: string; authority?: string; }
 interface EditorStream {
   network?: string; security?: string; tlsSettings?: EditorTls; realitySettings?: EditorReality;
@@ -46,6 +46,39 @@ function parsedOutbound(node: ImportedNode): EditorOutbound {
   return JSON.parse(parseNode(node.outboundJson).outboundJson) as EditorOutbound;
 }
 
+function editorAlpn(value: string[] | string | undefined): string {
+  // Xray's StringList accepts both a JSON array and a comma-separated string.
+  // Only a deliberate field edit rewrites that original representation.
+  return typeof value === 'string' ? value : value?.join(',') ?? '';
+}
+
+function editorWebSocketHost(ws: EditorWs | undefined): string {
+  if (typeof ws?.host === 'string' && ws.host.length > 0) { return ws.host; }
+  // The current core still accepts the legacy, case-insensitive headers.Host.
+  if (ws?.headers) {
+    for (const key of Object.keys(ws.headers)) {
+      if (key.toLowerCase() === 'host') {
+        if (typeof ws.headers[key] !== 'string') { throw new Error('invalid WebSocket Host'); }
+        return ws.headers[key];
+      }
+    }
+  }
+  return '';
+}
+
+function setEditorWebSocketHost(ws: EditorWs, value: string): void {
+  ws.host = value.trim() || undefined;
+  if (ws.headers) {
+    const retained: string[] = [];
+    for (const key of Object.keys(ws.headers)) {
+      if (key.toLowerCase() !== 'host') { retained.push(`${JSON.stringify(key)}:${JSON.stringify(ws.headers[key])}`); }
+    }
+    // Otherwise clearing the visible Host would reactivate its old header value.
+    // Parse serialized entries so even a literal "__proto__" header is preserved.
+    ws.headers = JSON.parse(`{${retained.join(',')}}`) as Record<string, string>;
+  }
+}
+
 export function nodeEditorDraft(node: ImportedNode): NodeEditorDraft {
   try {
     const outbound = parsedOutbound(node);
@@ -59,10 +92,10 @@ export function nodeEditorDraft(node: ImportedNode): NodeEditorDraft {
     draft.network = stream?.network ?? 'tcp'; draft.security = stream?.security ?? 'none';
     draft.serverName = draft.security === 'reality' ? (stream?.realitySettings?.serverName ?? '') : (stream?.tlsSettings?.serverName ?? '');
     draft.fingerprint = draft.security === 'reality' ? (stream?.realitySettings?.fingerprint ?? '') : (stream?.tlsSettings?.fingerprint ?? '');
-    draft.alpn = stream?.tlsSettings?.alpn?.join(',') ?? '';
+    draft.alpn = editorAlpn(stream?.tlsSettings?.alpn);
     draft.publicKey = stream?.realitySettings?.publicKey ?? ''; draft.shortId = stream?.realitySettings?.shortId ?? '';
     draft.spiderX = stream?.realitySettings?.spiderX ?? '';
-    draft.transportPath = stream?.wsSettings?.path ?? ''; draft.transportHost = stream?.wsSettings?.host ?? '';
+    draft.transportPath = stream?.wsSettings?.path ?? ''; draft.transportHost = editorWebSocketHost(stream?.wsSettings);
     draft.serviceName = stream?.grpcSettings?.serviceName ?? ''; draft.authority = stream?.grpcSettings?.authority ?? '';
     return draft;
   } catch (_) { throw new Error('无法打开这个节点，请检查其配置是否受支持。'); }
@@ -113,7 +146,7 @@ export function nodeFromEditorDraft(original: ImportedNode, draft: NodeEditorDra
       (draft.transportPath !== before.transportPath || draft.transportHost !== before.transportHost)) {
       if (!stream.wsSettings) { stream.wsSettings = {}; }
       if (draft.transportPath !== before.transportPath) { stream.wsSettings.path = draft.transportPath; }
-      if (draft.transportHost !== before.transportHost) { stream.wsSettings.host = draft.transportHost.trim() || undefined; }
+      if (draft.transportHost !== before.transportHost) { setEditorWebSocketHost(stream.wsSettings, draft.transportHost); }
     }
     if (stream && draft.network === 'grpc' &&
       (draft.serviceName !== before.serviceName || draft.authority !== before.authority)) {

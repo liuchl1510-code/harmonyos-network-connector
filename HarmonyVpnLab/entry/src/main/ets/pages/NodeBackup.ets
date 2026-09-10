@@ -35,7 +35,11 @@ struct NodeBackup {
     this.reload();
   }
   onPageShow(): void { this.reload(); }
-  onPageHide(): void { this.cancelPending(); }
+  onPageHide(): void {
+    // Hiding also includes ordinary app backgrounding, including a system file
+    // picker taking focus. Explicit back/disposal cancels; visibility alone does
+    // not discard a pending document operation or an unconfirmed preview.
+  }
   aboutToDisappear(): void { this.cancelPending(); }
   onBackPress(): boolean { this.cancelPending(); return false; }
   private clearPreview(): void {

@@ -11,6 +11,7 @@ const project = path.resolve(__dirname, '..');
 const ts = require(path.join(process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio',
     'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
 const sourceHashes = {};
+const nodePerformance = {};
 const compiledFiles = new Map();
 function compile(relative, page = false) {
     const file = path.join(project, 'entry/src/main/ets', relative);
@@ -35,7 +36,7 @@ function compile(relative, page = false) {
 for (const file of ['model/NodeImport.ets', 'model/NodeBatchImport.ets', 'model/SubscriptionFetch.ets', 'model/NodeEditGuard.ets', 'model/BatchLatency.ets', 'model/NodeScanner.ets', 'model/AdaptiveLayout.ets']) compile(file);
 for (const file of ['pages/NodeConfig.ets', 'pages/Subscriptions.ets', 'pages/Nodes.ets']) compile(file, true);
 function execute(relative, imports, timers = {}) {
-    const context = { VPN_CORE_AVAILABLE: true, exports: {}, Error, Date, Uint8Array, ArrayBuffer, Promise, URL, TextDecoder,
+    const context = { VPN_CORE_AVAILABLE: true, exports: {}, Error, Date, Uint8Array, ArrayBuffer, Promise, URL, TextDecoder, $r: name => name,
         require(name) { assert(Object.hasOwn(imports, name), 'Unexpected dependency: ' + name); return imports[name]; },
         ...timers };
     vm.runInNewContext(compiledFiles.get(relative), context, { filename: relative });
@@ -72,7 +73,8 @@ function harness(options = {}) {
         mode: '', readsAfterWrite: 0, scans: [], scannerModuleLoads: 0, capabilityChecks: 0, wallNow: 1789000000000,
         probeState: { phase: 'idle', kind: 'lifecycle', runId: '', detail: '', updatedAt: 1789000000000 },
         connectionStatus: undefined, command: undefined, commands: [], latencyRequests: [], latencyProofs: [],
-        latencyRecords: [], hashRequests: [], vpnStarts: [], measurements: [], processAlive: true, processCheckThrows: false
+        latencyRecords: [], latencyReads: 0, hashRequests: [], vpnStarts: [], measurements: [], processAlive: true, processCheckThrows: false,
+        dialogs: [], backs: 0, backThrows: false, profileReadsThrow: false, addressWrites: 0
     };
     const timers = {
         setTimeout(callback, delay) { const id = state.nextTimer++; state.timers.set(id, { callback, delay, kind: 'timeout' }); return id; },
@@ -103,6 +105,7 @@ function harness(options = {}) {
         importManualNodes(_, nodes) {
             state.events.push('manual-write-attempt'); allowed();
             if (state.mode === 'write-error') throw new Error('safe write failure');
+            if (state.mode === 'raw-write-error') throw RAW_ERROR;
             let added = 0, duplicates = 0;
             for (const node of nodes) {
                 if (state.catalog.nodes.some(saved => saved.outboundJson === node.outboundJson)) { duplicates++; continue; }
@@ -191,7 +194,7 @@ function harness(options = {}) {
                 return new Promise((resolve, reject) => { scan.resolve = resolve; scan.reject = reject; });
             } }
         },
-        '@kit.PerformanceAnalysisKit': { hilog: { info: (...args) => state.logs.push(args) } },
+        '@kit.PerformanceAnalysisKit': { hilog: { info: (...args) => { if (options.logThrows) throw RAW_ERROR; state.logs.push(args); } } },
         '@kit.ArkTS': { ...sdk, util: { ...sdk.util, generateRandomUUID() {
             assert(state.events.includes('manual-write'), 'Receipt created before a write');
             assert(state.events.lastIndexOf('catalog-read') > state.events.lastIndexOf('manual-write'),
@@ -216,7 +219,7 @@ function harness(options = {}) {
             writeProbeState(_, value) { state.probeState = clone(value); }
         },
         '../model/NodeLatency': {
-            readNodeLatencies() { if (options.recordsThrow) throw RAW_ERROR; return clone(state.latencyRecords); },
+            readNodeLatencies() { state.latencyReads++; if (options.recordsThrow) throw RAW_ERROR; return clone(state.latencyRecords); },
             fingerprintOutbound(outboundJson) {
                 const request = { outboundJson }; state.hashRequests.push(request);
                 if (options.hashThrow) return Promise.reject(RAW_ERROR);
@@ -242,9 +245,15 @@ function harness(options = {}) {
         },
         '../model/SubscriptionFetch': fetch,
         '../model/NodeProfile': {
-            readNodeProfile() { state.events.push('profile-read'); return clone(state.currentProfile); },
+            readNodeProfile() { state.events.push('profile-read'); if (state.profileReadsThrow) throw RAW_ERROR; return clone(state.currentProfile); },
             nodeServerAddress: node => JSON.parse(node.outboundJson).settings.vnext?.[0].address || 'example.invalid',
-            updateNodeServerAddress() { allowed(); }
+            updateNodeServerAddress(_, address) {
+                allowed(); if (state.mode === 'raw-address-error') throw RAW_ERROR;
+                state.addressWrites++;
+                const outbound = JSON.parse(state.currentProfile.outboundJson); outbound.settings.vnext[0].address = address.trim();
+                state.currentProfile.outboundJson = JSON.stringify(outbound);
+                if (state.mode === 'address-readback-error') state.profileReadsThrow = true;
+            }
         }
     };
     let scannerModule;
@@ -264,7 +273,12 @@ function harness(options = {}) {
             return options.scanCapability !== false;
         } });
         const instance = new api[name]();
-        instance.getUIContext = () => ({ getHostContext: () => ({ filesDir: 'synthetic-memory-only' }), getRouter: () => ({ back() {} }) });
+        instance.getUIContext = () => ({ getHostContext: () => ({ filesDir: 'synthetic-memory-only' }),
+            getRouter: () => ({ back() { if (state.backThrows) throw RAW_ERROR; state.backs++; } }),
+            getPromptAction: () => ({ showDialog(options) {
+                const dialog = { options }; state.dialogs.push(dialog);
+                return new Promise((resolve, reject) => { dialog.resolve = resolve; dialog.reject = reject; });
+            } }) });
         return instance;
     }
     return { state, page, timers };
@@ -325,6 +339,135 @@ function casesNodeConfig() {
         const h = harness(), p = h.page('NodeConfig'); p.input = SECOND + '\ninvalid-fixture'; p.save(); p.replacementAddress = '192.0.2.1';
         p.aboutToDisappear(); assert.equal(p.input, ''); assert.equal(p.pendingNodes.length, 0); assert.equal(p.partialCount, 0);
         assert.equal(p.replacementAddress, '');
+    });
+    return cases;
+}
+
+function casesNodeForm() {
+    const cases = [], add = (name, run) => cases.push({ name: 'NodeConfig form: ' + name, run });
+    add('clean return needs no dialog and double return does not navigate twice', async () => {
+        const h = harness(), p = h.page('NodeConfig'); p.aboutToAppear();
+        assert.equal(p.onBackPress(), false); await p.requestBack(); await p.requestBack();
+        assert.equal(h.state.backs, 1); assert.equal(h.state.dialogs.length, 0);
+    });
+    for (const field of ['input', 'replacementAddress']) add(field + ' stays intact when return is declined', async () => {
+        const h = harness(), p = h.page('NodeConfig'); p.aboutToAppear(); p[field] = field === 'input' ? SECOND : 'changed.invalid';
+        const before = clone(h.state.catalog), pending = p.requestBack();
+        assert.equal(p.confirmingLeave, true); await p.requestBack(); assert.equal(h.state.dialogs.length, 1);
+        assert(!JSON.stringify(h.state.dialogs[0].options).includes(p[field]));
+        h.state.dialogs[0].resolve({ index: 0 }); await pending;
+        assert(p[field].length > 0); assert.equal(p.confirmingLeave, false); assert.equal(h.state.backs, 0);
+        assert.deepEqual(h.state.catalog, before); assert.equal(h.state.writes.length, 0);
+    });
+    add('system return consumes dirty back and preserves partial preview until confirmed', async () => {
+        const h = harness(), p = h.page('NodeConfig'); p.aboutToAppear(); p.input = SECOND + '\ninvalid-fixture'; p.save();
+        assert.equal(p.onBackPress(), true); assert.equal(p.onBackPress(), true); assert.equal(h.state.dialogs.length, 1);
+        assert.equal(p.partialCount, 1); h.state.dialogs[0].resolve({ index: 1 }); await flush();
+        assert.equal(h.state.backs, 1); assert.equal(p.input, ''); assert.equal(p.pendingNodes.length, 0);
+        assert.equal(h.state.writes.length, 0);
+    });
+    for (const failure of ['dialog', 'router']) add(failure + ' failure keeps all input and exposes no raw error', async () => {
+        const h = harness(), p = h.page('NodeConfig'); p.aboutToAppear(); p.input = SECOND; p.replacementAddress = 'changed.invalid';
+        const pending = p.requestBack();
+        if (failure === 'dialog') h.state.dialogs[0].reject(RAW_ERROR);
+        else { h.state.backThrows = true; h.state.dialogs[0].resolve({ index: 1 }); }
+        await pending; assert.equal(p.input, SECOND); assert.equal(p.replacementAddress, 'changed.invalid');
+        assert.equal(p.confirmingLeave, false); assert.equal(p.leaving, false); noVisibleSecrets(p, h.state);
+    });
+    add('pending confirmation blocks save partial save address update and scanner', async () => {
+        const h = harness(), p = h.page('NodeConfig'); p.input = SECOND + '\ninvalid-fixture'; p.save();
+        p.replacementAddress = 'changed.invalid'; const pending = p.requestBack();
+        p.save(); p.savePartial(); p.updateAddress(); await p.scan();
+        assert.equal(h.state.writes.length, 0); assert.equal(h.state.addressWrites, 0); assert.equal(h.state.scans.length, 0);
+        h.state.dialogs[0].resolve({ index: 0 }); await pending; assert.equal(p.partialCount, 1);
+    });
+    add('old leave confirmation cannot navigate or clear a newer visit', async () => {
+        const h = harness(), p = h.page('NodeConfig'); p.aboutToAppear(); p.input = FIRST;
+        const pending = p.requestBack(); p.aboutToDisappear(); p.aboutToAppear(); p.input = SECOND;
+        h.state.dialogs[0].resolve({ index: 1 }); await pending;
+        assert.equal(h.state.backs, 0); assert.equal(p.input, SECOND); assert.equal(p.leaving, false);
+    });
+    add('confirmed return discards a scanner result that arrives later', async () => {
+        const h = harness(), p = h.page('NodeConfig'); p.aboutToAppear(); const scan = p.scan(); await flush();
+        const pending = p.requestBack(); h.state.dialogs[0].resolve({ index: 1 }); await pending;
+        h.state.scans[0].resolve({ originalValue: FIRST }); await scan;
+        assert.equal(h.state.backs, 1); assert.equal(p.input, ''); assert.equal(p.scanning, false); assert.equal(h.state.writes.length, 0);
+    });
+    add('return confirmation before scanner module resolves prevents native launch', async () => {
+        const h = harness(), p = h.page('NodeConfig'); const scan = p.scan(); const pending = p.requestBack();
+        await scan; assert.equal(p.confirmingLeave, true); assert.equal(p.scanning, false); assert.equal(h.state.scans.length, 0);
+        h.state.dialogs[0].resolve({ index: 0 }); await pending; assert.equal(p.input, ''); assert.match(p.message, /重新扫码/);
+    });
+    add('staying after cancelling a scan permits a new scan while the old result stays stale', async () => {
+        const h = harness(), p = h.page('NodeConfig'); const old = p.scan(); await flush(); const pending = p.requestBack();
+        h.state.dialogs[0].resolve({ index: 0 }); await pending; const fresh = p.scan(); await flush();
+        assert.equal(h.state.scans.length, 2); h.state.scans[0].resolve({ originalValue: FIRST }); await old;
+        assert.equal(p.input, ''); assert.equal(p.scanning, true);
+        h.state.scans[1].resolve({ originalValue: SECOND }); await fresh; assert.equal(p.input, SECOND); assert.equal(p.scanning, false);
+    });
+    add('ordinary page hiding under the scanner preserves its valid result', async () => {
+        const h = harness(), p = h.page('NodeConfig'); p.aboutToAppear(); const scan = p.scan(); await flush();
+        p.onPageHide(); assert.equal(p.scanning, true); p.onPageShow();
+        h.state.scans[0].resolve({ originalValue: SECOND }); await scan;
+        assert.equal(p.input, SECOND); assert.equal(p.scanning, false); assert.equal(h.state.writes.length, 0);
+    });
+    for (const outcome of ['resolve', 'reject']) add('hidden old ' + outcome + ' cannot release a newer confirmation lock', async () => {
+        const h = harness(), p = h.page('NodeConfig'); p.aboutToAppear(); p.input = FIRST;
+        const old = p.requestBack(); p.onPageHide(); p.onPageShow(); p.input = SECOND; const fresh = p.requestBack();
+        if (outcome === 'resolve') h.state.dialogs[0].resolve({ index: 1 }); else h.state.dialogs[0].reject(RAW_ERROR);
+        await old; assert.equal(p.confirmingLeave, true); assert.equal(p.input, SECOND); assert.equal(h.state.backs, 0);
+        h.state.dialogs[1].resolve({ index: 0 }); await fresh; assert.equal(p.confirmingLeave, false); noVisibleSecrets(p, h.state);
+    });
+    add('repeated save clicks after successful import preserve receipt and perform one write', () => {
+        const h = harness(), p = h.page('NodeConfig'); p.input = SECOND; p.save(); const receipt = p.saveReceipt, message = p.message;
+        p.save(); p.savePartial(); assert.equal(h.state.writes.length, 1); assert.equal(p.saveReceipt, receipt); assert.equal(p.message, message);
+    });
+    add('repeated confirmation clicks after partial import cannot overwrite its success', () => {
+        const h = harness(), p = h.page('NodeConfig'); p.input = SECOND + '\ninvalid-fixture'; p.save(); p.savePartial();
+        const receipt = p.saveReceipt; p.savePartial(); assert.equal(h.state.writes.length, 1); assert.equal(p.saveReceipt, receipt);
+    });
+    add('connection beginning after page open blocks each mutation and retains drafts', () => {
+        const h = harness(), p = h.page('NodeConfig'); p.aboutToAppear(); p.input = SECOND + '\ninvalid-fixture'; p.save();
+        p.replacementAddress = 'changed.invalid'; h.state.allowed = false; p.savePartial(); p.save(); p.updateAddress();
+        assert.equal(h.state.writes.length, 0); assert.equal(h.state.addressWrites, 0); assert.equal(p.partialCount, 1);
+        assert.equal(p.input, SECOND + '\ninvalid-fixture'); assert.equal(p.replacementAddress, 'changed.invalid'); assert.equal(p.editable, false);
+    });
+    add('unexpected import errors stay private and retain input', () => {
+        const h = harness(), p = h.page('NodeConfig'); p.input = SECOND; h.state.mode = 'raw-write-error'; p.save();
+        assert.equal(p.input, SECOND); assert.equal(h.state.writes.length, 0); assert.match(p.message, /输入已保留/); noVisibleSecrets(p, h.state);
+    });
+    add('profile load failure does not escape or expose its raw payload', () => {
+        const h = harness(), p = h.page('NodeConfig'); h.state.profileReadsThrow = true;
+        assert.doesNotThrow(() => p.aboutToAppear()); assert.equal(p.savedAddress, ''); noVisibleSecrets(p, h.state);
+    });
+    add('profile readback failure after committed import keeps input and reports uncertainty', () => {
+        const h = harness(), p = h.page('NodeConfig'); p.input = SECOND; h.state.profileReadsThrow = true; p.save();
+        assert.equal(h.state.writes.length, 1); assert.equal(p.input, SECOND); assert.equal(h.state.receipt, 0);
+        assert.match(p.message, /保存已提交.*读回校验未确认/); noVisibleSecrets(p, h.state);
+    });
+    add('address update errors retain input without exception text', () => {
+        const h = harness(), p = h.page('NodeConfig'); p.replacementAddress = 'changed.invalid'; h.state.mode = 'raw-address-error'; p.updateAddress();
+        assert.equal(p.replacementAddress, 'changed.invalid'); assert.equal(h.state.addressWrites, 0); noVisibleSecrets(p, h.state);
+    });
+    add('committed address change with unreadable profile is not called an unsaved failure', () => {
+        const h = harness(), p = h.page('NodeConfig'); p.replacementAddress = 'changed.invalid'; h.state.mode = 'address-readback-error'; p.updateAddress();
+        assert.equal(h.state.addressWrites, 1); assert.equal(p.replacementAddress, 'changed.invalid');
+        assert.match(p.message, /修改已提交.*读回未确认/); noVisibleSecrets(p, h.state);
+    });
+    add('successful address update absorbs a second queued click', () => {
+        const h = harness(), p = h.page('NodeConfig'); p.replacementAddress = 'changed.invalid'; p.updateAddress(); const message = p.message;
+        p.updateAddress(); assert.equal(h.state.addressWrites, 1); assert.equal(p.replacementAddress, ''); assert.equal(p.message, message);
+    });
+    add('diagnostic logging failure cannot misreport a committed import or address update', () => {
+        const h = harness({ logThrows: true }), p = h.page('NodeConfig'); p.input = SECOND; p.save();
+        assert.equal(h.state.writes.length, 1); assert.equal(p.input, ''); assert.match(p.saveReceipt, /^保存回执/); assert.match(p.message, /已新增/);
+        p.replacementAddress = 'changed.invalid'; p.updateAddress();
+        assert.equal(p.replacementAddress, ''); assert.match(p.message, /已更新/); noVisibleSecrets(p, h.state);
+    });
+    add('diagnostic logging failure preserves a successfully decoded scanner draft', async () => {
+        const h = harness({ logThrows: true }), p = h.page('NodeConfig'); const pending = p.scan(); await flush();
+        h.state.scans[0].resolve({ originalValue: SECOND }); await pending;
+        assert.equal(p.input, SECOND); assert.match(p.message, /已识别/); assert.equal(h.state.writes.length, 0); noVisibleSecrets(p, h.state);
     });
     return cases;
 }
@@ -662,7 +805,7 @@ function casesNodes() {
         p.aboutToDisappear(); assert.equal(h.state.timers.size, 0);
     });
     add('catalog read failure disables editing without losing displayed nodes', () => {
-        const h = harness(), p = h.page('Nodes'); p.aboutToAppear(); const before = clone(p.nodes);
+        const h = harness(), p = h.page('Nodes'); p.aboutToAppear(); p.onPageShow(); const before = clone(p.nodes);
         h.state.mode = 'catalog-read-error'; p.onPageShow(); assert.deepEqual(clone(p.nodes), before); assert.equal(p.editable, false);
         assert.match(p.message, /读取失败/); p.aboutToDisappear();
     });
@@ -849,8 +992,10 @@ function casesNodeLatency() {
         const old = p.refreshLatencies(); h.state.latencyRecords = [];
         await p.refreshLatencies(); h.state.hashRequests[0].resolve(outboundHash(firstNode.outboundJson)); await old;
         assert.equal(p.latencies.length, 0);
+        h.state.catalog.nodes[0].outboundJson = secondNode.outboundJson;
+        p.nodes = clone(h.state.catalog.nodes);
         h.state.latencyRecords = [latencyRecord(h.state.catalog.nodes[0])]; const destroyed = p.refreshLatencies();
-        p.aboutToDisappear(); h.state.hashRequests[1].resolve(outboundHash(firstNode.outboundJson)); await destroyed;
+        p.aboutToDisappear(); h.state.hashRequests[1].resolve(outboundHash(secondNode.outboundJson)); await destroyed;
         assert.equal(p.latencies.length, 0);
     });
     add('unreadable result history preserves catalog and shows fixed error', async () => {
@@ -1045,15 +1190,135 @@ function casesBatchLatency() {
     });
     return cases;
 }
+function casesNodePerformance() {
+    const cases = [], add = (name, run) => cases.push({ name: 'Nodes performance: ' + name, run });
+    function largeCatalog(h, count = 500) {
+        h.state.catalog.nodes = Array.from({ length: count }, (_, i) => {
+            const outbound = JSON.parse(firstNode.outboundJson);
+            outbound.settings.vnext[0].address = `synthetic-${i}.invalid`;
+            const node = single.parseNode(JSON.stringify(outbound)); node.name = `Synthetic ${i}`;
+            return savedNode(node, 'large-' + i);
+        });
+        h.state.catalog.activeNodeId = h.state.catalog.nodes[0].id;
+        h.state.latencyRecords = h.state.catalog.nodes.map((node, i) => latencyRecord(node, {
+            durationMs: (i * 73) % 997 + 1
+        })).reverse();
+    }
+    add('500-node latency ordering matches the prior stable semantics using one result index', () => {
+        const h = harness(), p = h.page('Nodes'); largeCatalog(h);
+        p.nodes = clone(h.state.catalog.nodes); p.activeId = h.state.catalog.activeNodeId; p.sortByLatency = true;
+        const plainRecords = clone(h.state.latencyRecords);
+        let referenceVisits = 0, indexedIdReads = 0;
+        const expected = [...p.nodes].sort((left, right) => {
+            const a = plainRecords.find(result => { referenceVisits++; return result.nodeId === left.id; });
+            const b = plainRecords.find(result => { referenceVisits++; return result.nodeId === right.id; });
+            const rankA = batchLatency.latencySortRank(a?.status ?? '', a?.durationMs ?? 0);
+            const rankB = batchLatency.latencySortRank(b?.status ?? '', b?.durationMs ?? 0);
+            return rankA === rankB ? 0 : rankA < rankB ? -1 : 1;
+        }).map(node => node.id);
+        p.latencies = plainRecords.map(record => {
+            const copy = { ...record }; Object.defineProperty(copy, 'nodeId', { get() { indexedIdReads++; return record.nodeId; } });
+            return copy;
+        });
+        const actual = p.filtered().map(node => node.id);
+        assert.deepEqual(clone(actual), expected); assert.equal(indexedIdReads, 500);
+        assert(referenceVisits > 1000000); assert.equal(p.activeId, h.state.catalog.activeNodeId);
+        assert.deepEqual(clone(p.nodes).map(node => node.id), h.state.catalog.nodes.map(node => node.id));
+        nodePerformance.sort500 = { referenceResultPredicateVisits: referenceVisits, optimizedResultIndexIdReads: indexedIdReads };
+    });
+    add('indexed ordering preserves ties, failed/missing placement and search semantics', () => {
+        const h = harness(), p = h.page('Nodes'); largeCatalog(h);
+        p.nodes = clone(h.state.catalog.nodes); p.sortByLatency = true;
+        p.latencies = h.state.latencyRecords.filter((_, i) => i % 5 !== 0).map((result, i) => ({
+            ...result, status: i % 4 === 0 ? 'failed' : 'passed', reason: i % 4 === 0 ? 'timeout' : '', durationMs: i % 3 === 0 ? 10 : 20
+        }));
+        for (const search of ['', 'Synthetic 1', 'not present']) {
+            p.search = search; const query = search.toLowerCase();
+            const expected = p.nodes.filter(node => node.name.toLowerCase().includes(query) || node.protocol.includes(query)).sort((a, b) => {
+                const left = p.latencies.find(result => result.nodeId === a.id), right = p.latencies.find(result => result.nodeId === b.id);
+                const x = batchLatency.latencySortRank(left?.status ?? '', left?.durationMs ?? 0), y = batchLatency.latencySortRank(right?.status ?? '', right?.durationMs ?? 0);
+                return x === y ? 0 : x < y ? -1 : 1;
+            });
+            assert.deepEqual(clone(p.filtered()).map(node => node.id), expected.map(node => node.id));
+        }
+        p.sortByLatency = false; p.search = ''; assert.deepEqual(clone(p.filtered()), clone(p.nodes));
+    });
+    add('first appearance/show reads once and unchanged return reuses all 500 fingerprints', async () => {
+        const h = harness(), p = h.page('Nodes'); largeCatalog(h);
+        const tasks = [], refresh = p.refreshLatencies.bind(p);
+        p.refreshLatencies = () => { const task = refresh(); tasks.push(task); return task; };
+        p.aboutToAppear(); p.onPageShow(); await Promise.all(tasks);
+        assert.equal(h.state.events.filter(event => event === 'catalog-read').length, 1);
+        assert.equal(h.state.latencyReads, 1); assert.equal(h.state.hashRequests.length, 500); assert.equal(p.latencies.length, 500);
+        const first = { catalogReads: 1, resultReads: 1, fingerprintCalls: 500 };
+        p.onPageHide(); assert.equal(h.state.timers.size, 0); p.onPageShow(); await tasks.at(-1);
+        assert.equal(h.state.events.filter(event => event === 'catalog-read').length, 2);
+        assert.equal(h.state.latencyReads, 2); assert.equal(h.state.hashRequests.length, 500);
+        assert.equal(p.latencies.length, 500); assert.equal(p.historyFingerprints.size, 500); assert.equal(h.state.timers.size, 1);
+        nodePerformance.firstShow500 = first;
+        nodePerformance.unchangedRefresh500 = { resultReads: 1, additionalFingerprintCalls: 0, matchedResults: 500 };
+        p.aboutToDisappear(); assert.equal(h.state.timers.size, 0); assert.equal(p.historyFingerprints.size, 0);
+    });
+    add('500-result refresh uses indexed nodes and invalidates changed/deleted identities only', async () => {
+        const h = harness(), p = h.page('Nodes'); largeCatalog(h);
+        let nodeIdReads = 0;
+        p.nodes = h.state.catalog.nodes.map(node => {
+            const copy = { ...node }; Object.defineProperty(copy, 'id', { get() { nodeIdReads++; return node.id; } }); return copy;
+        });
+        await p.refreshLatencies(); assert.equal(nodeIdReads, 1000); assert.equal(h.state.hashRequests.length, 500);
+        nodePerformance.historyJoin500 = { priorLinearNodePredicateVisits: 500 * 501 / 2, optimizedNodeIdReads: nodeIdReads };
+        h.state.catalog.nodes[5].name = 'Metadata changed'; p.nodes = clone(h.state.catalog.nodes);
+        await p.refreshLatencies(); assert.equal(h.state.hashRequests.length, 500);
+        const changed = h.state.catalog.nodes[17], removed = h.state.catalog.nodes[29];
+        changed.protocol = secondNode.protocol; changed.outboundJson = secondNode.outboundJson;
+        h.state.catalog.nodes = h.state.catalog.nodes.filter(node => node.id !== removed.id); p.nodes = clone(h.state.catalog.nodes);
+        await p.refreshLatencies(); assert.equal(h.state.hashRequests.length, 501);
+        assert.equal(p.latencies.length, 498); assert.equal(p.historyFingerprints.size, 499);
+        assert.equal(p.historyFingerprints.has(removed.id), false);
+        h.state.latencyRecords = h.state.latencyRecords.filter(record => record.nodeId !== changed.id);
+        h.state.latencyRecords.push(latencyRecord(changed, { durationMs: 777, runId: 'fresh-result' }));
+        await p.refreshLatencies(); assert.equal(h.state.hashRequests.length, 501);
+        assert.equal(p.latencies.find(record => record.nodeId === changed.id).durationMs, 777); assert.equal(p.latencies.length, 499);
+    });
+    add('overlapping history refreshes share a pending fingerprint and only newest results win', async () => {
+        const h = harness({ hashDeferred: true }), p = h.page('Nodes'); p.nodes = clone(h.state.catalog.nodes);
+        h.state.latencyRecords = [latencyRecord(h.state.catalog.nodes[0])]; const old = p.refreshLatencies();
+        h.state.latencyRecords = [latencyRecord(h.state.catalog.nodes[0], { durationMs: 555, runId: 'new-result' })]; const fresh = p.refreshLatencies();
+        assert.equal(h.state.hashRequests.length, 1); h.state.hashRequests[0].resolve(outboundHash(firstNode.outboundJson));
+        await Promise.all([old, fresh]); assert.equal(p.latencies.length, 1); assert.equal(p.latencies[0].durationMs, 555);
+    });
+    add('a changed outbound replaces an in-flight cache entry and late old completion cannot poison it', async () => {
+        const h = harness({ hashDeferred: true }), p = h.page('Nodes'); p.nodes = clone(h.state.catalog.nodes);
+        h.state.latencyRecords = [latencyRecord(h.state.catalog.nodes[0])]; const old = p.refreshLatencies();
+        h.state.catalog.nodes[0] = savedNode(secondNode, 'node-old'); p.nodes = clone(h.state.catalog.nodes);
+        h.state.latencyRecords = [latencyRecord(h.state.catalog.nodes[0])]; const fresh = p.refreshLatencies();
+        assert.equal(h.state.hashRequests.length, 2); h.state.hashRequests[1].resolve(outboundHash(secondNode.outboundJson)); await fresh;
+        h.state.hashRequests[0].resolve(outboundHash(firstNode.outboundJson)); await old;
+        assert.equal(p.latencies[0].outboundFingerprint, outboundHash(secondNode.outboundJson));
+        assert.equal(p.historyFingerprints.get('node-old').outboundJson, secondNode.outboundJson);
+        assert.equal(p.historyFingerprints.get('node-old').value, outboundHash(secondNode.outboundJson));
+    });
+    add('failed cached fingerprint is retryable and obsolete identities cannot accumulate', async () => {
+        const h = harness({ hashDeferred: true }), p = h.page('Nodes'); p.nodes = clone(h.state.catalog.nodes);
+        h.state.latencyRecords = [latencyRecord(h.state.catalog.nodes[0])]; const failed = p.refreshLatencies();
+        h.state.hashRequests[0].reject(RAW_ERROR); await failed; assert.equal(p.latencies.length, 0); noVisibleSecrets(p, h.state);
+        const retry = p.refreshLatencies(); assert.equal(h.state.hashRequests.length, 2);
+        h.state.hashRequests[1].resolve(outboundHash(firstNode.outboundJson)); await retry; assert.equal(p.latencies.length, 1);
+        p.nodes = []; h.state.latencyRecords = []; await p.refreshLatencies(); assert.equal(p.historyFingerprints.size, 0);
+        p.aboutToDisappear(); assert.equal(p.historyFingerprints.size, 0);
+    });
+    return cases;
+}
+
 async function main() {
     const passed = [], failed = [];
-    for (const test of [...casesNodeConfig(), ...casesNodeScan(), ...casesSubscriptions(), ...casesNodes(), ...casesNodeLatency(), ...casesBatchLatency()]) {
+    for (const test of [...casesNodeConfig(), ...casesNodeForm(), ...casesNodeScan(), ...casesSubscriptions(), ...casesNodes(), ...casesNodeLatency(), ...casesBatchLatency(), ...casesNodePerformance()]) {
         try { await test.run(); passed.push(test.name); }
         catch (error) { failed.push({ name: test.name, error: error.message }); }
     }
     const record = { generatedAt: new Date().toISOString(), passed: passed.length, failed: failed.length, sourceHashes,
         scope: 'Real ArkTS methods/parsers/fetcher/NodeEditGuard, SDK transpilation, synthetic catalog/HTTP/scanner/timers/VPN state and deferred latency dependencies; not a device result.',
-        tests: passed, failures: failed };
+        tests: passed, failures: failed, nodePerformance };
     const output = path.join(project, 'build/node-management-ui-verification.json');
     fs.mkdirSync(path.dirname(output), { recursive: true }); fs.writeFileSync(output, JSON.stringify(record, null, 2) + '\n');
     console.log(JSON.stringify({ passed: passed.length, failed: failed.length, failures: failed, record: output }));

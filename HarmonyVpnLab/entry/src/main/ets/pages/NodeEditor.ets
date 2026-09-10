@@ -1,4 +1,5 @@
 import { common } from '@kit.AbilityKit';
+import { deviceInfo } from '@kit.BasicServicesKit';
 import { readNodeCatalog, SavedNode, updateCatalogNode } from '../model/NodeCatalog';
 import { ImportedNode } from '../model/NodeImport';
 import { isNodeManagementAllowed } from '../model/NodeEditGuard';
@@ -30,7 +31,12 @@ struct NodeEditor {
   private leaveRequest: number = 0;
 
   private context(): common.UIAbilityContext { return this.getUIContext().getHostContext() as common.UIAbilityContext; }
-  aboutToAppear(): void { this.pageEpoch++; this.confirmingLeave = false; this.leaving = false; this.load(); }
+  aboutToAppear(): void {
+    // A live editor owns its draft until save/discard. Visibility or dialog
+    // lifecycle re-entry must not reload the persisted baseline over that draft.
+    if (this.loaded) { this.refreshEditable(); return; }
+    this.pageEpoch++; this.confirmingLeave = false; this.leaving = false; this.load();
+  }
   onPageShow(): void { this.refreshEditable(); }
   aboutToDisappear(): void {
     this.pageEpoch++; this.leaveRequest++; this.confirmingLeave = false;
@@ -61,6 +67,63 @@ struct NodeEditor {
     this.portError = !this.jsonMode && (!/^[0-9]{1,5}$/.test(this.draft.port) ||
       Number(this.draft.port) < 1 || Number(this.draft.port) > 65535) ? '端口应为 1–65535 的整数。' : '';
     this.refreshDirty();
+  }
+
+  private fieldValue(id: string): string {
+    // Read reactive state inside the builder, never a captured scalar argument.
+    const draft = this.draft;
+    switch (id) {
+      case 'editNodeName': return draft.name;
+      case 'editNodeAddress': return draft.address;
+      case 'editNodePort': return draft.port;
+      case 'editNodeCredential': return draft.credential;
+      case 'editNodeMethod': return draft.method;
+      case 'editNodeFlow': return draft.flow;
+      case 'editNodeSni': return draft.serverName;
+      case 'editNodeFingerprint': return draft.fingerprint;
+      case 'editNodeAlpn': return draft.alpn;
+      case 'editNodePublicKey': return draft.publicKey;
+      case 'editNodeShortId': return draft.shortId;
+      case 'editNodeSpiderX': return draft.spiderX;
+      case 'editNodeWsHost': return draft.transportHost;
+      case 'editNodeWsPath': return draft.transportPath;
+      case 'editNodeGrpcService': return draft.serviceName;
+      case 'editNodeGrpcAuthority': return draft.authority;
+      default: return '';
+    }
+  }
+
+  private changeField(id: string, text: string): void {
+    if (!this.loaded || !this.editable || this.confirmingLeave || this.leaving) { return; }
+    // Replace the observed object instead of mutating a class property through
+    // a callback captured by a parameterized builder.
+    const next = JSON.parse(JSON.stringify(this.draft)) as NodeEditorDraft;
+    switch (id) {
+      case 'editNodeName': next.name = text; break;
+      case 'editNodeAddress': next.address = text; break;
+      case 'editNodePort': next.port = text; break;
+      case 'editNodeCredential': next.credential = text; break;
+      case 'editNodeMethod': next.method = text; break;
+      case 'editNodeFlow': next.flow = text; break;
+      case 'editNodeSni': next.serverName = text; break;
+      case 'editNodeFingerprint': next.fingerprint = text; break;
+      case 'editNodeAlpn': next.alpn = text; break;
+      case 'editNodePublicKey': next.publicKey = text; break;
+      case 'editNodeShortId': next.shortId = text; break;
+      case 'editNodeSpiderX': next.spiderX = text; break;
+      case 'editNodeWsHost': next.transportHost = text; break;
+      case 'editNodeWsPath': next.transportPath = text; break;
+      case 'editNodeGrpcService': next.serviceName = text; break;
+      case 'editNodeGrpcAuthority': next.authority = text; break;
+      default: return;
+    }
+    this.draft = next;
+    this.draftChanged();
+  }
+
+  private changeJson(text: string): void {
+    if (!this.loaded || !this.editable || this.confirmingLeave || this.leaving) { return; }
+    this.jsonText = text; this.draftChanged();
   }
 
   onBackPress(): boolean {
@@ -199,7 +262,7 @@ struct NodeEditor {
         Column({ space: 18 }) {
           if (this.loaded) {
             Column({ space: 14 }) {
-              this.field('节点名称', this.draft.name, 'editNodeName', false, 64, (value: string) => { this.draft.name = value; });
+              this.field('节点名称', 'editNodeName', false, 64);
               Text(`${this.draft.protocol.toUpperCase()} · ${this.draft.network.toUpperCase()} · ${this.draft.security.toUpperCase()}`)
                 .id('editNodeProtocol').fontSize(14).fontColor($r('app.color.text_secondary'));
               if (this.fromSubscription) {
@@ -214,36 +277,36 @@ struct NodeEditor {
                 Text('这里显示完整连接配置。支持现有四种协议的单个 outbound；保存前会重新校验。')
                   .fontSize(13).fontColor($r('app.color.text_secondary')).lineHeight('21fp');
                 TextArea({ text: this.jsonText, placeholder: '单个 outbound JSON' }).id('editNodeJson').height(360)
+                  .enableKeyboardOnFocus(deviceInfo.deviceType !== '2in1')
                   .fontSize(13).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.surface_secondary'))
-                  .maxLength(65536).enabled(this.editable && !this.confirmingLeave && !this.leaving)
-                  .onChange((value: string) => { this.jsonText = value; this.draftChanged(); });
+                  .maxLength(65536).enabled(this.editable && !this.leaving)
+                  .onChange((value: string) => { this.changeJson(value); });
               }.padding(20).width('100%').alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.surface')).borderRadius(18);
             } else {
               Column({ space: 14 }) {
                 Text('连接参数').fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
-                this.field('服务器 IP 或域名', this.draft.address, 'editNodeAddress', false, 253, (value: string) => { this.draft.address = value; });
-                this.field('端口', this.draft.port, 'editNodePort', false, 5, (value: string) => { this.draft.port = value; });
-                this.field(['vless', 'vmess'].includes(this.draft.protocol) ? '用户 UUID' : '密码', this.draft.credential, 'editNodeCredential', true, 4096,
-                  (value: string) => { this.draft.credential = value; });
+                this.field('服务器 IP 或域名', 'editNodeAddress', false, 253);
+                this.field('端口', 'editNodePort', false, 5);
+                this.field(['vless', 'vmess'].includes(this.draft.protocol) ? '用户 UUID' : '密码', 'editNodeCredential', true, 4096);
                 if (this.draft.protocol === 'shadowsocks') {
-                  this.field('加密方法', this.draft.method, 'editNodeMethod', false, 64, (value: string) => { this.draft.method = value; });
+                  this.field('加密方法', 'editNodeMethod', false, 64);
                 }
                 if (this.draft.protocol === 'vless') {
-                  this.field('Flow（可留空）', this.draft.flow, 'editNodeFlow', false, 64, (value: string) => { this.draft.flow = value; });
+                  this.field('Flow（可留空）', 'editNodeFlow', false, 64);
                 }
               }.padding(20).width('100%').alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.surface')).borderRadius(18);
 
               if (this.draft.security === 'tls' || this.draft.security === 'reality') {
                 Column({ space: 14 }) {
                   Text('TLS / REALITY').fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
-                  this.field('服务器名称 SNI', this.draft.serverName, 'editNodeSni', false, 253, (value: string) => { this.draft.serverName = value; });
-                  this.field('客户端指纹', this.draft.fingerprint, 'editNodeFingerprint', false, 64, (value: string) => { this.draft.fingerprint = value; });
+                  this.field('服务器名称 SNI', 'editNodeSni', false, 253);
+                  this.field('客户端指纹', 'editNodeFingerprint', false, 64);
                   if (this.draft.security === 'tls') {
-                    this.field('ALPN（英文逗号分隔）', this.draft.alpn, 'editNodeAlpn', false, 256, (value: string) => { this.draft.alpn = value; });
+                    this.field('ALPN（英文逗号分隔）', 'editNodeAlpn', false, 256);
                   } else {
-                    this.field('REALITY 公钥', this.draft.publicKey, 'editNodePublicKey', false, 256, (value: string) => { this.draft.publicKey = value; });
-                    this.field('Short ID', this.draft.shortId, 'editNodeShortId', false, 64, (value: string) => { this.draft.shortId = value; });
-                    this.field('Spider X（可留空）', this.draft.spiderX, 'editNodeSpiderX', false, 1024, (value: string) => { this.draft.spiderX = value; });
+                    this.field('REALITY 公钥', 'editNodePublicKey', false, 256);
+                    this.field('Short ID', 'editNodeShortId', false, 64);
+                    this.field('Spider X（可留空）', 'editNodeSpiderX', false, 1024);
                   }
                 }.padding(20).width('100%').alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.surface')).borderRadius(18);
               }
@@ -251,11 +314,11 @@ struct NodeEditor {
                 Column({ space: 14 }) {
                   Text('传输参数').fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
                   if (this.draft.network === 'ws') {
-                    this.field('WebSocket Host', this.draft.transportHost, 'editNodeWsHost', false, 253, (value: string) => { this.draft.transportHost = value; });
-                    this.field('WebSocket Path', this.draft.transportPath, 'editNodeWsPath', false, 2048, (value: string) => { this.draft.transportPath = value; });
+                    this.field('WebSocket Host', 'editNodeWsHost', false, 253);
+                    this.field('WebSocket Path', 'editNodeWsPath', false, 2048);
                   } else {
-                    this.field('gRPC Service Name', this.draft.serviceName, 'editNodeGrpcService', false, 1024, (value: string) => { this.draft.serviceName = value; });
-                    this.field('gRPC Authority', this.draft.authority, 'editNodeGrpcAuthority', false, 253, (value: string) => { this.draft.authority = value; });
+                    this.field('gRPC Service Name', 'editNodeGrpcService', false, 1024);
+                    this.field('gRPC Authority', 'editNodeGrpcAuthority', false, 253);
                   }
                 }.padding(20).width('100%').alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.surface')).borderRadius(18);
               }
@@ -287,14 +350,17 @@ struct NodeEditor {
   }
 
   @Builder
-  private field(label: string, value: string, id: string, sensitive: boolean, limit: number, changed: (value: string) => void) {
+  private field(label: string, id: string, sensitive: boolean, limit: number) {
     Column({ space: 7 }) {
       Text(label).fontSize(13).fontColor($r('app.color.text_secondary'));
-      TextInput({ text: value, placeholder: label }).id(id).maxLength(limit)
+      TextInput({ text: this.fieldValue(id), placeholder: label }).id(id).maxLength(limit)
+        .enableKeyboardOnFocus(deviceInfo.deviceType !== '2in1')
         .type(sensitive ? InputType.Password : id === 'editNodePort' ? InputType.Number : InputType.Normal)
         .fontSize(15).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.surface_secondary'))
-        .constraintSize({ minHeight: 46 }).enabled(this.editable && !this.confirmingLeave && !this.leaving)
-        .onChange((text: string) => { changed(text); this.draftChanged(); });
+        // Native modal focus already blocks interaction. Toggling enabled here
+        // can cause the text control to reapply a stale construction value.
+        .constraintSize({ minHeight: 46 }).enabled(this.editable && !this.leaving)
+        .onChange((text: string) => { this.changeField(id, text); });
       if (id === 'editNodePort' && this.portError) {
         Text(this.portError).id('editNodePortError').fontSize(13).fontColor($r('app.color.danger'));
       }

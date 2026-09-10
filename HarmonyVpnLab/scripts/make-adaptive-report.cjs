@@ -5,8 +5,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const phase = process.argv[2] || 'phase12';
-if (!['phase12', 'phase13'].includes(phase) || process.argv.length > 3) throw Error('Unknown report phase');
-const version = phase === 'phase13' ? '0.13.0' : '0.12.0';
+if (!['phase12', 'phase13', 'phase14'].includes(phase) || process.argv.length > 3) throw Error('Unknown report phase');
+const version = { phase12: '0.12.0', phase13: '0.13.0', phase14: '0.14.0' }[phase];
 const directory = path.resolve(__dirname, '../build/' + phase + '-emulators');
 const output = path.join(directory, 'report.html');
 const categories = [
@@ -15,7 +15,7 @@ const categories = [
   { key: 'pc', label: '电脑', short: 'PC' },
   { key: 'fold', label: '折叠屏', short: 'Fold' }
 ];
-const excludedName = /(?:^|[-_\s])(initial|debug|start|seed-debug|boot|lock(?:ed|screen)?|unlock(?:ed)?|launcher|desktop)(?:$|[-_\s])/i;
+const excludedName = /(?:^|[-_\s])(initial|debug|start|seed-debug|boot|lock(?:ed|screen)?|unlock(?:ed)?|launcher|desktop|failure|failed|interrupted)(?:$|[-_\s])/i;
 const systemName = /(?:^|[-_\s])system(?:$|[-_\s])/i;
 const excludedMode = /^(?:initial|debug|start|system|boot|lock|unlock|launcher|desktop)/i;
 const pages = { Home: '连接首页', Nodes: '节点列表', Settings: '设置', Network: '分流与 DNS',
@@ -33,10 +33,11 @@ const flag = value => value === true ? '有' : value === false ? '无' : '未记
 const entries = fs.readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isFile());
 const files = new Map(entries.map(entry => [entry.name.toLowerCase(), entry.name]));
 let finalPreviewHash;
-if (phase === 'phase13' && files.has('final-verification.json')) {
+if (phase !== 'phase12' && files.has('final-verification.json')) {
   const verification = JSON.parse(fs.readFileSync(path.join(directory, files.get('final-verification.json')), 'utf8'));
   if (/^[0-9a-f]{64}$/.test(verification.preview?.sha256 || '')) finalPreviewHash = verification.preview.sha256;
 }
+if (phase === 'phase14' && !finalPreviewHash) throw Error('Phase14 requires a verified final preview hash');
 const rejected = { excluded: 0, notQa: 0, incomplete: 0, earlierCandidate: 0 };
 const records = [];
 
@@ -70,7 +71,7 @@ for (const entry of entries.filter(item => item.name.toLowerCase().endsWith('.js
     sideNavigation: data.sideNavigation, twoColumns: data.twoColumns,
     overflowCount: data.horizontalOverflow.length,
     overflow: data.horizontalOverflow.slice(0, 30).map((item, index) => ({
-      id: boundedText(item?.id, 120) || `检查项 ${index + 1}`,
+      id: boundedText(typeof item === 'string' ? item : item?.id, 120) || `检查项 ${index + 1}`,
       bounds: validBounds(item?.bounds) ? item.bounds.slice() : undefined
     })), imageName });
 }
@@ -80,7 +81,7 @@ const counts = Object.fromEntries(categories.map(item => [item.key, records.filt
 const overflowRecords = records.filter(record => record.overflowCount > 0).length;
 const generatedAt = new Date().toISOString();
 const verificationLink = files.has('final-verification.json') ? '<a href="final-verification.json" target="_blank" rel="noopener">最终包与截图对应记录</a>' : '阶段十二文档';
-const candidateNote = phase === 'phase12' ? '同一版本包含多个候选：fold-home-default 是 680 vp 修复前对照，fold-home-final 是修复后记录。早期截图不能统一归入最终 HAP 哈希，详见' + verificationLink + '。' :
+const candidateNote = phase === 'phase14' ? '本轮修复草稿保护、桌面键盘操作与大字号按钮换行。此页仅展示最终预览包的截图，包哈希见' + verificationLink + '；长时间导航与排序对照的候选版本分别记录在阶段十四文档中。<a href="../phase13-emulators/report.html">查看上一轮界面</a>。' : phase === 'phase12' ? '同一版本包含多个候选：fold-home-default 是 680 vp 修复前对照，fold-home-final 是修复后记录。早期截图不能统一归入最终 HAP 哈希，详见' + verificationLink + '。' :
   '本轮聚焦首页、节点管理、编辑保护和设置分组。此页仅展示最终预览包的截图，原始 JSON 记录对应包哈希；<a href="../phase12-emulators/report.html">查看上一轮界面</a>。API 24 平板的安装和联网验证已按用户要求暂停。';
 
 function card(record, index) {

@@ -12,6 +12,7 @@ const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/et
 const names = ['NodeImport', 'NodeCatalog', 'NodeEditor'];
 const sources = new Map(names.map(name => [name, fs.readFileSync(path.join(root, `entry/src/main/ets/model/${name}.ets`), 'utf8')]));
 const pageSource = fs.readFileSync(path.join(root, 'entry/src/main/ets/pages/NodeEditor.ets'), 'utf8');
+let fieldValueBinding, fieldInputHandler;
 const pageMethods = pageSource.split('  build() {')[0].replace(/@Entry\s*/g, '').replace(/@Component\s*/g, '')
   .replace(/@State\s*/g, '').replace(/@StorageProp\([^)]*\)\s*/g, '')
   .replace('struct NodeEditor', 'export class NodeEditor') + '\n}';
@@ -139,6 +140,80 @@ test('Advanced JSON preserves the full accepted object and supports an explicit 
   const edited = f.editor.nodeFromEditorJson('Chosen name', JSON.stringify(JSON.parse(target.outboundJson), null, 2));
   assert.equal(edited.outboundJson, target.outboundJson); assert.equal(edited.protocol, 'trojan'); assert.equal(edited.name, 'Chosen name');
 });
+test('String and array ALPN representations load and survive unrelated form edits exactly', () => {
+  for (const alpn of ['h2', 'h2,http/1.1', ['h2', 'http/1.1']]) {
+    const f = fixture();
+    const original = f.node(1, 'vless', { streamSettings: { network: 'tcp', security: 'tls',
+      tlsSettings: { serverName: 'sni.invalid', alpn, enableSessionResumption: true, minVersion: '1.2' },
+      sockopt: { tcpFastOpen: true } } });
+    const draft = f.editor.nodeEditorDraft(original);
+    assert.equal(draft.alpn, typeof alpn === 'string' ? alpn : alpn.join(','));
+    assert.equal(f.editor.nodeFromEditorDraft(original, draft).outboundJson, original.outboundJson);
+    draft.port = '8443';
+    const out = JSON.parse(f.editor.nodeFromEditorDraft(original, draft).outboundJson);
+    assert.deepEqual(out.streamSettings.tlsSettings.alpn, alpn);
+    assert.equal(out.streamSettings.tlsSettings.enableSessionResumption, true);
+    assert.equal(out.streamSettings.tlsSettings.minVersion, '1.2');
+    assert.equal(out.streamSettings.sockopt.tcpFastOpen, true);
+  }
+});
+test('Explicit ALPN edits and clearing keep other TLS fields and validate normally', () => {
+  const f = fixture(), original = f.node(1, 'vless', { streamSettings: { network: 'tcp', security: 'tls',
+    tlsSettings: { alpn: 'h2', serverName: 'sni.invalid', minVersion: '1.2' } } });
+  const draft = f.editor.nodeEditorDraft(original); draft.alpn = 'http/1.1,h2';
+  let out = JSON.parse(f.editor.nodeFromEditorDraft(original, draft).outboundJson);
+  assert.deepEqual(out.streamSettings.tlsSettings.alpn, ['http/1.1', 'h2']);
+  draft.alpn = ''; out = JSON.parse(f.editor.nodeFromEditorDraft(original, draft).outboundJson);
+  assert.equal(out.streamSettings.tlsSettings.alpn, undefined); assert.equal(out.streamSettings.tlsSettings.minVersion, '1.2');
+});
+test('Legacy WebSocket Host is displayed while no-op and unrelated edits preserve headers', () => {
+  for (const key of ['Host', 'host', 'hOsT']) {
+    const f = fixture(), headers = { [key]: 'legacy.invalid', 'X-Preserve': 'synthetic-header-value' };
+    const original = f.node(1, 'vless', { streamSettings: { network: 'ws', security: 'tls',
+      tlsSettings: { serverName: 'sni.invalid' }, wsSettings: { path: '/path?ed=2048', headers, heartbeatPeriod: 25 } } });
+    const draft = f.editor.nodeEditorDraft(original); assert.equal(draft.transportHost, 'legacy.invalid');
+    assert.equal(f.editor.nodeFromEditorDraft(original, draft).outboundJson, original.outboundJson);
+    draft.port = '8443'; const out = JSON.parse(f.editor.nodeFromEditorDraft(original, draft).outboundJson);
+    assert.deepEqual(out.streamSettings.wsSettings.headers, headers);
+    assert.equal(out.streamSettings.wsSettings.host, undefined); assert.equal(out.streamSettings.wsSettings.heartbeatPeriod, 25);
+  }
+});
+test('Changing or clearing a WebSocket Host removes its legacy fallback but retains unrelated headers', () => {
+  for (const explicit of [undefined, '', 'explicit.invalid']) {
+    for (const replacement of ['', 'replacement.invalid']) {
+      const f = fixture(), original = f.node(1, 'vless', { streamSettings: { network: 'ws', security: 'tls',
+        tlsSettings: { serverName: 'sni.invalid' }, wsSettings: { path: '/original', host: explicit,
+          headers: { Host: 'legacy.invalid', 'X-Preserve': 'synthetic-header-value' } } } });
+      const draft = f.editor.nodeEditorDraft(original);
+      assert.equal(draft.transportHost, explicit || 'legacy.invalid'); draft.transportHost = replacement;
+      const out = JSON.parse(f.editor.nodeFromEditorDraft(original, draft).outboundJson);
+      assert.equal(out.streamSettings.wsSettings.host, replacement || undefined);
+      assert.deepEqual(out.streamSettings.wsSettings.headers, { 'X-Preserve': 'synthetic-header-value' });
+      assert.equal(out.streamSettings.wsSettings.path, '/original');
+      assert.equal(out.streamSettings.tlsSettings.serverName, 'sni.invalid');
+    }
+  }
+});
+test('Changing a legacy Host preserves unusual but valid literal header names', () => {
+  const f = fixture(), headers = JSON.parse('{"Host":"legacy.invalid","__proto__":"preserved-literal","constructor":"preserved-constructor"}');
+  const original = f.node(1, 'vless', { streamSettings: { network: 'ws', security: 'tls',
+    tlsSettings: { serverName: 'sni.invalid' }, wsSettings: { path: '/ws', headers } } });
+  const draft = f.editor.nodeEditorDraft(original); draft.transportHost = 'replacement.invalid';
+  const out = JSON.parse(f.editor.nodeFromEditorDraft(original, draft).outboundJson);
+  assert.equal(Object.hasOwn(out.streamSettings.wsSettings.headers, '__proto__'), true);
+  assert.equal(out.streamSettings.wsSettings.headers.__proto__, 'preserved-literal');
+  assert.equal(out.streamSettings.wsSettings.headers.constructor, 'preserved-constructor');
+});
+test('Complex supported nodes remain exact through catalog backup and restore', () => {
+  const f = fixture();
+  const nodes = [f.node(1, 'vless', { streamSettings: { network: 'tcp', security: 'tls', tlsSettings: { alpn: 'h2', minVersion: '1.2' } } }),
+    f.node(2, 'vless', { streamSettings: { network: 'ws', security: 'tls', tlsSettings: { serverName: 'sni.invalid' },
+      wsSettings: { path: '/ws', headers: { Host: 'legacy.invalid', 'X-Preserve': 'synthetic-header-value' } } } })];
+  f.catalog.importManualNodes(dir, nodes); const backup = f.catalog.exportNodeCatalogBackup(dir);
+  const restored = fixture(); restored.catalog.restoreNodeCatalogBackup(dir, backup, 0);
+  assert.deepEqual(restored.read().nodes.map(node => node.outboundJson).join('\n'), nodes.map(node => node.outboundJson).join('\n'));
+  for (const saved of restored.read().nodes) assert.equal(restored.editor.nodeFromEditorDraft(saved, restored.editor.nodeEditorDraft(saved)).outboundJson, saved.outboundJson);
+});
 test('Unsupported structural transitions and invalid form values cannot mutate the original', () => {
   const f = fixture(), original = f.node(), before = original.outboundJson;
   for (const [key, value] of [['network', 'grpc'], ['protocol', 'trojan'], ['port', '0'], ['port', '1e3'], ['port', '65536'], ['credential', 'bad-uuid']]) {
@@ -236,6 +311,17 @@ test('Switching page editors retains unsaved basic changes and accepted raw-only
   page.draft.port = '8443'; page.save(); const saved = JSON.parse(f.read().nodes[0].outboundJson);
   assert.deepEqual(saved.mux, { enabled: true, concurrency: 4 }); assert.equal(saved.settings.vnext[0].port, 8443);
 });
+test('Editor page loads string ALPN and legacy Host without dirtying the saved configuration', () => {
+  const f = fixture(), original = f.node(1, 'vless', { streamSettings: { network: 'ws', security: 'tls',
+    tlsSettings: { alpn: 'http/1.1', serverName: 'sni.invalid' },
+    wsSettings: { path: '/ws', headers: { Host: 'legacy.invalid', 'X-Preserve': 'synthetic-header-value' } } } });
+  f.catalog.importManualNodes(dir, [original]); const before = f.bytes(), catalog = f.read(), writes = f.state.renames;
+  const page = f.page(catalog.activeNodeId); page.aboutToAppear();
+  assert.equal(page.loaded, true); assert.equal(page.dirty, false); assert.equal(page.draft.transportHost, 'legacy.invalid');
+  page.switchEditor(); page.switchEditor(); page.save(); assert.equal(f.state.renames, writes); assert.equal(f.bytes(), before);
+  page.draft.name = 'Renamed complex node'; page.draftChanged(); page.save();
+  assert.equal(page.dirty, false); assert.equal(f.read().nodes[0].outboundJson, original.outboundJson);
+});
 test('Invalid raw page edits remain available for correction and never write', () => {
   const f = fixture(), catalog = store(f), page = f.page(catalog.activeNodeId); page.aboutToAppear(); page.switchEditor();
   const before = f.bytes(); page.jsonText = '{synthetic-secret'; page.switchEditor();
@@ -294,8 +380,9 @@ test('Actual ArkUI bindings keep feedback beside save and preserve numeric/passw
   const options = ts.readConfigFile(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/tsconfig.json'), ts.sys.readFile).config.compilerOptions;
   const ast = ts.createSourceFile('NodeEditor.ets', pageSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.ETS, options);
   assert.equal(ast.parseDiagnostics.length, 0);
-  const ids = new Map(); let typeBinding;
+  const ids = new Map(); let typeBinding, input, inputEnabled;
   function walk(node) {
+    if ((ts.isCallExpression(node) || ts.isEtsComponentExpression(node)) && node.expression?.getText(ast) === 'TextInput') input = node;
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
       if (node.expression.name.text === 'id' && ts.isStringLiteral(node.arguments[0])) ids.set(node.arguments[0].text, node);
       if (node.expression.name.text === 'type' && node.arguments[0].getText(ast).includes('InputType.Number')) typeBinding = node.arguments[0];
@@ -303,6 +390,28 @@ test('Actual ArkUI bindings keep feedback beside save and preserve numeric/passw
     ts.forEachChild(node, walk);
   }
   walk(ast);
+  const structure = ast.statements.find(node => node.kind === ts.SyntaxKind.StructDeclaration);
+  const field = structure.members.find(node => ts.isMethodDeclaration(node) && node.name.getText(ast) === 'field');
+  assert.deepEqual(field.parameters.map(parameter => parameter.name.getText(ast)), ['label', 'id', 'sensitive', 'limit']);
+  const text = input.arguments[0].properties.find(property => property.name.getText(ast) === 'text').initializer;
+  assert.equal(text.getText(ast), 'this.fieldValue(id)');
+  fieldValueBinding = new Function('id', 'return ' + text.getText(ast));
+  let changed;
+  for (let node = input.parent; node && !ts.isExpressionStatement(node); node = node.parent) {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      if (node.expression.name.text === 'onChange') changed = node.arguments[0];
+      if (node.expression.name.text === 'enabled') inputEnabled = node.arguments[0];
+    }
+  }
+  assert(changed && inputEnabled);
+  const callback = ts.transpileModule('export function fieldInputHandler(id: string) { return ' + changed.getText(ast) + '; }', {
+    compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }
+  });
+  const callbackScope = { exports: {} }; vm.runInNewContext(callback.outputText, callbackScope);
+  fieldInputHandler = callbackScope.exports.fieldInputHandler;
+  const inputIsEnabled = new Function('return ' + inputEnabled.getText(ast));
+  assert.equal(inputIsEnabled.call({ editable: true, leaving: false, confirmingLeave: false }), true);
+  assert.equal(inputIsEnabled.call({ editable: true, leaving: false, confirmingLeave: true }), true);
   function owningComponent(node) {
     for (let parent = node.parent; parent; parent = parent.parent) if (ts.isEtsComponentExpression(parent)) return parent;
   }
@@ -330,6 +439,21 @@ test('Actual ArkUI bindings keep feedback beside save and preserve numeric/passw
   }
 });
 
+test('Keyed field updates replace observed draft state and preserve every other field', () => {
+  const f = fixture(), catalog = store(f), page = f.page(catalog.activeNodeId); page.aboutToAppear();
+  const fields = { editNodeName: 'name', editNodeAddress: 'address', editNodePort: 'port', editNodeCredential: 'credential',
+    editNodeMethod: 'method', editNodeFlow: 'flow', editNodeSni: 'serverName', editNodeFingerprint: 'fingerprint',
+    editNodeAlpn: 'alpn', editNodePublicKey: 'publicKey', editNodeShortId: 'shortId', editNodeSpiderX: 'spiderX',
+    editNodeWsHost: 'transportHost', editNodeWsPath: 'transportPath', editNodeGrpcService: 'serviceName', editNodeGrpcAuthority: 'authority' };
+  for (const [id, key] of Object.entries(fields)) {
+    const previous = page.draft, before = plain(previous), value = key === 'port' ? '70000' : 'synthetic-value';
+    page.changeField(id, value); assert.notEqual(page.draft, previous); assert.deepEqual(plain(previous), before);
+    assert.equal(page.fieldValue(id), value); assert.deepEqual(plain(page.draft), { ...before, [key]: value });
+  }
+  const current = page.draft; page.changeField('unknown-field', 'ignored'); assert.equal(page.draft, current);
+  page.editable = false; page.changeField('editNodePort', '443'); assert.equal(page.draft.port, '70000');
+});
+
 async function asyncTest(name, body) {
   try { await body(); results.push({ name, passed: true }); }
   catch (_) { throw new Error(name); }
@@ -351,6 +475,27 @@ await asyncTest('Continue editing after explicit return keeps unsaved content an
   dialog.resolve({ index: 0 }); await pending;
   assert.equal(f.state.backs, 0); assert.equal(page.draft.address, 'stay.invalid'); assert.equal(page.dirty, true);
   assert.equal(page.confirmingLeave, false); assert.equal(f.bytes(), before);
+});
+await asyncTest('Actual keyed input binding retains 70000 through modal rerender, stale change and repeated appearance', async () => {
+  const f = fixture(), catalog = store(f), page = f.page(catalog.activeNodeId); page.aboutToAppear();
+  const before = f.bytes(), initialDraft = page.draft;
+  const onChange = fieldInputHandler.call(page, 'editNodePort');
+  assert.equal(fieldValueBinding.call(page, 'editNodePort'), '443');
+  onChange('70000'); assert.notEqual(page.draft, initialDraft); assert.equal(page.dirty, true);
+  const pending = page.requestBack(); assert.equal(page.confirmingLeave, true);
+  assert.equal(fieldValueBinding.call(page, 'editNodePort'), '70000');
+  onChange('443'); page.aboutToAppear(); page.onPageShow();
+  assert.equal(fieldValueBinding.call(page, 'editNodePort'), '70000'); assert.equal(page.dirty, true);
+  f.state.dialogs[0].resolve({ index: 0 }); await pending;
+  assert.equal(fieldValueBinding.call(page, 'editNodePort'), '70000'); assert.equal(page.dirty, true); assert.equal(f.state.backs, 0);
+  page.save(); assert.match(page.message, /1–65535/); assert.equal(page.draft.port, '70000'); assert.equal(f.bytes(), before);
+});
+await asyncTest('JSON draft rejects stale text callbacks while return confirmation is open', async () => {
+  const f = fixture(), catalog = store(f), page = f.page(catalog.activeNodeId); page.aboutToAppear(); page.switchEditor();
+  const baseline = page.jsonText; page.changeJson('{invalid-synthetic-json'); assert.equal(page.dirty, true);
+  const pending = page.requestBack(); page.changeJson(baseline); page.aboutToAppear();
+  assert.equal(page.jsonText, '{invalid-synthetic-json'); f.state.dialogs[0].resolve({ index: 0 }); await pending;
+  assert.equal(page.jsonText, '{invalid-synthetic-json'); assert.equal(page.dirty, true); assert.equal(f.state.backs, 0);
 });
 await asyncTest('Dirty system back is consumed and discard is the only dialog choice that leaves', async () => {
   const f = fixture(), catalog = store(f), page = f.page(catalog.activeNodeId); page.aboutToAppear();
