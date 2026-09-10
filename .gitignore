@@ -39,3 +39,8 @@ HarmonyVpnLab/docs/resume-checkpoint.md
 *.zip
 __pycache__/
 *.pyc
+
+# Runtime heap captures can contain application data. Keep only sanitized reports.
+*.heapsnapshot
+*.rawheap
+*.jsleaklist

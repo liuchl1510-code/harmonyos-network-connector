@@ -3,15 +3,18 @@
 // Always target the selected emulator so a USB phone cannot receive these actions.
 const cp=require('node:child_process'),fs=require('node:fs'),path=require('node:path'),os=require('node:os');
 const crypto=require('node:crypto');
+const {performance}=require('node:perf_hooks');
 const diagnostic=require('./emulator-failure-detail.cjs');
 const HDC=path.join(process.env.DEVECO_STUDIO_HOME||'C:/Program Files/Huawei/DevEco Studio','sdk/default/openharmony/toolchains/hdc.exe');
 const target=process.argv[2],mode=process.argv[3]||'Inspect',label=process.argv[4]||mode.toLowerCase();
 const phase=process.argv[5]||'phase12';
 if(!/^127\.0\.0\.1:15[0-9]{3}$/.test(target||'')||!/^[a-zA-Z0-9_-]+$/.test(label))throw Error('Explicit test emulator and safe artifact label required');
-if(!['phase12','phase13','phase14'].includes(phase)||process.argv.length>6)throw Error('Unknown QA phase or extra arguments');
+if(!['phase12','phase13','phase14','phase15'].includes(phase)||process.argv.length>6)throw Error('Unknown QA phase or extra arguments');
 const root=path.resolve(__dirname,'..'),out=path.join(root,'build',phase+'-emulators'),bundle='com.example.harmonyvpnlab';
 fs.mkdirSync(out,{recursive:true});
-const remote='/data/local/tmp/harmony-adaptive-'+process.pid+'.json';
+const remote='/data/local/tmp/harmony-adaptive-'+process.pid+'-'+crypto.randomUUID()+'.json';
+const HDC_TIMEOUT_MS=12000,LAYOUT_TIMEOUT_MS=30000,SLOW_LAYOUT_MS=10000;
+const uiTiming={layoutDumps:0,slowLayoutDumps:0,maxLayoutDumpMs:0,layoutTimeoutMs:LAYOUT_TIMEOUT_MS};
 let failureContext={stage:'preflight',operation:'validate-mode',mode};
 function context(stage,operation){failureContext={stage,operation,mode};return failureContext;}
 function fail(code,stage,operation){return diagnostic.failure(code,context(stage,operation));}
@@ -25,8 +28,10 @@ const run=args=>{let stage='navigation',operation='hdc-command';
  else if(args[1]==='bm'){stage='preflight';operation='package-info';}
  else if(args[1]==='aa')operation=args[2]==='start'?'start-app':'stop-app';
  else if(args[1]==='uitest'&&args[2]==='uiInput')operation={click:'click-control',swipe:'swipe',inputText:'input-text',keyEvent:'back-key'}[args[3]]||'hdc-command';
- const where=context(stage,operation);try{return cp.execFileSync(HDC,['-t',target,...args],{encoding:'utf8',windowsHide:true,timeout:12000,maxBuffer:10*1024*1024,stdio:['ignore','pipe','pipe']});}
- catch(original){const error=Error('UI_OPERATION_FAILED');error.failureDetail=diagnostic.command(where,original);throw error;}};
+ const where=context(stage,operation),isLayout=operation==='dump-layout',began=performance.now();
+ try{return cp.execFileSync(HDC,['-t',target,...args],{encoding:'utf8',windowsHide:true,timeout:isLayout?LAYOUT_TIMEOUT_MS:HDC_TIMEOUT_MS,maxBuffer:10*1024*1024,stdio:['ignore','pipe','pipe']});}
+ catch(original){const error=Error('UI_OPERATION_FAILED');error.failureDetail=diagnostic.command(where,original);throw error;}
+ finally{if(isLayout){const elapsed=Math.max(0,Math.ceil(performance.now()-began));uiTiming.layoutDumps++;if(elapsed>SLOW_LAYOUT_MS)uiTiming.slowLayoutDumps++;uiTiming.maxLayoutDumpMs=Math.max(uiTiming.maxLayoutDumpMs,elapsed);}}};
 const shell=(...a)=>run(['shell',...a]),pause=ms=>new Promise(r=>setTimeout(r,ms));
 const installationFile=path.join(out,'install-'+target.split(':')[1]+'.json');
 const flag=x=>x===true||x==='true';
@@ -52,10 +57,10 @@ async function capture(){const s=snapshot();if(!s.appBounds)throw fail('UI_APPLI
   const controls=s.controls.filter(x=>fixed.has(x.id)||secondary.has(x.id)||/^backFrom|^backTo|^nodeName-|^appearance-|^nodeMore-|^selectNode-|^testNodeLatency-/.test(x.id||'')).map(x=>({id:/^nodeName-/.test(x.id)?'sampleNodeRow':x.id,type:x.type,bounds:bounds(x),enabled:flag(x.enabled)}));
   const b=bounds(s.appBounds);const overflow=controls.filter(x=>x.bounds[0]<b[0]-2||x.bounds[2]>b[2]+2);
   context('capture','read-installation');const installation=fs.existsSync(installationFile)?JSON.parse(fs.readFileSync(installationFile,'utf8')):undefined;
-  const result={target,label,mode,capturedAt:new Date().toISOString(),artifactSHA256:installation?.target===target?installation.sha256:undefined,appBounds:b,sideNavigation:controls.some(x=>x.id==='appSideNavigation'),twoColumns:controls.some(x=>x.id==='homeTwoColumns'),controls,horizontalOverflow:overflow.map(x=>x.id),scope:'UI-only x86_64 emulator build; no VPN network result'};
+  const result={target,label,mode,capturedAt:new Date().toISOString(),artifactSHA256:installation?.target===target?installation.sha256:undefined,appBounds:b,sideNavigation:controls.some(x=>x.id==='appSideNavigation'),twoColumns:controls.some(x=>x.id==='homeTwoColumns'),controls,horizontalOverflow:overflow.map(x=>x.id),scope:'UI-only x86_64 emulator build; no VPN network result',uiTiming:{...uiTiming}};
   context('output','write-report');fs.writeFileSync(path.join(out,label+'.json'),JSON.stringify(result,null,2));
   if(process.env.HARMONY_UI_QA_CAPTURE_IMAGE!=='0'){
-    const image='/data/local/tmp/harmony-adaptive-'+process.pid+'.jpeg';let primary;try{shell('snapshot_display','-f',image);run(['file','recv',image,path.join(out,label+'.jpeg')]);}catch(error){primary=error;throw error;}finally{try{shell('rm','-f',image);}catch(error){if(!primary)throw error;}}
+    const image=remote.slice(0,-5)+'.jpeg';let primary;try{shell('snapshot_display','-f',image);run(['file','recv',image,path.join(out,label+'.jpeg')]);}catch(error){primary=error;throw error;}finally{try{shell('rm','-f',image);}catch(error){if(!primary)throw error;}}
   }
   console.log(JSON.stringify(result));if(overflow.length)throw fail('UI_LAYOUT_OR_OVERFLOW_FAILURE','capture','capture-layout');
 }
@@ -108,6 +113,6 @@ async function main(){
   else if(mode!=='Inspect')throw fail('UI_MODE_INVALID','preflight','validate-mode');
   await capture();
 }
-function reportFailure(error){const failureDetail=diagnostic.sanitize(error?.failureDetail)||diagnostic.detail(failureContext,'UI_OPERATION_FAILED');console.error(JSON.stringify({target,mode:failureDetail.mode,error:'Emulator UI operation failed',errorCode:failureDetail.errorCode,failureDetail}));process.exitCode=1;}
+function reportFailure(error){const failureDetail=diagnostic.sanitize(error?.failureDetail)||diagnostic.detail(failureContext,'UI_OPERATION_FAILED');console.error(JSON.stringify({target,mode:failureDetail.mode,error:'Emulator UI operation failed',errorCode:failureDetail.errorCode,failureDetail,uiTiming:{...uiTiming}}));process.exitCode=1;}
 module.exports={main,reportFailure};
 if(require.main===module)main().catch(reportFailure);

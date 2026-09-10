@@ -1,4 +1,4 @@
-"""Plot completed phase14 soak records without exposing device/process IDs.
+"""Plot finalized emulator soak records without exposing device/process IDs.
 
 Dependencies: an existing Python 3.10+ environment with Matplotlib and NumPy.
 No package download, device operation, or application-source access is performed.
@@ -8,9 +8,12 @@ Example (PowerShell, using the already installed local Anaconda runtime):
     candidate-014-phone-idle-after-partial candidate-014-phone-inspection-control `
     --output c3-phone-memory.png
 
-Input: build/phase14-soak/<run>/{summary.json,samples.jsonl} only.
-Output: PNG and a numeric verification receipt under build/phase14-analysis.
+Input: build/<phase>-soak/<run>/{summary.json,samples.jsonl} only.
+Output: PNG and a numeric verification receipt under build/<phase>-analysis.
+Defaults: --phase phase14 --device phone. Device is an explicit plot label.
 Different package hashes or process births must be plotted in separate invocations.
+An early producer completion is displayed as WINDOW SHORT, without altering its
+original declared outcome. This plot does not replace inspect-emulator-soak.cjs.
 """
 from __future__ import annotations
 
@@ -28,6 +31,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 INPUT_ROOT = ROOT / "build" / "phase14-soak"
 OUTPUT_ROOT = ROOT / "build" / "phase14-analysis"
+PHASES = ("phase14", "phase15")
+DEVICES = {"phone": "phone", "tablet": "tablet", "pc": "PC"}
 ACTIVITIES = {"navigation": "Navigation", "idle": "Idle", "inspection": "Layout inspection"}
 OUTCOMES = {"completed", "failed", "stopped", "deadline-reached", "insufficient-observation"}
 COLORS = {"navigation": "#c66030", "idle": "#238573", "inspection": "#3f6fba"}
@@ -108,6 +113,9 @@ def validate_run(name, summary, samples):
     if abs(observed - number(summary.get("observedSeconds"))) > 0.025:
         raise InvalidRecord("The observed span does not match first and last samples.")
     requested = number(summary.get("requestedMinutes"), positive=True)
+    duration_met = elapsed >= requested * 60
+    display_status = ("WINDOW SHORT" if outcome == "completed" and not duration_met
+                      else outcome.upper())
     if outcome == "completed":
         if summary.get("failure") is not None or summary.get("deadlineLimited") is True:
             raise InvalidRecord("A completed outcome conflicts with failure or deadline metadata.")
@@ -122,24 +130,35 @@ def validate_run(name, summary, samples):
     intervals = [b["elapsed"] - a["elapsed"] for a, b in zip(rows, rows[1:])]
     return {"name": name, "activity": activity, "outcome": outcome, "started": started,
             "finished": finished, "elapsed": elapsed, "observed": observed, "rows": rows,
+            "requested_minutes": requested, "requested_duration_met": duration_met,
+            "display_status": display_status,
             "identity": identity, "gap_seconds": max(30.0, 2.5 * statistics.median(intervals)),
             "actions": summary.get("actions", 0), "uiInspections": summary.get("uiInspections")}
 
 
-def load_run(name):
+def phase_roots(phase):
+    if phase not in PHASES:
+        raise InvalidRecord("The requested observation phase is not supported.")
+    return ROOT / "build" / f"{phase}-soak", ROOT / "build" / f"{phase}-analysis"
+
+
+def load_run(name, phase="phase14"):
+    input_root, _ = phase_roots(phase)
     if not re.fullmatch(r"[a-z0-9-]{1,64}", name):
-        raise InvalidRecord("Run names must be safe phase14 folder names.")
-    directory = (INPUT_ROOT / name).resolve()
-    if directory.parent != INPUT_ROOT.resolve():
-        raise InvalidRecord("An input directory resolves outside the phase14 soak folder.")
+        raise InvalidRecord("Run names must be safe soak folder names.")
+    directory = (input_root / name).resolve()
+    if directory.parent != input_root.resolve():
+        raise InvalidRecord("An input directory resolves outside the selected soak folder.")
     summary_path, samples_path = directory / "summary.json", directory / "samples.jsonl"
     if not summary_path.is_file():
-        raise InvalidRecord("A requested run has no final summary; wait for it to finish.")
+        raise InvalidRecord("A requested run has no final summary; completion is unconfirmed.")
     for file in (summary_path, samples_path):
         if file.resolve().parent != directory:
             raise InvalidRecord("An input file resolves outside its run folder.")
     summary_bytes, sample_bytes = summary_path.read_bytes(), samples_path.read_bytes()
     summary = json.loads(summary_bytes.decode("utf-8-sig"))
+    if not isinstance(summary, dict) or summary.get("phase", "phase14") != phase:
+        raise InvalidRecord("The final summary does not belong to the selected phase.")
     samples = [json.loads(line) for line in sample_bytes.decode("utf-8-sig").splitlines() if line.strip()]
     result = validate_run(name, summary, samples)
     result["input_digests"] = {"summarySHA256": hashlib.sha256(summary_bytes).hexdigest(),
@@ -169,11 +188,20 @@ def rss_segments(run):
         yield segment
 
 
-def render(runs, cohort, output_name):
+def figure_title(cohort, device, sequence):
+    if device not in DEVICES:
+        raise InvalidRecord("The requested device label is not supported.")
+    title = "Sequential memory observations" if sequence else "Memory observations"
+    return f"{cohort} {DEVICES[device]} preview | {title}"
+
+
+def render(runs, cohort, output_name, phase="phase14", device="phone"):
+    _, output_root = phase_roots(phase)
+    title = figure_title(cohort, device, len(runs) > 1)
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,100}\.png", output_name):
         raise InvalidRecord("Output must be a simple PNG filename.")
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    os.environ["MPLCONFIGDIR"] = str(OUTPUT_ROOT / ".mpl-cache")
+    output_root.mkdir(parents=True, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = str(output_root / ".mpl-cache")
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.dates as mdates
@@ -185,8 +213,7 @@ def render(runs, cohort, output_name):
                                           gridspec_kw={"height_ratios": [1.1, 1]})
     fig.subplots_adjust(left=.09, right=.975, top=.82, bottom=.17, hspace=.18)
     sequence = len(runs) > 1
-    title = "Sequential memory observations" if sequence else "Memory observations"
-    fig.suptitle(f"{cohort} phone preview | {title}", x=.09, y=.965,
+    fig.suptitle(title, x=.09, y=.965,
                  ha="left", fontsize=19, fontweight="bold")
     identity_note = ("Same emulator, process birth and package verified across these phases." if sequence
                      else "Process birth and package verified across all samples in this run.")
@@ -209,9 +236,10 @@ def render(runs, cohort, output_name):
                              marker=marker, s=25, color=metric_color, edgecolors="white", linewidths=.35,
                              label=("Ark private dirty" if key == "ark" else "Native private dirty") if index == 0 else None)
         midpoint = run["started"] + (run["finished"] - run["started"]) / 2
-        status = "COMPLETED" if run["outcome"] == "completed" else run["outcome"].upper()
+        status = run["display_status"]
         rss_ax.text(midpoint, 1.025, f"{ACTIVITIES[run['activity']]} | {status}\n"
-                    f"window {run['elapsed']/60:.2f} min / sampled {run['observed']/60:.2f} min",
+                    f"window {run['elapsed']/60:.2f} min / sampled {run['observed']/60:.2f} min"
+                    f" / requested {run['requested_minutes']:g} min",
                     transform=rss_ax.get_xaxis_transform(), ha="center", va="bottom", fontsize=9,
                     color=color, linespacing=1.45)
         if run["outcome"] == "failed":
@@ -234,12 +262,13 @@ def render(runs, cohort, output_name):
     dirty_ax.set_xlabel(f"UTC on {runs[0]['started'].date().isoformat()}  |  startedAt + sample.elapsedSeconds", labelpad=9)
     fig.text(.09, .091, "Blank intervals stay blank. RSS lines stop at phase boundaries, missing values and large sampling gaps.", fontsize=10, color="#475569")
     fig.text(.09, .063, "Private-dirty markers show only actual measurements (KiB / 1024). No forced-GC or leak-cause inference is made.", fontsize=10, color="#475569")
-    png = OUTPUT_ROOT / output_name
-    if png.resolve().parent != OUTPUT_ROOT.resolve() or png.with_suffix(".verification.json").resolve().parent != OUTPUT_ROOT.resolve():
-        raise InvalidRecord("An output file resolves outside the phase14 analysis folder.")
-    fig.savefig(png, dpi=170, facecolor="white", metadata={"Title": f"{cohort} emulator memory observations"})
+    png = output_root / output_name
+    if png.resolve().parent != output_root.resolve() or png.with_suffix(".verification.json").resolve().parent != output_root.resolve():
+        raise InvalidRecord("An output file resolves outside the selected analysis folder.")
+    fig.savefig(png, dpi=170, facecolor="white", metadata={"Title": f"{cohort} {DEVICES[device]} emulator memory observations"})
     plt.close(fig)
-    receipt = {"cohort": cohort, "samePackageProcessBirthAndTargetVerified": True,
+    receipt = {"cohort": cohort, "phase": phase, "device": device,
+               "deviceLabelSource": "explicit-cli-label", "samePackageProcessBirthAndTargetVerified": True,
                "alignment": "UTC summary.startedAt plus numeric sample.elapsedSeconds",
                "rssGapPolicy": "Separate each phase; break missing values or gaps over max(30 s, 2.5 times median interval)",
                "privateDirtyPolicy": "Actual sampled markers only; never replace missing data with zero",
@@ -247,6 +276,8 @@ def render(runs, cohort, output_name):
                "figure": output_name, "figureSHA256": hashlib.sha256(png.read_bytes()).hexdigest(), "runs": []}
     for run in runs:
         receipt["runs"].append({"folder": run["name"], "activity": run["activity"], "outcome": run["outcome"],
+                                "outcomeSource": "original-producer-summary", "displayStatus": run["display_status"],
+                                "requestedMinutes": run["requested_minutes"], "requestedDurationMet": run["requested_duration_met"],
                                 "startedAtUtc": run["started"].isoformat(), "finishedAtUtc": run["finished"].isoformat(),
                                 "windowMinutes": run["elapsed"] / 60, "sampleSpanMinutes": run["observed"] / 60,
                                 "sampleCount": len(run["rows"]), "actions": run["actions"], "uiInspections": run["uiInspections"],
@@ -256,17 +287,23 @@ def render(runs, cohort, output_name):
                       "runs": len(runs), "sameIdentityVerified": True}))
 
 
-def main():
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--cohort", required=True, choices=[f"C{i}" for i in range(1, 100)])
     parser.add_argument("--runs", required=True, nargs="+")
     parser.add_argument("--output", required=True)
-    args = parser.parse_args()
+    parser.add_argument("--phase", choices=PHASES, default="phase14")
+    parser.add_argument("--device", choices=DEVICES, default="phone")
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_arguments()
     if len(set(args.runs)) != len(args.runs):
         raise InvalidRecord("Duplicate run names are not allowed.")
-    runs = [load_run(name) for name in args.runs]
+    runs = [load_run(name, args.phase) for name in args.runs]
     validate_cohort(runs)
-    render(runs, args.cohort, args.output)
+    render(runs, args.cohort, args.output, args.phase, args.device)
 
 
 if __name__ == "__main__":
