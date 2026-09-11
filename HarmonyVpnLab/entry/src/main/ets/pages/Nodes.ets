@@ -3,7 +3,9 @@ import { deviceInfo } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { vpnExtension } from '@kit.NetworkKit';
 import native from 'libvpnbridge.so';
-import { SavedNode, SubscriptionSource, readNodeCatalog, selectCatalogNode, renameCatalogNode, deleteCatalogNode } from '../model/NodeCatalog';
+import { SavedNode, SubscriptionSource, readNodeCatalog, selectCatalogNode, renameCatalogNode, deleteCatalogNode, setCatalogNodeFavorite } from '../model/NodeCatalog';
+import { NodeListFilter, filterCatalogNodes } from '../model/NodeListFilter';
+import { readImportedNodeIds, readImportedNavigationRequestId } from '../model/NodeListNavigation';
 import { isNodeManagementAllowed } from '../model/NodeEditGuard';
 import { ConnectionCommand, ConnectionStatus, readConnectionCommand, readConnectionStatus, writeConnectionCommand } from '../model/ConnectionControl';
 import { ProbeState, readProbeState, writeProbeState } from '../model/ProbeState';
@@ -13,7 +15,8 @@ import { measureNodeLatency } from '../model/LatencyProbe';
 import { BatchLatencyTarget, BatchLatencyObservation, BatchLatencyQueue, latencySortRank } from '../model/BatchLatency';
 import { AppTabBar } from '../components/AppTabBar';
 import { AppSideNav } from '../components/AppSideNav';
-import { useSideNavigation, nodeListContentWidth } from '../model/AdaptiveLayout';
+import { NodeDetailsCard } from '../components/NodeDetailsCard';
+import { useSideNavigation, nodeListContentWidth, nodeListUsesDetails, nodeListPaneWidth } from '../model/AdaptiveLayout';
 import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
 
 class HistoryFingerprint {
@@ -44,6 +47,11 @@ struct Nodes {
   @State batchActive: boolean = false;
   @State batchProgress: string = '';
   @State sortByLatency: boolean = false;
+  @State favoritesOnly: boolean = false;
+  @State sourceFilterId: string = '$all';
+  @State importedOnly: boolean = false;
+  @State importedNodeIds: string[] = [];
+  @State detailNodeId: string = '';
   private batchQueue: BatchLatencyQueue | undefined = undefined;
   private pageVisible: boolean = true;
   private catalogReadable: boolean = true;
@@ -55,6 +63,7 @@ struct Nodes {
   private pageEpoch: number = 0;
   private resultEpoch: number = 0;
   private firstShowLoaded: boolean = false;
+  private consumedImportRequest: string = '';
   private historyFingerprints: Map<string, HistoryFingerprint> = new Map<string, HistoryFingerprint>();
 
   private context(): common.UIAbilityContext { return this.getUIContext().getHostContext() as common.UIAbilityContext; }
@@ -63,6 +72,7 @@ struct Nodes {
     this.pageVisible = true;
     if (this.firstShowLoaded) { this.firstShowLoaded = false; }
     else { this.reload(); }
+    this.applyImportedNavigation();
     this.pollLatency();
     if (this.timer < 0) { this.timer = setInterval(() => { this.pollLatency(); }, 500); }
   }
@@ -106,6 +116,13 @@ struct Nodes {
       this.nodes = catalog.nodes;
       this.sources = catalog.subscriptions;
       this.activeId = catalog.activeNodeId;
+      if (!this.nodes.some((node: SavedNode) => node.id === this.detailNodeId)) {
+        this.detailNodeId = nodeListUsesDetails(this.windowWidthVp) ? this.activeId : '';
+      }
+      if (this.sourceFilterId !== '$all' && this.sourceFilterId !== '$manual' &&
+        !this.sources.some((source: SubscriptionSource) => source.id === this.sourceFilterId)) {
+        this.sourceFilterId = '$all';
+      }
       this.catalogReadable = true;
       this.editable = this.canEdit();
       this.refreshLatencies();
@@ -383,8 +400,10 @@ struct Nodes {
   }
 
   private filtered(): SavedNode[] {
-    const query = this.search.trim().toLowerCase();
-    const nodes = this.nodes.filter((node: SavedNode) => node.name.toLowerCase().includes(query) || node.protocol.includes(query));
+    const filter = new NodeListFilter();
+    filter.query = this.search; filter.sourceId = this.sourceFilterId; filter.favoritesOnly = this.favoritesOnly;
+    filter.importedOnly = this.importedOnly; filter.importedNodeIds = this.importedNodeIds;
+    const nodes = filterCatalogNodes(this.nodes, filter);
     if (this.sortByLatency) {
       const resultsById: Map<string, NodeLatencyResult> = new Map<string, NodeLatencyResult>();
       for (const result of this.latencies) {
@@ -408,7 +427,7 @@ struct Nodes {
     if (!this.canEdit()) { this.message = '请先断开连接或等待检测结束，再修改节点。'; return; }
     try {
       selectCatalogNode(this.context().filesDir, id);
-      this.reload(); this.message = '已切换当前节点，返回首页后连接。';
+      this.reload(); this.message = this.catalogReadable ? '已切换当前节点，返回首页后连接。' : '当前选择已保存，但列表读取未确认，请返回核对。';
       hilog.info(0x0000, 'HarmonyVpnLab', 'NODE_SELECTION_SAVED');
     } catch (_) { this.message = '切换未完成，请先断开连接。'; }
   }
@@ -416,22 +435,97 @@ struct Nodes {
     if (!this.canEdit()) { this.message = '请先断开连接或等待检测结束，再修改节点。'; return; }
     try {
       renameCatalogNode(this.context().filesDir, this.renameId, this.renameText);
-      this.renameId = ''; this.renameText = ''; this.reload(); this.message = '名称已保存。';
+      this.renameId = ''; this.renameText = ''; this.reload();
+      this.message = this.catalogReadable ? '名称已保存。' : '名称已保存，但列表读取未确认，请返回核对。';
     } catch (_) { this.message = '改名未完成，请检查名称并先断开连接。'; }
+  }
+  private prepareRename(id: string): void {
+    if (!this.canEdit()) { return; }
+    try {
+      const node = readNodeCatalog(this.context().filesDir).nodes.find((item: SavedNode) => item.id === id);
+      if (!node) { throw new Error('missing'); }
+      this.renameId = id; this.renameText = node.name; this.deleteId = '';
+    } catch (_) { this.message = '节点暂时无法读取，请刷新后重试。'; }
   }
   private remove(id: string): void {
     if (!this.canEdit()) { this.message = '请先断开连接或等待检测结束，再修改节点。'; return; }
     try {
       deleteCatalogNode(this.context().filesDir, id);
-      this.deleteId = ''; this.reload(); this.message = '节点已删除。';
+      this.deleteId = ''; this.reload(); this.message = this.catalogReadable ? '节点已删除。' : '删除已提交，但列表读取未确认，请返回核对。';
       hilog.info(0x0000, 'HarmonyVpnLab', 'NODE_REMOVED');
     } catch (_) { this.message = '删除未完成，请先断开连接。'; }
   }
 
   private clearSearch(): void { this.search = ''; this.limit = 50; }
 
+  private clearFilters(): void {
+    this.search = ''; this.sourceFilterId = '$all'; this.favoritesOnly = false;
+    this.importedOnly = false; this.limit = 50;
+  }
+
+  private applyImportedNavigation(): void {
+    if (!this.catalogReadable) { return; }
+    const params = this.getUIContext().getRouter().getParams();
+    const request = readImportedNavigationRequestId(params);
+    if (!request || request === this.consumedImportRequest) { return; }
+    const ids = readImportedNodeIds(params);
+    this.consumedImportRequest = request;
+    this.clearFilters(); this.importedNodeIds = ids; this.importedOnly = true;
+    this.detailNodeId = ids.find((id: string) => this.nodes.some((node: SavedNode) => node.id === id)) ?? '';
+    this.message = '';
+  }
+
+  private hasFilters(): boolean {
+    return this.search.trim().length > 0 || this.sourceFilterId !== '$all' || this.favoritesOnly || this.importedOnly;
+  }
+
+  private toggleFavorite(id: string): void {
+    if (!this.canEdit()) { this.message = '请先断开连接或等待检测结束，再修改收藏。'; return; }
+    try {
+      const node = readNodeCatalog(this.context().filesDir).nodes.find((item: SavedNode) => item.id === id);
+      if (!node) { throw new Error('missing'); }
+      const favorite = !node.favorite;
+      setCatalogNodeFavorite(this.context().filesDir, id, favorite);
+      this.reload(); this.message = this.catalogReadable ? (favorite ? '已加入收藏。' : '已取消收藏。') :
+        '收藏已保存，但列表读取未确认，请返回核对。';
+    } catch (_) { this.message = '收藏未保存，请刷新列表后重试。'; }
+  }
+
+  private sourceFilterName(): string {
+    return this.sourceFilterId === '$all' ? '全部来源' : this.sourceName(this.sourceFilterId === '$manual' ? '' : this.sourceFilterId);
+  }
+
+  private sourceFilterMenu(): MenuElement[] {
+    const items: MenuElement[] = [
+      { value: '全部来源', action: () => { this.sourceFilterId = '$all'; this.limit = 50; } },
+      { value: '手动导入', action: () => { this.sourceFilterId = '$manual'; this.limit = 50; } }
+    ];
+    for (const source of this.sources) {
+      const id = source.id;
+      items.push({ value: source.name, action: () => { this.sourceFilterId = id; this.limit = 50; } });
+    }
+    return items;
+  }
+
+  private detailNode(): SavedNode | undefined { return this.nodes.find((node: SavedNode) => node.id === this.detailNodeId); }
+  private nodeById(id: string): SavedNode | undefined { return this.nodes.find((node: SavedNode) => node.id === id); }
+  private isFavorite(id: string): boolean { return this.nodeById(id)?.favorite ?? false; }
+  private nodeSourceText(id: string): string {
+    const node = this.nodeById(id);
+    return node ? node.protocol.toUpperCase() + ' · ' + this.sourceName(node.sourceId) : '';
+  }
+  private openNodeEditor(id: string): void {
+    if (!this.canEdit() || !this.nodeById(id)) { return; }
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/NodeEditor', params: { nodeId: id } })
+      .catch(() => { this.message = '编辑页暂时无法打开，请重试。'; });
+  }
+
+  private inspectNode(id: string): void {
+    this.detailNodeId = this.detailNodeId === id && !nodeListUsesDetails(this.windowWidthVp) ? '' : id;
+  }
+
   private searchResultText(): string {
-    return this.search.trim().length > 0 ? `匹配 ${this.filtered().length} 个 · 已显示 ${this.visibleNodes().length} 个` :
+    return this.hasFilters() ? `匹配 ${this.filtered().length} 个 · 已显示 ${this.visibleNodes().length} 个` :
       `显示 ${this.visibleNodes().length} / ${this.nodes.length} 个节点`;
   }
 
@@ -439,12 +533,12 @@ struct Nodes {
 
   private toggleLatencyHelp(): void { this.latencyHelpExpanded = !this.latencyHelpExpanded; }
 
-  private wideNodeRows(): boolean { return nodeListContentWidth(this.windowWidthVp) >= 680; }
+  private wideNodeRows(): boolean { return nodeListPaneWidth(this.windowWidthVp) >= 640; }
 
   private nodeInformationWidth(): number {
     // The list has 20 vp outer padding and each row has 16/12 vp padding.
     // Wide rows reserve 276 vp for controls and a 12 vp inter-column gap.
-    const innerWidth = nodeListContentWidth(this.windowWidthVp) - 40 - 28;
+    const innerWidth = nodeListPaneWidth(this.windowWidthVp) - 28;
     return Math.max(1, innerWidth - (this.wideNodeRows() ? 288 : 0));
   }
 
@@ -465,6 +559,7 @@ struct Nodes {
           .fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
           .enabled(this.editable).bindMenu(this.addNodeMenu);
       }.width(nodeListContentWidth(this.windowWidthVp)).padding({ left: 20, right: 20, top: 16, bottom: 14 });
+      Row({ space: 16 }) {
       Scroll() {
         Column({ space: 12 }) {
           if (!VPN_CORE_AVAILABLE) {
@@ -482,7 +577,35 @@ struct Nodes {
                 .accessibilityText('清空节点搜索').onClick(() => { this.clearSearch(); });
             }
           }.width('100%');
-          Text(this.searchResultText()).id('nodeSearchResultCount').fontSize(12).fontColor($r('app.color.text_secondary'));
+          Row({ space: 8 }) {
+            Button({ type: ButtonType.Normal }) {
+              Text(this.sourceFilterName() + ' ▾').fontSize(13).fontColor($r('app.color.text_primary'))
+                .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%').textAlign(TextAlign.Start);
+            }.id('filterNodeSource').constraintSize({ minHeight: 44 }).layoutWeight(1).borderRadius(12)
+              .padding({ left: 12, right: 12, top: 10, bottom: 10 }).backgroundColor($r('app.color.surface'))
+              .accessibilityText('筛选节点来源，' + this.sourceFilterName()).bindMenu(this.sourceFilterMenu());
+            Button({ type: ButtonType.Normal }) {
+              Text(this.favoritesOnly ? '★ 收藏' : '☆ 收藏').fontSize(13).width('100%').textAlign(TextAlign.Center)
+                .fontColor(this.favoritesOnly ? $r('app.color.accent') : $r('app.color.text_secondary'));
+            }.id('filterFavoriteNodes').constraintSize({ minHeight: 44 }).layoutWeight(1).borderRadius(12)
+              .padding({ left: 10, right: 10, top: 10, bottom: 10 })
+              .backgroundColor(this.favoritesOnly ? $r('app.color.accent_soft') : $r('app.color.surface'))
+              .accessibilityText(this.favoritesOnly ? '仅显示收藏节点，已开启' : '仅显示收藏节点，未开启')
+              .onClick(() => { this.favoritesOnly = !this.favoritesOnly; this.limit = 50; });
+          }.width('100%');
+          if (this.importedOnly) {
+            Text('正在查看本次导入的节点，已有重复项也包含在内。').id('importedNodesNotice')
+              .fontSize(13).lineHeight('20fp').fontColor($r('app.color.accent')).width('100%');
+          }
+          Row({ space: 8 }) {
+            Text(this.searchResultText()).id('nodeSearchResultCount').fontSize(12)
+              .fontColor($r('app.color.text_secondary')).layoutWeight(1);
+            if (this.hasFilters()) {
+              Button('查看全部', { type: ButtonType.Normal }).id('clearNodeFilters').constraintSize({ minHeight: 44 })
+                .fontSize(13).fontColor($r('app.color.accent')).backgroundColor(Color.Transparent)
+                .onClick(() => { this.clearFilters(); });
+            }
+          }.width('100%');
           Row({ space: 8 }) {
             Button({ type: ButtonType.Normal }) {
               Text(this.batchButtonText()).fontSize(13).fontColor($r('app.color.accent'))
@@ -535,16 +658,26 @@ struct Nodes {
                     alignItems: ItemAlign.Center, justifyContent: FlexAlign.SpaceBetween }) {
                     Column({ space: 5 }) {
                       Row({ space: 8 }) {
+                        Button(this.isFavorite(node.id) ? '★' : '☆', { type: ButtonType.Normal }).id(`favoriteNode-${node.id}`)
+                          .constraintSize({ minHeight: 44, minWidth: 44 }).padding(0).fontSize(24)
+                          .fontColor(this.isFavorite(node.id) ? $r('app.color.accent') : $r('app.color.text_secondary'))
+                          .backgroundColor(Color.Transparent).enabled(this.editable)
+                          .accessibilityText((this.isFavorite(node.id) ? '取消收藏，' : '收藏，') + (this.nodeById(node.id)?.name ?? ''))
+                          .onClick(() => { this.toggleFavorite(node.id); });
                         if (node.id === this.activeId) {
                           Text('当前').id(`currentNodeBadge-${node.id}`).fontSize(11).fontWeight(FontWeight.Medium)
                             .fontColor($r('app.color.accent')).padding({ left: 6, right: 6, top: 3, bottom: 3 })
                             .backgroundColor($r('app.color.surface')).borderRadius(6);
                         }
-                        Text(node.name).id(`nodeName-${node.id}`).fontSize(17).fontWeight(FontWeight.Medium)
-                          .fontColor($r('app.color.text_primary')).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
-                          .lineHeight('23fp').layoutWeight(1);
+                        Button({ type: ButtonType.Normal }) {
+                          Text(this.nodeById(node.id)?.name ?? '').id(`nodeName-${node.id}`).fontSize(17).fontWeight(FontWeight.Medium)
+                            .fontColor($r('app.color.text_primary')).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+                            .lineHeight('23fp').width('100%').textAlign(TextAlign.Start);
+                        }.id(`inspectNode-${node.id}`).layoutWeight(1).constraintSize({ minHeight: 44 }).padding(0)
+                          .backgroundColor(Color.Transparent).accessibilityText('查看节点详情，' + (this.nodeById(node.id)?.name ?? ''))
+                          .onClick(() => { this.inspectNode(node.id); });
                       }.width('100%').alignItems(VerticalAlign.Top);
-                      Text(`${node.protocol.toUpperCase()} · ${this.sourceName(node.sourceId)}`)
+                      Text(this.nodeSourceText(node.id))
                         .fontSize(12).fontColor($r('app.color.text_secondary')).maxLines(2)
                         .textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%');
                       Text(this.latencyText(node.id)).id(`nodeLatency-${node.id}`).fontSize(12).lineHeight('18fp')
@@ -572,6 +705,12 @@ struct Nodes {
                     }.width(this.wideNodeRows() ? 276 : '100%')
                       .margin({ left: this.wideNodeRows() ? 12 : 0, top: this.wideNodeRows() ? 0 : 6 });
                   }.width('100%');
+                  if (!nodeListUsesDetails(this.windowWidthVp) && this.detailNodeId === node.id) {
+                    NodeDetailsCard({ nodeName: this.nodeById(node.id)?.name ?? '', source: this.nodeSourceText(node.id),
+                      favorite: this.isFavorite(node.id), selected: node.id === this.activeId,
+                      latency: this.latencyText(node.id), editable: this.editable,
+                      onSelect: () => { this.select(node.id); }, onEdit: () => { this.openNodeEditor(node.id); } });
+                  }
                   if (this.renameId === node.id) {
                     TextInput({ text: this.renameText, placeholder: '节点名称' }).enableKeyboardOnFocus(deviceInfo.deviceType !== '2in1').id('renameNodeInput').maxLength(64)
                       .constraintSize({ minHeight: 42 }).fontSize(14).fontColor($r('app.color.text_primary'))
@@ -618,11 +757,29 @@ struct Nodes {
           } else if (this.filtered().length === 0) {
             Column({ space: 8 }) {
               Text('没有匹配的节点').fontSize(17).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
-              Text('试试其他名称或协议。').fontSize(14).fontColor($r('app.color.text_secondary'));
+              Text(this.favoritesOnly ? '点击节点名称旁的星标即可收藏，或点击“查看全部”清除筛选。' : '试试其他名称、协议或来源，或点击“查看全部”。')
+                .fontSize(14).lineHeight('21fp').fontColor($r('app.color.text_secondary')).width('100%');
             }.id('nodeSearchEmpty').width('100%').padding({ top: 40, bottom: 40 });
           }
-        }.id('nodeListContent').width(nodeListContentWidth(this.windowWidthVp)).padding({ left: 20, right: 20, bottom: 20 }).alignItems(HorizontalAlign.Start);
-      }.width('100%').layoutWeight(1).scrollBar(BarState.Off).align(Alignment.Top);
+        }.id('nodeListContent').width(nodeListPaneWidth(this.windowWidthVp)).padding({ bottom: 20 }).alignItems(HorizontalAlign.Start);
+      }.layoutWeight(1).height('100%').scrollBar(BarState.Off).align(Alignment.Top);
+      if (nodeListUsesDetails(this.windowWidthVp)) {
+        Scroll() {
+          Column({ space: 12 }) {
+            Text('节点详情').fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
+            if (this.detailNode()) {
+              NodeDetailsCard({ nodeName: this.detailNode()?.name ?? '', source: this.nodeSourceText(this.detailNodeId),
+                favorite: this.isFavorite(this.detailNodeId), selected: this.detailNodeId === this.activeId,
+                latency: this.latencyText(this.detailNodeId), editable: this.editable,
+                onSelect: () => { this.select(this.detailNodeId); }, onEdit: () => { this.openNodeEditor(this.detailNodeId); } });
+            } else {
+              Text('点击列表中的节点名称，在这里查看详情。').fontSize(14).lineHeight('22fp')
+                .fontColor($r('app.color.text_secondary')).width('100%');
+            }
+          }.id('nodeDetailsPanel').width('100%').alignItems(HorizontalAlign.Start);
+        }.width(300).height('100%').scrollBar(BarState.Off).align(Alignment.Top);
+      }
+      }.width(nodeListContentWidth(this.windowWidthVp)).padding({ left: 20, right: 20, bottom: 12 }).layoutWeight(1).alignItems(VerticalAlign.Top);
       if (this.testingId || this.batchActive) {
         Row({ space: 12 }) {
           Text(this.batchActive ? '正在依次检测节点' : '节点 HTTPS 检测中').fontSize(13).fontColor($r('app.color.accent')).layoutWeight(1);
@@ -633,7 +790,7 @@ struct Nodes {
           .backgroundColor($r('app.color.surface'));
       }
       if (!useSideNavigation(this.windowWidthVp)) { AppTabBar({ current: 'nodes' }); }
-    }.layoutWeight(1).height('100%');
+    }.layoutWeight(1).height('100%').alignItems(HorizontalAlign.Center);
     }.width('100%').height('100%').backgroundColor($r('app.color.page_bg'));
   }
 
@@ -664,7 +821,7 @@ struct Nodes {
         }
       } },
       { value: '改名', enabled: this.editable, action: () => {
-        if (this.canEdit()) { this.renameId = node.id; this.renameText = node.name; }
+        this.prepareRename(node.id);
       } },
       { value: '删除', enabled: this.editable, action: () => {
         if (this.canEdit()) { this.deleteId = node.id; }

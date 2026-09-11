@@ -20,7 +20,7 @@ struct About {
             .width(72).height(72).textAlign(TextAlign.Center)
             .backgroundColor($r('app.color.accent_soft')).borderRadius(22);
           Text('Harmony VPN').fontSize(26).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'));
-          Text(VPN_CORE_AVAILABLE ? '版本 0.14.0' : '版本 0.14.0 · 界面预览').id('appVersion').fontSize(14).fontColor($r('app.color.text_secondary'));
+          Text(VPN_CORE_AVAILABLE ? '版本 0.15.0' : '版本 0.15.0 · 界面预览').id('appVersion').fontSize(14).fontColor($r('app.color.text_secondary'));
           Text('管理节点，连接你的网络。').fontSize(14).fontColor($r('app.color.text_secondary'));
         }.padding(28).width('100%').backgroundColor($r('app.color.surface')).borderRadius(22);
 

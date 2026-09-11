@@ -16,7 +16,7 @@ function atomicWriteJson(file,value,fileSystem=fs){
 function persistenceError(original){const error=Error('SOAK_OUTPUT_PERSISTENCE_FAILED');error.ioCode=['EACCES','EPERM','ENOSPC','EIO','ENOENT','EEXIST','EBUSY'].includes(original?.code)?original.code:'IO_ERROR';return error;}
 const options={};for(let i=2;i<process.argv.length;i+=2){if(!['--target','--minutes','--label','--deadline','--activity','--memory-breakdown-every','--phase'].includes(process.argv[i])||!process.argv[i+1]||options[process.argv[i]])throw Error('Invalid soak arguments');options[process.argv[i]]=process.argv[i+1];}
 const target=options['--target'],minutes=Number(options['--minutes']),label=options['--label'],deadline=Date.parse(options['--deadline']);
-const phase=options['--phase']||'phase14';if(!['phase14','phase15'].includes(phase))throw Error('Invalid soak phase');
+const phase=options['--phase']||'phase14';if(!['phase14','phase15','phase16'].includes(phase))throw Error('Invalid soak phase');
 const activity=options['--activity']||'navigation';if(!['navigation','idle','inspection'].includes(activity))throw Error('Invalid soak activity');
 const memoryBreakdownEvery=Number(options['--memory-breakdown-every']||'0');
 if(!/^(0|[1-9][0-9]*)$/.test(options['--memory-breakdown-every']||'0')||!Number.isInteger(memoryBreakdownEvery)||memoryBreakdownEvery>1000)throw Error('Memory breakdown interval must be 0 or 1..1000');

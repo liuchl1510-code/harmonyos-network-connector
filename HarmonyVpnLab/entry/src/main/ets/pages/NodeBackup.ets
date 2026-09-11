@@ -157,7 +157,7 @@ struct NodeBackup {
       Button('备份整个节点库').id('exportNodeCatalog').width('100%').constraintSize({ minHeight: 48 })
         .fontSize(15).fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
         .enabled(this.readable && !this.busy).onClick(() => { this.save(false); });
-      Text('包括所有节点、订阅来源和当前选择。').fontSize(13).fontColor($r('app.color.text_secondary'));
+      Text('包括所有节点、收藏、订阅来源和当前选择。').fontSize(13).fontColor($r('app.color.text_secondary'));
     }.width('100%').padding(20).alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.surface'))
       .border({ width: 1, color: $r('app.color.border') }).borderRadius(20);
   }

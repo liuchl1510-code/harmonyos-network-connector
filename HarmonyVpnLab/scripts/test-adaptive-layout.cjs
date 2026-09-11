@@ -10,7 +10,9 @@ for(const width of [240,320,360,480,600,679,680,707.2,768,799,800,840,1023,1024,
   assert(layout.primaryContentWidth(width)+rail<=width);
   assert(layout.nodeListContentWidth(width)+rail<=width);
   assert(layout.primaryContentWidth(width)<=1200);
-  assert(layout.nodeListContentWidth(width)<=1040);
+  assert(layout.nodeListContentWidth(width)<=1200);
+  assert(layout.nodeListPaneWidth(width)>0);
+  assert(layout.nodeListPaneWidth(width)+(layout.nodeListUsesDetails(width)?316:0)+40<=layout.nodeListContentWidth(width));
 });
 test('phone, tablet and resized PC use width rather than hardware labels',()=>{
   assert.equal(layout.useSideNavigation(1023),false);assert.equal(layout.useSideNavigation(1024),true);

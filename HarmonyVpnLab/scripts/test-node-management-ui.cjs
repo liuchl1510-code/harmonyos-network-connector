@@ -33,7 +33,7 @@ function compile(relative, page = false) {
     assert.equal(output.diagnostics.length, 0, 'SDK transpilation failed: ' + relative);
     compiledFiles.set(relative, output.outputText);
 }
-for (const file of ['model/NodeImport.ets', 'model/NodeBatchImport.ets', 'model/SubscriptionFetch.ets', 'model/NodeEditGuard.ets', 'model/BatchLatency.ets', 'model/NodeScanner.ets', 'model/AdaptiveLayout.ets']) compile(file);
+for (const file of ['model/NodeImport.ets', 'model/NodeBatchImport.ets', 'model/SubscriptionFetch.ets', 'model/NodeEditGuard.ets', 'model/BatchLatency.ets', 'model/NodeScanner.ets', 'model/AdaptiveLayout.ets', 'model/NodeListFilter.ets', 'model/NodeListNavigation.ets']) compile(file);
 for (const file of ['pages/NodeConfig.ets', 'pages/Subscriptions.ets', 'pages/Nodes.ets']) compile(file, true);
 function execute(relative, imports, timers = {}) {
     const context = { VPN_CORE_AVAILABLE: true, exports: {}, Error, Date, Uint8Array, ArrayBuffer, Promise, URL, TextDecoder, $r: name => name,
@@ -60,9 +60,11 @@ const single = execute('model/NodeImport.ets', { '@kit.ArkTS': sdk });
 const batch = execute('model/NodeBatchImport.ets', { '@kit.ArkTS': sdk, './NodeImport': single });
 const batchLatency = execute('model/BatchLatency.ets', {});
 const adaptiveLayout = execute('model/AdaptiveLayout.ets', {});
+const nodeListFilter = execute('model/NodeListFilter.ets', {});
+const nodeListNavigation = execute('model/NodeListNavigation.ets', {});
 const firstNode = single.parseNode(FIRST);
 const secondNode = single.parseNode(SECOND);
-const savedNode = (node, id = 'node-first', sourceId = '') => ({ ...clone(node), id, sourceId, modifiedAt: 1 });
+const savedNode = (node, id = 'node-first', sourceId = '') => ({ ...clone(node), id, sourceId, modifiedAt: 1, favorite: false });
 
 function harness(options = {}) {
     const state = {
@@ -74,7 +76,7 @@ function harness(options = {}) {
         probeState: { phase: 'idle', kind: 'lifecycle', runId: '', detail: '', updatedAt: 1789000000000 },
         connectionStatus: undefined, command: undefined, commands: [], latencyRequests: [], latencyProofs: [],
         latencyRecords: [], latencyReads: 0, hashRequests: [], vpnStarts: [], measurements: [], processAlive: true, processCheckThrows: false,
-        dialogs: [], backs: 0, backThrows: false, profileReadsThrow: false, addressWrites: 0
+        dialogs: [], backs: 0, backThrows: false, profileReadsThrow: false, addressWrites: 0, routeParams: {}, routes: []
     };
     const timers = {
         setTimeout(callback, delay) { const id = state.nextTimer++; state.timers.set(id, { callback, delay, kind: 'timeout' }); return id; },
@@ -134,14 +136,20 @@ function harness(options = {}) {
             allowed(); state.catalog.subscriptions = state.catalog.subscriptions.filter(s => s.id !== id);
             state.catalog.nodes = state.catalog.nodes.filter(n => n.sourceId !== id); state.writes.push('delete-subscription');
         },
-        selectCatalogNode(_, id) { allowed(); state.catalog.activeNodeId = id; state.writes.push('select'); },
+        selectCatalogNode(_, id) { allowed(); state.catalog.activeNodeId = id; state.writes.push('select'); if(options.mutationReadbackError)state.mode='catalog-read-error'; },
+        setCatalogNodeFavorite(_, id, favorite) {
+            allowed(); const node = state.catalog.nodes.find(n => n.id === id); assert(node);
+            if (state.mode === 'write-error') throw RAW_ERROR;
+            node.favorite = favorite; state.writes.push('favorite'); if(options.mutationReadbackError)state.mode='catalog-read-error';
+        },
         renameCatalogNode(_, id, name) {
-            allowed(); const node = state.catalog.nodes.find(n => n.id === id); assert(node); node.name = name; state.writes.push('rename');
+            allowed(); const node = state.catalog.nodes.find(n => n.id === id); assert(node); node.name = name; state.writes.push('rename'); if(options.mutationReadbackError)state.mode='catalog-read-error';
         },
         deleteCatalogNode(_, id) {
             allowed(); state.catalog.nodes = state.catalog.nodes.filter(n => n.id !== id);
             if (state.catalog.activeNodeId === id) state.catalog.activeNodeId = state.catalog.nodes[0]?.id || '';
             state.writes.push('delete');
+            if(options.mutationReadbackError)state.mode='catalog-read-error';
         }
     };
     function createHttp() {
@@ -175,8 +183,11 @@ function harness(options = {}) {
         'libvpnbridge.so': { default: { processAlive: () => { if (state.processCheckThrows) throw RAW_ERROR; return state.processAlive; } } },
         '../model/BatchLatency': batchLatency,
         '../model/AdaptiveLayout': adaptiveLayout,
+        '../model/NodeListFilter': nodeListFilter,
+        '../model/NodeListNavigation': nodeListNavigation,
         '../model/BuildCapabilities': { VPN_CORE_AVAILABLE: true },
         '@kit.AbilityKit': {},
+        '@kit.ArkUI': { router: { RouterMode: { Single: 1 } } },
         '@kit.NetworkKit': { vpnExtension: {
             startVpnExtensionAbility(want) {
                 const start = { want: clone(want) }; state.vpnStarts.push(start);
@@ -274,7 +285,9 @@ function harness(options = {}) {
         } });
         const instance = new api[name]();
         instance.getUIContext = () => ({ getHostContext: () => ({ filesDir: 'synthetic-memory-only' }),
-            getRouter: () => ({ back() { if (state.backThrows) throw RAW_ERROR; state.backs++; } }),
+            getRouter: () => ({ getParams: () => state.routeParams,
+                replaceUrl(options, mode) { state.routes.push({ options: clone(options), mode }); return Promise.resolve(); },
+                back() { if (state.backThrows) throw RAW_ERROR; state.backs++; } }),
             getPromptAction: () => ({ showDialog(options) {
                 const dialog = { options }; state.dialogs.push(dialog);
                 return new Promise((resolve, reject) => { dialog.resolve = resolve; dialog.reject = reject; });
@@ -1310,9 +1323,94 @@ function casesNodePerformance() {
     return cases;
 }
 
+function casesNodeCollection() {
+    const cases = [], add = (name, run) => cases.push({ name: 'Node collection: ' + name, run });
+    add('source, favorites, import-result and case-insensitive search intersect without mutating catalog', () => {
+        const h = harness(), p = h.page('Nodes');
+        h.state.catalog.nodes = [savedNode(firstNode, 'manual'), savedNode(secondNode, 'source-match', 'source-a'),
+            savedNode(secondNode, 'source-other', 'source-b')];
+        h.state.catalog.nodes[1].favorite = true; h.state.catalog.nodes[2].favorite = true;
+        p.nodes = clone(h.state.catalog.nodes); const original = JSON.stringify(p.nodes);
+        p.sourceFilterId = 'source-a'; p.favoritesOnly = true; p.search = ' TROJAN ';
+        p.importedOnly = true; p.importedNodeIds = ['manual', 'source-match'];
+        assert.deepEqual(Array.from(p.filtered(), n => n.id), ['source-match']);
+        assert.equal(JSON.stringify(p.nodes), original); assert.equal(h.state.writes.length, 0);
+    });
+    add('manual source and missing imported identities never widen to all sources', () => {
+        const h = harness(), p = h.page('Nodes'); p.nodes = [savedNode(firstNode), savedNode(secondNode, 'remote', 'source-a')];
+        p.sourceFilterId = '$manual'; assert.equal(p.filtered().length, 1);
+        p.importedOnly = true; p.importedNodeIds = ['deleted']; assert.equal(p.filtered().length, 0);
+        p.clearFilters(); assert.equal(p.filtered().length, 2);
+    });
+    add('favorite changes metadata while retaining selection and outbound', () => {
+        const h = harness(), p = h.page('Nodes'); p.reload(); const original = clone(h.state.catalog);
+        p.toggleFavorite('node-old'); assert.equal(h.state.catalog.nodes[0].favorite, true);
+        assert.equal(h.state.catalog.activeNodeId, original.activeNodeId);
+        assert.equal(h.state.catalog.nodes[0].outboundJson, original.nodes[0].outboundJson);
+        p.toggleFavorite('node-old'); assert.equal(h.state.catalog.nodes[0].favorite, false);
+    });
+    add('favorite is guarded and failed writes do not optimistically change UI state', () => {
+        const h = harness(), p = h.page('Nodes'); p.reload(); h.state.allowed = false;
+        p.toggleFavorite('node-old'); assert.equal(h.state.writes.length, 0);
+        h.state.allowed = true; h.state.mode = 'write-error'; p.toggleFavorite('node-old');
+        assert.equal(p.nodes[0].favorite, false); assert.match(p.message, /未保存/); noVisibleSecrets(p, h.state);
+    });
+    for (const operation of ['favorite','select','rename','delete']) {
+        add(operation + ' distinguishes committed mutation from unconfirmed list readback', () => {
+            const h = harness({mutationReadbackError:true}), p = h.page('Nodes'); p.reload();
+            if(operation==='favorite')p.toggleFavorite('node-old');
+            if(operation==='select')p.select('node-old');
+            if(operation==='rename'){p.renameId='node-old';p.renameText='Saved name';p.rename();}
+            if(operation==='delete')p.remove('node-old');
+            assert(h.state.writes.includes(operation)); assert.equal(p.catalogReadable,false); assert.equal(p.editable,false);
+            assert.match(p.message, /已保存|已提交/); assert.match(p.message,/读取未确认/);
+            assert(!/未保存|原节点已保留/.test(p.message)); noVisibleSecrets(p,h.state);
+        });
+    }
+    add('a consumed import request does not override later user filters after page return', () => {
+        const h = harness(), p = h.page('Nodes'); p.reload();
+        h.state.routeParams = new nodeListNavigation.ImportedNodesNavigation(['node-old'], UUID);
+        p.applyImportedNavigation(); assert.equal(p.importedOnly, true);
+        p.clearFilters(); p.search = 'mine'; p.applyImportedNavigation();
+        assert.equal(p.importedOnly, false); assert.equal(p.search, 'mine');
+    });
+    add('an import route retains a catalog read error and waits for a successful reload', () => {
+        const h = harness(), p = h.page('Nodes'); p.reload();
+        h.state.routeParams = new nodeListNavigation.ImportedNodesNavigation(['node-old'], UUID);
+        h.state.mode = 'catalog-read-error'; p.reload(); const failure = p.message;
+        p.applyImportedNavigation(); assert.equal(p.message, failure); assert.match(p.message, /读取失败/);
+        assert.equal(p.consumedImportRequest, ''); assert.equal(p.importedOnly, false);
+        h.state.mode = ''; p.reload(); p.applyImportedNavigation();
+        assert.equal(p.importedOnly, true); assert.equal(p.consumedImportRequest, UUID); assert.equal(p.message, '');
+        p.clearFilters(); p.applyImportedNavigation(); assert.equal(p.importedOnly, false);
+    });
+    add('a fresh receipt for the same node opens its result again without selection or writes', () => {
+        const h = harness(), p = h.page('Nodes'); p.reload();
+        h.state.routeParams = new nodeListNavigation.ImportedNodesNavigation(['node-old'], UUID);
+        p.applyImportedNavigation(); p.clearFilters();
+        h.state.routeParams = new nodeListNavigation.ImportedNodesNavigation(['node-old'], '00000000-0000-4000-8000-000000000123');
+        p.applyImportedNavigation(); assert.equal(p.importedOnly, true); assert.equal(p.detailNodeId, 'node-old');
+        assert.equal(h.state.writes.length, 0);
+    });
+    add('viewing another node only changes detail focus', () => {
+        const h = harness(), p = h.page('Nodes'); p.windowWidthVp = 1440;
+        p.inspectNode('different-node'); assert.equal(p.detailNodeId, 'different-node');
+        assert.equal(h.state.catalog.activeNodeId, 'node-old'); assert.equal(h.state.writes.length, 0);
+    });
+    add('same-id reload reads current row metadata and second rename starts from the saved name', () => {
+        const h = harness(), p = h.page('Nodes'); p.reload(); const old = p.nodes[0];
+        h.state.catalog.nodes[0].name = 'Updated synthetic name'; h.state.catalog.nodes[0].favorite = true;
+        p.reload(); assert.notEqual(p.nodes[0], old); assert.equal(p.isFavorite(old.id), true);
+        assert.equal(p.nodeById(old.id).name, 'Updated synthetic name');
+        p.prepareRename(old.id); assert.equal(p.renameText, 'Updated synthetic name');
+        assert.equal(h.state.writes.length, 0);
+    });
+    return cases;
+}
+
 async function main() {
     const passed = [], failed = [];
-    for (const test of [...casesNodeConfig(), ...casesNodeForm(), ...casesNodeScan(), ...casesSubscriptions(), ...casesNodes(), ...casesNodeLatency(), ...casesBatchLatency(), ...casesNodePerformance()]) {
+    for (const test of [...casesNodeConfig(), ...casesNodeForm(), ...casesNodeScan(), ...casesSubscriptions(), ...casesNodes(), ...casesNodeLatency(), ...casesBatchLatency(), ...casesNodePerformance(), ...casesNodeCollection()]) {
         try { await test.run(); passed.push(test.name); }
         catch (error) { failed.push({ name: test.name, error: error.message }); }
     }

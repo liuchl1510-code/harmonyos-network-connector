@@ -250,7 +250,7 @@ test('Backup round trip contains names, subscription metadata, stable IDs and ac
   const f = fixture(); store(f); f.catalog.saveSubscriptionWithNodes(dir, '', 'Source', 'https://subscription.invalid/list?token=synthetic', [f.node(3)]);
   f.catalog.selectCatalogNode(dir, f.read().nodes[2].id); const before = f.read(), count = f.state.renames;
   const text = f.catalog.exportNodeCatalogBackup(dir), envelope = JSON.parse(text);
-  assert.equal(envelope.format, 'harmony-vpn-node-backup'); assert.equal(envelope.schemaVersion, 1); assert.equal(typeof envelope.exportedAt, 'number');
+  assert.equal(envelope.format, 'harmony-vpn-node-backup'); assert.equal(envelope.schemaVersion, 2); assert.equal(typeof envelope.exportedAt, 'number');
   assert.deepEqual(plain(f.catalog.previewNodeCatalogBackup(text)), plain(before)); assert.equal(f.state.renames, count);
 });
 test('Restore atomically replaces nodes and subscriptions while incrementing the local revision', () => {
@@ -264,7 +264,7 @@ test('Restore atomically replaces nodes and subscriptions while incrementing the
 test('Preview rejects malformed schemas, dangling IDs, duplicates and invalid subscription URLs', () => {
   const f = fixture(); store(f); f.catalog.saveSubscriptionWithNodes(dir, '', 'Source', 'https://subscription.invalid/list', [f.node(3)]);
   const text = f.catalog.exportNodeCatalogBackup(dir);
-  const changes = [b => { b.schemaVersion = 2; }, b => { b.extra = 'private-value'; }, b => { b.catalog.extra = 1; },
+  const changes = [b => { b.schemaVersion = 3; }, b => { b.extra = 'private-value'; }, b => { b.catalog.extra = 1; },
     b => { b.catalog.activeNodeId = 'missing'; }, b => { b.catalog.nodes[0].sourceId = 'missing'; },
     b => { b.catalog.nodes[1].outboundJson = b.catalog.nodes[0].outboundJson; },
     b => { b.catalog.subscriptions[0].url = 'http://insecure.invalid'; }, b => { b.catalog.nodes[0].id = '../escape'; }];

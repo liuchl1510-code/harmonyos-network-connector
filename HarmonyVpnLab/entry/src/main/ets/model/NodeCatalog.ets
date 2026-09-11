@@ -17,6 +17,7 @@ export class SavedNode {
   outboundJson: string;
   sourceId: string;
   modifiedAt: number;
+  favorite: boolean = false;
   constructor(id: string, node: ImportedNode, sourceId: string, modifiedAt: number = Date.now()) {
     this.id = id;
     this.name = node.name;
@@ -41,7 +42,7 @@ export class SubscriptionSource {
 }
 
 export class NodeCatalog {
-  schemaVersion: number = 1;
+  schemaVersion: number = 2;
   revision: number = 0;
   activeNodeId: string = '';
   nodes: SavedNode[] = [];
@@ -61,7 +62,7 @@ export class NodeImportResult {
 
 class NodeCatalogBackup {
   format: string = 'harmony-vpn-node-backup';
-  schemaVersion: number = 1;
+  schemaVersion: number = 2;
   exportedAt: number = Date.now();
   catalog: NodeCatalog;
   constructor(catalog: NodeCatalog) { this.catalog = catalog; }
@@ -123,7 +124,7 @@ function subscriptionUrl(value: string): string {
 
 function validateCatalog(catalog: NodeCatalog): NodeCatalog {
   exactKeys(catalog, ['schemaVersion', 'revision', 'activeNodeId', 'nodes', 'subscriptions']);
-  if (catalog.schemaVersion !== 1 || !wholeNumber(catalog.revision) ||
+  if ((catalog.schemaVersion !== 1 && catalog.schemaVersion !== 2) || !wholeNumber(catalog.revision) ||
     typeof catalog.activeNodeId !== 'string' || !Array.isArray(catalog.nodes) ||
     !Array.isArray(catalog.subscriptions) || catalog.nodes.length > MAX_NODES ||
     catalog.subscriptions.length > MAX_SUBSCRIPTIONS) { throw new Error(CATALOG_ERROR); }
@@ -140,9 +141,12 @@ function validateCatalog(catalog: NodeCatalog): NodeCatalog {
   const nodeIds: Set<string> = new Set<string>();
   const outbounds: Set<string> = new Set<string>();
   for (const node of catalog.nodes) {
-    exactKeys(node, ['id', 'name', 'protocol', 'outboundJson', 'sourceId', 'modifiedAt']);
+    exactKeys(node, catalog.schemaVersion === 1 ?
+      ['id', 'name', 'protocol', 'outboundJson', 'sourceId', 'modifiedAt'] :
+      ['id', 'name', 'protocol', 'outboundJson', 'sourceId', 'modifiedAt', 'favorite']);
     if (!validId(node.id) || nodeIds.has(node.id) || typeof node.sourceId !== 'string' ||
-      (node.sourceId !== '' && !sourceIds.has(node.sourceId)) || !wholeNumber(node.modifiedAt)) {
+      (node.sourceId !== '' && !sourceIds.has(node.sourceId)) || !wholeNumber(node.modifiedAt) ||
+      (catalog.schemaVersion === 2 && typeof node.favorite !== 'boolean')) {
       throw new Error(CATALOG_ERROR);
     }
     const parsed = normalizeNode(new ImportedNode(node.name, node.protocol, node.outboundJson));
@@ -154,6 +158,13 @@ function validateCatalog(catalog: NodeCatalog): NodeCatalog {
   }
   if ((catalog.activeNodeId === '' && catalog.nodes.length !== 0) ||
     (catalog.activeNodeId !== '' && !nodeIds.has(catalog.activeNodeId))) { throw new Error(CATALOG_ERROR); }
+  // Validate the complete original schema before adding defaults. Reads and
+  // backup previews migrate only this in-memory value, preserving disk bytes and
+  // revision; the next actual mutation atomically commits the current schema.
+  if (catalog.schemaVersion === 1) {
+    for (const node of catalog.nodes) { node.favorite = false; }
+    catalog.schemaVersion = 2;
+  }
   return catalog;
 }
 
@@ -283,6 +294,16 @@ export function renameCatalogNode(filesDir: string, id: string, name: string): v
   writeCatalog(filesDir, catalog);
 }
 
+export function setCatalogNodeFavorite(filesDir: string, id: string, favorite: boolean): void {
+  assertNodeManagementAllowed(filesDir);
+  if (typeof favorite !== 'boolean') { throw new Error('收藏状态无效，未保存。'); }
+  const catalog = readNodeCatalog(filesDir);
+  const node = requireNode(catalog, id);
+  if (node.favorite === favorite) { return; }
+  node.favorite = favorite;
+  writeCatalog(filesDir, catalog);
+}
+
 export function deleteCatalogNode(filesDir: string, id: string): void {
   assertNodeManagementAllowed(filesDir);
   const catalog = readNodeCatalog(filesDir);
@@ -352,8 +373,10 @@ export function previewNodeCatalogBackup(text: string): NodeCatalog {
       byteLength(text) > MAX_BACKUP_BYTES) { throw new Error('invalid'); }
     const backup = JSON.parse(text) as NodeCatalogBackup;
     exactKeys(backup, ['format', 'schemaVersion', 'exportedAt', 'catalog']);
-    if (backup.format !== 'harmony-vpn-node-backup' || backup.schemaVersion !== 1 ||
-      !wholeNumber(backup.exportedAt)) { throw new Error('invalid'); }
+    if (backup.format !== 'harmony-vpn-node-backup' ||
+      (backup.schemaVersion !== 1 && backup.schemaVersion !== 2) ||
+      !wholeNumber(backup.exportedAt) || !backup.catalog ||
+      backup.catalog.schemaVersion !== backup.schemaVersion) { throw new Error('invalid'); }
     const catalog = validateCatalog(backup.catalog);
     if (byteLength(JSON.stringify(catalog)) > MAX_FILE_BYTES) { throw new Error('invalid'); }
     return catalog;

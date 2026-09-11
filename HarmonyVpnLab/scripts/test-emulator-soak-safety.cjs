@@ -62,9 +62,9 @@ const passed=[];async function test(name,fn){await fn();passed.push(name);}
  if(process.argv[2]==='--interruption-child'){await fixture({activity:'idle',realOutput:process.argv[3],blockAfterSamples:2}).api.main();return;}
  await test('invalid target is refused before any command',()=>assert.throws(()=>fixture({target:'USB_PHONE'})));
  await test('unknown activity is refused',()=>assert.throws(()=>fixture({activity:'connect'})));
- await test('unknown phase is refused before any output or device command',()=>assert.throws(()=>fixture({phase:'phase16'})));
- await test('phase15 uses its own output and installation record and is forwarded to every UI helper',async()=>{
-  const f=fixture({phase:'phase15',activity:'inspection'});await f.api.main();assert.equal(f.summary().outcome,'completed');assert.equal(f.summary().phase,'phase15');assert.equal(f.manifest().request.phase,'phase15');assert(f.state.ui.includes('Inspect'));assert([...f.state.files.keys()].every(p=>p.includes('phase15-soak')));
+ await test('unknown phase is refused before any output or device command',()=>assert.throws(()=>fixture({phase:'phase99'})));
+ for (const phase of ['phase15','phase16']) await test(phase+' uses its own output and installation record and is forwarded to every UI helper',async()=>{
+  const f=fixture({phase,activity:'inspection'});await f.api.main();assert.equal(f.summary().outcome,'completed');assert.equal(f.summary().phase,phase);assert.equal(f.manifest().request.phase,phase);assert(f.state.ui.includes('Inspect'));assert([...f.state.files.keys()].every(p=>p.includes(phase+'-soak')));
  });
  await test('existing output directory cannot be overwritten',()=>assert.throws(()=>fixture({existingOutput:true})));
  await test('manifest and initial checkpoint identify the run before any device command',()=>{

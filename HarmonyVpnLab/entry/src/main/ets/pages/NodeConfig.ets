@@ -6,8 +6,10 @@ import { importManualNodes, readNodeCatalog } from '../model/NodeCatalog';
 import { nodeServerAddress, readNodeProfile, updateNodeServerAddress } from '../model/NodeProfile';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { util } from '@kit.ArkTS';
+import { router } from '@kit.ArkUI';
 import { assertNodeManagementAllowed, isNodeManagementAllowed } from '../model/NodeEditGuard';
 import { formContentWidth } from '../model/AdaptiveLayout';
+import { ImportedNodesNavigation, readImportedNodeIds } from '../model/NodeListNavigation';
 
 interface ScanFailure { code?: number; }
 
@@ -28,6 +30,8 @@ struct NodeConfig {
   @State editable: boolean = false;
   @State confirmingLeave: boolean = false;
   @State leaving: boolean = false;
+  @State importedNodeIds: string[] = [];
+  private importedRequestId: string = '';
   private pendingNodes: ImportedNode[] = [];
   private scanEpoch: number = 0;
   private pageEpoch: number = 0;
@@ -39,6 +43,7 @@ struct NodeConfig {
     this.refreshEditable();
     // Loading an earlier profile is not evidence that a new import succeeded.
     this.saveReceipt = '尚未生成本次保存回执';
+    this.clearImportedNavigation();
     try {
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const saved = readNodeProfile(context.filesDir);
@@ -46,7 +51,7 @@ struct NodeConfig {
       this.savedAddress = saved ? nodeServerAddress(saved) : '';
     } catch (_) { this.savedAddress = ''; this.message = '当前节点无法读取，原数据已保留，请返回列表后重试。'; }
   }
-  onPageShow(): void { this.refreshEditable(); }
+  onPageShow(): void { this.leaving = false; this.refreshEditable(); }
   // Hiding under the system scanner must not invalidate its pending result.
   onPageHide(): void { this.pageEpoch++; this.leaveRequest++; this.confirmingLeave = false; }
 
@@ -125,6 +130,7 @@ struct NodeConfig {
 
   private save(): void {
     if (this.scanning || this.confirmingLeave || this.leaving || this.input.trim().length === 0) { return; }
+    this.clearImportedNavigation();
     this.refreshEditable();
     if (!this.editable) { this.message = '请先断开连接并等待清理完成，再保存节点。'; return; }
     this.saveReceipt = '本次保存正在校验';
@@ -145,6 +151,7 @@ struct NodeConfig {
 
   private async scan(): Promise<void> {
     if (this.scanning || this.confirmingLeave || this.leaving || this.input.trim().length > 0) { return; }
+    this.clearImportedNavigation();
     this.scanSupported = this.scannerAvailable();
     if (!this.scanSupported) {
       this.message = '此设备不支持系统扫码，可粘贴分享链接或单个 outbound JSON，也可从设置恢复节点备份。';
@@ -184,15 +191,23 @@ struct NodeConfig {
       const result = importManualNodes(context.filesDir, nodes);
       committed = true;
       const catalog = readNodeCatalog(context.filesDir);
-      if (!nodes.every((node: ImportedNode) => catalog.nodes.some((saved) => saved.outboundJson === node.outboundJson))) {
-        throw new Error('保存后的节点列表未通过读回校验');
+      const confirmedIds: string[] = [];
+      for (const node of nodes) {
+        const saved = catalog.nodes.find((entry) => entry.outboundJson === node.outboundJson);
+        if (!saved) { throw new Error('保存后的节点列表未通过读回校验'); }
+        if (!confirmedIds.includes(saved.id)) { confirmedIds.push(saved.id); }
       }
       const active = readNodeProfile(context.filesDir);
       this.savedAddress = active ? nodeServerAddress(active) : '';
-      const receipt = '保存回执：' + util.generateRandomUUID();
+      const requestId = util.generateRandomUUID();
+      const navigationIds = readImportedNodeIds(new ImportedNodesNavigation(confirmedIds, requestId));
+      if (navigationIds.length === 0) { throw new Error('保存后的节点列表未通过读回校验'); }
+      const receipt = '保存回执：' + requestId;
       this.input = ''; this.pendingNodes = []; this.partialCount = 0;
       this.message = `已新增 ${result.added} 个节点，跳过 ${result.duplicates} 个已有节点。可返回节点列表选择连接。`;
       this.saveReceipt = receipt;
+      this.importedNodeIds = navigationIds;
+      this.importedRequestId = requestId;
       try { hilog.info(0x0000, 'HarmonyVpnLab', 'NODE_BATCH_SAVED added=%{public}d duplicates=%{public}d', result.added, result.duplicates); }
       catch (_) { /* Logging cannot turn a confirmed commit into a failure. */ }
     } catch (error) {
@@ -203,17 +218,48 @@ struct NodeConfig {
 
   private savePartial(): void {
     if (this.scanning || this.confirmingLeave || this.leaving || this.pendingNodes.length === 0) { return; }
+    this.clearImportedNavigation();
     this.refreshEditable();
     if (!this.editable) { this.message = '请先断开连接并等待清理完成，再保存节点。'; return; }
     try { this.persist(this.pendingNodes); }
     catch (error) { this.saveReceipt = '本次保存未完成'; this.message = this.importError(error as Error); }
   }
 
-  private clearDraft(): void { this.scanEpoch++; this.scanning = false; this.input = ''; this.pendingNodes = []; this.partialCount = 0; this.replacementAddress = ''; }
+  private clearImportedNavigation(): void { this.importedNodeIds = []; this.importedRequestId = ''; }
+
+  private changeInput(value: string): void {
+    if (this.input !== value) { this.clearImportedNavigation(); }
+    this.input = value;
+    this.pendingNodes = []; this.partialCount = 0;
+    if (value.length > 0) { this.saveReceipt = '尚未生成本次保存回执'; }
+  }
+
+  private changeReplacementAddress(value: string): void {
+    if (this.replacementAddress !== value) { this.clearImportedNavigation(); }
+    this.replacementAddress = value;
+  }
+
+  private async viewImportedNodes(): Promise<void> {
+    if (this.scanning || this.confirmingLeave || this.leaving || this.hasDraft() || this.importedNodeIds.length === 0) { return; }
+    const params = new ImportedNodesNavigation(this.importedNodeIds, this.importedRequestId);
+    if (readImportedNodeIds(params).length === 0) { this.clearImportedNavigation(); return; }
+    const epoch = this.pageEpoch;
+    this.leaving = true;
+    try {
+      await this.getUIContext().getRouter().replaceUrl({ url: 'pages/Nodes', params }, router.RouterMode.Single);
+    } catch (_) {
+      if (epoch === this.pageEpoch) {
+        this.leaving = false; this.message = '节点已保存，列表暂未打开，请重试。';
+      }
+    }
+  }
+
+  private clearDraft(): void { this.scanEpoch++; this.scanning = false; this.input = ''; this.pendingNodes = []; this.partialCount = 0; this.replacementAddress = ''; this.clearImportedNavigation(); }
   aboutToDisappear(): void { this.pageEpoch++; this.leaveRequest++; this.confirmingLeave = false; this.clearDraft(); }
 
   private updateAddress(): void {
     if (this.scanning || this.confirmingLeave || this.leaving || this.replacementAddress.trim().length === 0) { return; }
+    this.clearImportedNavigation();
     this.refreshEditable();
     if (!this.editable) { this.message = '请先断开连接并等待清理完成，再修改服务器地址。'; return; }
     this.saveReceipt = '尚未生成本次保存回执';
@@ -283,13 +329,8 @@ struct NodeConfig {
               .width('100%').constraintSize({ minHeight: 200, maxHeight: 360 }).fontSize(15)
               .fontColor($r('app.color.text_primary')).placeholderColor($r('app.color.text_secondary'))
               .backgroundColor($r('app.color.surface_secondary')).borderRadius(14)
-              .maxLength(1048576).enabled(!this.scanning && !this.confirmingLeave && !this.leaving).onChange((value: string) => {
-                this.input = value;
-                this.pendingNodes = []; this.partialCount = 0;
-                if (value.length > 0) {
-                  this.saveReceipt = '尚未生成本次保存回执';
-                }
-              });
+              .maxLength(1048576).enabled(!this.scanning && !this.confirmingLeave && !this.leaving)
+              .onChange((value: string) => { this.changeInput(value); });
             Button('解析并保存').id('saveNode').width('100%').constraintSize({ minHeight: 50 })
               .fontSize(16).fontWeight(FontWeight.Medium).backgroundColor($r('app.color.accent')).fontColor(Color.White)
               .enabled(this.editable && !this.scanning && !this.confirmingLeave && !this.leaving && this.input.trim().length > 0)
@@ -305,6 +346,13 @@ struct NodeConfig {
               .fontColor(this.partialCount > 0 ? $r('app.color.warning') : $r('app.color.text_primary'));
             Text(this.message).id('nodeSaveResult').fontSize(15).fontColor($r('app.color.text_primary'))
               .width('100%').wordBreak(WordBreak.BREAK_ALL);
+            if (this.importedNodeIds.length > 0) {
+              Button('查看导入的节点').id('viewImportedNodes').width('100%')
+                .constraintSize({ minHeight: 48 }).fontSize(16)
+                .backgroundColor($r('app.color.accent')).fontColor(Color.White)
+                .enabled(!this.scanning && !this.confirmingLeave && !this.leaving && !this.hasDraft())
+                .onClick(() => { void this.viewImportedNodes(); });
+            }
             if (this.partialCount > 0) {
               Button(`仅导入 ${this.partialCount} 个可用节点`).id('confirmPartialImport').width('100%')
                 .constraintSize({ minHeight: 48 }).fontSize(15)
@@ -340,7 +388,7 @@ struct NodeConfig {
                   .fontColor($r('app.color.text_primary')).placeholderColor($r('app.color.text_secondary'))
                   .backgroundColor($r('app.color.surface_secondary')).borderRadius(12)
                   .enabled(!this.scanning && !this.confirmingLeave && !this.leaving)
-                  .onChange((value: string) => { this.replacementAddress = value; });
+                  .onChange((value: string) => { this.changeReplacementAddress(value); });
                 Button('更新服务器地址').id('updateNodeHost').width('100%').constraintSize({ minHeight: 48 })
                   .fontSize(15).fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
                   .enabled(this.editable && !this.scanning && !this.confirmingLeave && !this.leaving && this.replacementAddress.trim().length > 0)

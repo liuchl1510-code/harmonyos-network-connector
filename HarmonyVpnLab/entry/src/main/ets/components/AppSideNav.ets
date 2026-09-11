@@ -7,11 +7,11 @@ export struct AppSideNav {
   build() {
     Scroll() {
     Column({ space: 12 }) {
-      Row({ space: 8 }) {
+      Column({ space: 8 }) {
         Image($r('app.media.ic_shield')).width(24).height(24).fillColor($r('app.color.accent'));
         Text('Harmony VPN').fontSize(16).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
-          .layoutWeight(1).maxLines(2);
-      }.width('100%').padding({ top: 16, bottom: 24, left: 4, right: 4 });
+          .width('100%').maxLines(2).wordBreak(WordBreak.NORMAL);
+      }.width('100%').alignItems(HorizontalAlign.Start).padding({ top: 16, bottom: 24, left: 4, right: 4 });
       this.item('home', '连接', $r('app.media.ic_power'), 'navHome');
       this.item('nodes', '节点', $r('app.media.ic_nodes'), 'navNodes');
       this.item('settings', '设置', $r('app.media.ic_settings'), 'navSettings');

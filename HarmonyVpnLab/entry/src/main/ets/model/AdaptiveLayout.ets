@@ -26,5 +26,13 @@ export function homeUsesColumns(width: number): boolean {
 }
 
 export function nodeListContentWidth(width: number): number {
-  return Math.min(contentViewportWidth(width), 1040);
+  return Math.min(contentViewportWidth(width), 1200);
+}
+
+export function nodeListUsesDetails(width: number): boolean {
+  return nodeListContentWidth(width) >= 1020;
+}
+
+export function nodeListPaneWidth(width: number): number {
+  return Math.max(1, nodeListContentWidth(width) - 40 - (nodeListUsesDetails(width) ? 316 : 0));
 }

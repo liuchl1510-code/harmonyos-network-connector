@@ -109,8 +109,163 @@ function unchanged(f, run) {
 }
 test('empty store has no active node and does not write', () => {
   const f = fixture(); assert.equal(f.read().nodes.length, 0); assert.equal(f.catalog.readActiveNode(dir), undefined);
-  assert.equal(f.files.size, 0);
+  assert.equal(f.read().schemaVersion, 2); assert.equal(f.files.size, 0);
 });
+
+function asV1(catalog) {
+  const old = JSON.parse(JSON.stringify(catalog)); old.schemaVersion = 1;
+  for (const node of old.nodes) delete node.favorite;
+  return old;
+}
+
+test('strict v1 catalog migrates in memory without write guard or revision change', () => {
+  const f = fixture(); f.catalog.importManualNodes(dir, [f.node(1), f.node(2)]);
+  const old = asV1(f.read()); old.revision = 37; f.raw(old);
+  const before = f.bytes(), renames = f.state.renames, guards = f.state.guardCalls;
+  f.state.allowed = false;
+  const migrated = f.read();
+  assert.equal(migrated.schemaVersion, 2); assert.equal(migrated.revision, 37);
+  assert(migrated.nodes.every(node => node.favorite === false));
+  assert.equal(JSON.stringify(asV1(migrated)), JSON.stringify(old));
+  assert.equal(f.catalog.readActiveNode(dir).outboundJson, old.nodes[0].outboundJson);
+  const backup = JSON.parse(f.catalog.exportNodeCatalogBackup(dir));
+  assert.equal(backup.schemaVersion, 2); assert.equal(backup.catalog.schemaVersion, 2);
+  assert.equal(backup.catalog.revision, 37);
+  assert.equal(f.bytes(), before); assert.equal(f.state.renames, renames);
+  assert.equal(f.state.guardCalls, guards);
+});
+
+test('empty v1 catalog upgrades read-only and commits v2 on the next import', () => {
+  const f = fixture(); const old = asV1(f.read()); old.revision = 5; f.raw(old);
+  const before = f.bytes(); assert.equal(f.read().schemaVersion, 2); assert.equal(f.bytes(), before);
+  f.catalog.importManualNodes(dir, [f.node(1)]);
+  const disk = JSON.parse(f.bytes()); assert.equal(disk.schemaVersion, 2); assert.equal(disk.revision, 6);
+  assert.equal(disk.nodes[0].favorite, false); assert.equal(f.state.renames, 1);
+});
+
+test('v1 no-op selection, import and favorite leave the original bytes untouched', () => {
+  const f = fixture(); f.catalog.importManualNodes(dir, [f.node(1)]); f.raw(asV1(f.read()));
+  const before = f.bytes(), active = f.read().activeNodeId, renames = f.state.renames;
+  f.catalog.selectCatalogNode(dir, active); f.catalog.importManualNodes(dir, [f.node(1)]);
+  f.catalog.setCatalogNodeFavorite(dir, active, false);
+  assert.equal(f.bytes(), before); assert.equal(f.state.renames, renames);
+});
+
+test('favorite commits v1 migration in one revision and is idempotent', () => {
+  const f = fixture(); f.catalog.importManualNodes(dir, [f.node(1), f.node(2)]); f.raw(asV1(f.read()));
+  const old = f.read(), target = old.nodes[1], renames = f.state.renames;
+  f.catalog.setCatalogNodeFavorite(dir, target.id, true);
+  const disk = JSON.parse(f.bytes()); assert.equal(disk.schemaVersion, 2);
+  assert.equal(disk.revision, old.revision + 1); assert.equal(disk.activeNodeId, old.activeNodeId);
+  assert.equal(disk.nodes[1].favorite, true); assert.equal(disk.nodes[0].favorite, false);
+  assert.equal(disk.nodes[1].modifiedAt, target.modifiedAt); assert.equal(f.state.renames, renames + 1);
+  const before = f.bytes(); f.catalog.setCatalogNodeFavorite(dir, target.id, true); assert.equal(f.bytes(), before);
+  f.catalog.setCatalogNodeFavorite(dir, target.id, false);
+  assert.equal(f.read().nodes[1].favorite, false); assert.equal(f.read().revision, old.revision + 2);
+});
+
+test('favorite rejects a missing identity and every non-boolean without changing bytes', () => {
+  const f = fixture(); f.catalog.importManualNodes(dir, [f.node(1)]);
+  unchanged(f, () => f.catalog.setCatalogNodeFavorite(dir, 'missing', true));
+  for (const value of [undefined, null, 0, 1, '', 'false', [], {}, NaN]) {
+    unchanged(f, () => f.catalog.setCatalogNodeFavorite(dir, f.read().activeNodeId, value));
+  }
+});
+
+test('favorite survives duplicate import, rename, identity edit and active profile edit', () => {
+  const f = fixture(); f.catalog.importManualNodes(dir, [f.node(1), f.node(2)]);
+  const id = f.read().activeNodeId; f.catalog.setCatalogNodeFavorite(dir, id, true);
+  const before = f.bytes(); f.catalog.importManualNodes(dir, [f.node(1)]); assert.equal(f.bytes(), before);
+  f.catalog.renameCatalogNode(dir, id, 'Favorite renamed'); assert.equal(f.read().nodes[0].favorite, true);
+  f.catalog.updateCatalogNode(dir, id, f.node(3), f.read().revision);
+  assert.equal(f.read().nodes[0].favorite, true); assert.equal(f.read().nodes[0].id, id);
+  f.profile.updateNodeServerAddress(dir, '192.0.2.10'); assert.equal(f.read().nodes[0].favorite, true);
+  assert.equal(f.read().nodes[1].favorite, false);
+});
+
+test('v1 editor revision stays valid until a genuine mutation commits migration', () => {
+  const f = fixture(); f.catalog.importManualNodes(dir, [f.node(1)]); f.raw(asV1(f.read()));
+  const old = f.read(); f.catalog.updateCatalogNode(dir, old.activeNodeId, f.node(2), old.revision);
+  assert.equal(f.read().revision, old.revision + 1); assert.equal(f.read().nodes[0].favorite, false);
+  unchanged(f, () => f.catalog.updateCatalogNode(dir, old.activeNodeId, f.node(3), old.revision));
+});
+
+test('subscription refresh preserves favorites only for matching retained configurations', () => {
+  const f = fixture(); f.catalog.importManualNodes(dir, [f.node(1)]);
+  const manual = f.read().activeNodeId; f.catalog.setCatalogNodeFavorite(dir, manual, true);
+  f.catalog.saveSubscriptionWithNodes(dir, '', 'Source', 'https://feed.invalid/token', [f.node(2), f.node(3)]);
+  const source = f.read().subscriptions[0].id;
+  const old = f.read().nodes.find(node => node.sourceId === source && node.outboundJson === f.node(2).outboundJson);
+  f.catalog.setCatalogNodeFavorite(dir, old.id, true);
+  f.catalog.replaceSubscriptionNodes(dir, source, [f.node(2), f.node(4), f.node(1)]);
+  assert.equal(f.read().nodes.find(node => node.id === old.id).favorite, true);
+  assert.equal(f.read().nodes.find(node => node.id === manual).favorite, true);
+  assert.equal(f.read().nodes.find(node => node.outboundJson === f.node(4).outboundJson).favorite, false);
+  f.catalog.saveSubscriptionWithNodes(dir, source, 'Source renamed', 'https://feed.invalid/token', [f.node(2), f.node(5)]);
+  assert.equal(f.read().nodes.find(node => node.id === old.id).favorite, true);
+  f.catalog.replaceSubscriptionNodes(dir, source, [f.node(3)]);
+  assert(!f.read().nodes.some(node => node.id === old.id));
+  assert.equal(f.read().nodes.find(node => node.sourceId === source).favorite, false);
+});
+
+for (const version of [1, 2]) {
+  test(`v${version} backup preview is pure and restore preserves the correct favorites`, () => {
+    const f = fixture(); f.catalog.importManualNodes(dir, [f.node(1), f.node(2)]);
+    f.catalog.setCatalogNodeFavorite(dir, f.read().nodes[1].id, true);
+    const backup = JSON.parse(f.catalog.exportNodeCatalogBackup(dir));
+    if (version === 1) { backup.schemaVersion = 1; backup.catalog = asV1(backup.catalog); }
+    const text = JSON.stringify(backup), before = f.bytes(), renames = f.state.renames;
+    const preview = f.catalog.previewNodeCatalogBackup(text);
+    assert.equal(preview.schemaVersion, 2); assert.equal(preview.revision, backup.catalog.revision);
+    assert.equal(preview.nodes[0].favorite, false); assert.equal(preview.nodes[1].favorite, version === 2);
+    assert.equal(f.bytes(), before); assert.equal(f.state.renames, renames);
+    f.catalog.deleteCatalogNode(dir, f.read().nodes[0].id); const revision = f.read().revision;
+    f.catalog.restoreNodeCatalogBackup(dir, text, revision);
+    assert.equal(f.read().revision, revision + 1); assert.equal(f.read().nodes.length, 2);
+    assert.equal(f.read().nodes[1].favorite, version === 2);
+    assert.equal(f.read().activeNodeId, backup.catalog.activeNodeId);
+  });
+}
+
+test('mixed backup envelope and catalog versions are rejected without recovery', () => {
+  const f = fixture(); f.catalog.importManualNodes(dir, [f.node(1)]);
+  for (const [envelope, catalog] of [[1, 2], [2, 1]]) {
+    const backup = JSON.parse(f.catalog.exportNodeCatalogBackup(dir)); backup.schemaVersion = envelope;
+    if (catalog === 1) backup.catalog = asV1(backup.catalog);
+    const text = JSON.stringify(backup);
+    unchanged(f, () => f.catalog.previewNodeCatalogBackup(text));
+    unchanged(f, () => f.catalog.restoreNodeCatalogBackup(dir, text, f.read().revision));
+  }
+});
+
+for (const [name, mutate] of [
+  ['v1 with false favorite', c => { c.schemaVersion = 1; }],
+  ['v1 with true favorite', c => { c.schemaVersion = 1; c.nodes[0].favorite = true; }],
+  ['v2 missing favorite', c => { delete c.nodes[0].favorite; }],
+  ...[null, 0, 1, 'true', [], {}].map((value, index) => [`v2 favorite type ${index}`, c => { c.nodes[0].favorite = value; }])
+]) {
+  test(`catalog and backup fail closed for ${name}`, () => {
+    const f = fixture(); f.catalog.importManualNodes(dir, [f.node(1)]);
+    const raw = JSON.parse(f.bytes()); mutate(raw); f.raw(raw);
+    unchanged(f, () => f.read()); unchanged(f, () => f.catalog.setCatalogNodeFavorite(dir, raw.activeNodeId, true));
+    const text = JSON.stringify({ format: 'harmony-vpn-node-backup', schemaVersion: raw.schemaVersion,
+      exportedAt: 1, catalog: raw });
+    unchanged(f, () => f.catalog.previewNodeCatalogBackup(text));
+  });
+}
+
+for (const version of [1, 2]) {
+  for (const [name, setup] of [['partial write', s => { s.maxWrite = 5; s.failWriteAfter = s.writeCalls + 3; }],
+    ['sync', s => { s.failSync = true; }], ['rename', s => { s.failRename = true; }]]) {
+    test(`v${version} favorite ${name} failure preserves the original catalog`, () => {
+      const f = fixture(); f.catalog.importManualNodes(dir, [f.node(1)]);
+      if (version === 1) f.raw(asV1(f.read()));
+      const id = f.read().activeNodeId; setup(f.state);
+      unchanged(f, () => f.catalog.setCatalogNodeFavorite(dir, id, true));
+      assert.equal(f.read().nodes[0].favorite, false); assert.equal(JSON.parse(f.bytes()).schemaVersion, version);
+    });
+  }
+}
 test('legacy migration is atomic and preserves original bytes', () => {
   const f = fixture(), node = f.node(1, '  legacy\u0000名  ');
   f.files.set(legacyPath, Buffer.from(JSON.stringify(node))); const original = f.files.get(legacyPath);
@@ -238,6 +393,8 @@ test('all explicit mutators reject active connection before any write', () => {
   const active = f.read().activeNodeId; f.state.allowed = false;
   const calls = [() => f.catalog.importManualNodes(dir, [f.node(2)]),
     () => f.catalog.selectCatalogNode(dir, active), () => f.catalog.renameCatalogNode(dir, active, 'other'),
+    () => f.catalog.setCatalogNodeFavorite(dir, active, true),
+    () => f.catalog.setCatalogNodeFavorite(dir, active, false),
     () => f.catalog.deleteCatalogNode(dir, active), () => f.catalog.updateActiveNode(dir, f.node(2)),
     () => f.catalog.saveSubscription(dir, id, 'other', 'https://other.invalid/token'),
     () => f.catalog.saveSubscriptionWithNodes(dir, id, 'other', 'https://other.invalid/token', [f.node(2)]),
@@ -246,7 +403,7 @@ test('all explicit mutators reject active connection before any write', () => {
   for (const run of calls) { const guards = f.state.guardCalls; unchanged(f, run); assert.equal(f.state.guardCalls, guards + 1); }
 });
 for (const [name, mutate] of [
-  ['schema version', value => value.schemaVersion = 2], ['extra field', value => value.extra = 'secret'],
+  ['schema version', value => value.schemaVersion = 3], ['extra field', value => value.extra = 'secret'],
   ['revision', value => value.revision = -1], ['missing active', value => value.activeNodeId = 'missing'],
   ['empty active with nodes', value => value.activeNodeId = ''], ['duplicate ID', value => value.nodes.push(value.nodes[0])],
   ['dangling source', value => value.nodes[0].sourceId = 'missing'],

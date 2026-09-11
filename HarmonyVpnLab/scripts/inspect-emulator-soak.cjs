@@ -56,7 +56,7 @@ function validateManifest(m){
  if(Object.hasOwn(m,'collector'))validateCollector(m.collector);
  requireThat(typeof m.runId==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(m.runId)&&hash(m.script?.sha256)&&timestamp(m.startedAt),'MANIFEST_IDENTITY_INVALID');
  const r=m.request,p=m.plan;
- requireThat(r&&/^127\.0\.0\.1:15\d{3}$/.test(r.target)&&/^[a-z0-9-]{1,64}$/.test(r.label)&&['phase14','phase15'].includes(r.phase)&&['idle','navigation','inspection'].includes(r.activity)&&integer(r.minutes)&&r.minutes>=1&&r.minutes<=180&&integer(r.memoryBreakdownEvery)&&r.memoryBreakdownEvery<=1000&&timestamp(r.hardDeadline),'REQUEST_INVALID');
+ requireThat(r&&/^127\.0\.0\.1:15\d{3}$/.test(r.target)&&/^[a-z0-9-]{1,64}$/.test(r.label)&&['phase14','phase15','phase16'].includes(r.phase)&&['idle','navigation','inspection'].includes(r.activity)&&integer(r.minutes)&&r.minutes>=1&&r.minutes<=180&&integer(r.memoryBreakdownEvery)&&r.memoryBreakdownEvery<=1000&&timestamp(r.hardDeadline),'REQUEST_INVALID');
  const expected=Math.min(r.minutes*60000,Date.parse(r.hardDeadline)-30000-Date.parse(m.startedAt));
  requireThat(p&&p.plannedMillis===expected&&expected>0&&p.hardDeadlineReserveMillis===30000&&p.deadlineLimited===(expected<r.minutes*60000)&&timestamp(p.observationEndsAt)&&Date.parse(p.observationEndsAt)===Date.parse(m.startedAt)+expected,'PLAN_MISMATCH');
  requireThat(m.host&&typeof m.host.hostname==='string'&&m.host.hostname.length>0&&integer(m.host.pid)&&m.host.pid>0&&typeof m.host.nodeVersion==='string'&&typeof m.host.platform==='string','HOST_IDENTITY_INVALID');
