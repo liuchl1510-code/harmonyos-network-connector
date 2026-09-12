@@ -15,6 +15,12 @@ const compiled = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true
 });
 assert.equal(compiled.diagnostics.length, 0, 'SDK transpilation');
+const protocolSourcePath = path.join(root, 'entry/src/main/ets/model/LatencyProtocol.ets');
+const protocolSource = fs.readFileSync(protocolSourcePath, 'utf8');
+const protocolCompiled = ts.transpileModule(protocolSource, {
+  compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true
+});
+assert.equal(protocolCompiled.diagnostics.length, 0, 'protocol SDK transpilation');
 const dir = '/synthetic-private';
 const destination = `${dir}/node-latency.json`;
 const readError = '延迟记录损坏或无法读取，已保留原文件。';
@@ -30,7 +36,7 @@ function fixture() {
   const fileIo = {
     OpenMode: { CREATE: 1, WRITE_ONLY: 2, TRUNC: 4 },
     accessSync: p => files.has(p),
-    statSync: p => ({ size: state.statSize ?? files.get(p).byteLength }),
+    statSync: p => ({ size: state.statSize ?? files.get(p).byteLength, isFile: () => true }),
     readTextSync: p => files.get(p).toString('utf8'),
     openSync: p => {
       if (state.fail === 'open') throw Error('sensitive synthetic path');
@@ -84,14 +90,36 @@ function fixture() {
       throw Error(`Unexpected import ${name}`);
     }, Uint8Array, Set, Map, Date, Number, Object, Array, JSON, Math, Error
   }, { filename: sourcePath });
-  return { api: exports, files, handles, state,
+  const protocol = {};
+  vm.runInNewContext(protocolCompiled.outputText, {
+    exports: protocol, require: name => {
+      if (name === '@kit.CoreFileKit') return { fileIo };
+      if (name === '@kit.ArkTS') return { util: { generateRandomUUID: crypto.randomUUID,
+        TextEncoder: class { encodeInto(value) { return new Uint8Array(Buffer.from(value, 'utf8')); } } } };
+      throw Error(`Unexpected protocol import ${name}`);
+    }, Uint8Array, Set, Map, Date, Number, Object, Array, JSON, Math, Error
+  }, { filename: protocolSourcePath });
+  return { api: exports, protocol, files, handles, state,
     seed: value => files.set(destination, Buffer.from(typeof value === 'string' ? value : JSON.stringify(value))) };
 }
 function record(api, changes = {}) {
   return Object.assign(new api.NodeLatencyResult('n-example', digest, 'run-example', 'passed', 123.4, '', 100), changes);
 }
-function envelope(results) { return { schemaVersion: 1, results }; }
+function envelope(results, schemaVersion = 2) { return { schemaVersion, results }; }
 function plain(value) { return JSON.parse(JSON.stringify(value)); }
+function legacy(value) {
+  const result = plain(value);
+  for (const field of ['measurementVersion', 'secondStatus', 'secondDurationMs', 'secondReason', 'secondConnection']) delete result[field];
+  return result;
+}
+function paired(api, changes = {}) {
+  return record(api, { measurementVersion: 2, secondStatus: 'passed', secondDurationMs: 321.5,
+    secondReason: '', secondConnection: 'new', ...changes });
+}
+function proof(api, changes = {}) {
+  return Object.assign(new api.LatencyProof('1789000000000', 'n-example', digest, 'passed', 123.4, '', 100,
+    2, 'passed', 321.5, '', 'new'), changes);
+}
 function onlyDestination(f) { assert.deepEqual([...f.files.keys()], [destination]); assert.equal(f.handles.size, 0); }
 const cases = [];
 async function test(name, body) { await body(); cases.push({ name, passed: true }); }
@@ -193,7 +221,7 @@ async function test(name, body) { await body(); cases.push({ name, passed: true 
   });
   await test('Corrupt, duplicate, unsupported and oversized files fail closed and are never overwritten', () => {
     const f = fixture();
-    const values = ['invalid', null, [], {}, { schemaVersion: 2, results: [] },
+    const values = ['invalid', null, [], {}, { schemaVersion: 3, results: [] },
       { schemaVersion: 1, results: [], extra: 'private' }, envelope([record(f.api), record(f.api)]),
       envelope(Array.from({ length: 501 }, (_, i) => record(f.api, { nodeId: `n-${i}` }))),
       ' '.repeat(256 * 1024 + 1)];
@@ -214,18 +242,176 @@ async function test(name, body) { await body(); cases.push({ name, passed: true 
   });
   await test('Labels distinguish untested, success, failure and cancellation; failure is never 0 ms', () => {
     const f = fixture(); assert.equal(f.api.latencyLabel(), '未检测');
-    assert.equal(f.api.latencyLabel(record(f.api)), 'HTTPS 123 ms');
-    assert.equal(f.api.latencyLabel(record(f.api, { durationMs: 60000 })), 'HTTPS 60000 ms');
-    assert.equal(f.api.latencyLabel(record(f.api, { durationMs: 0 })), 'HTTPS 0 ms');
+    assert.equal(f.api.latencyLabel(record(f.api)), '首次 HTTPS 123 ms');
+    assert.equal(f.api.latencyLabel(record(f.api, { durationMs: 60000 })), '首次 HTTPS 60000 ms');
+    assert.equal(f.api.latencyLabel(record(f.api, { durationMs: 0 })), '首次 HTTPS 0 ms');
     for (const status of ['failed', 'cancelled']) for (const reason of ['dns', 'https', 'timeout', 'network-changed', 'stopped', 'configuration', 'internal']) {
       const label = f.api.latencyLabel(record(f.api, { status, reason, durationMs: 0 }));
       assert(label.startsWith(status === 'failed' ? '失败：' : '已取消：')); assert.equal(label.includes(' ms'), false);
     }
     assert.equal(f.api.latencyLabel(record(f.api, { status: 'failed', reason: 'private message' })), '检测记录无效');
   });
+  await test('Old schema1 records normalize only in memory without inventing a second request', () => {
+    const f = fixture(); const old = legacy(record(f.api)); f.seed(envelope([old], 1));
+    const before = f.files.get(destination), events = f.state.events.length;
+    const a = f.api.readNodeLatencies(dir), b = f.api.readNodeLatencies(dir);
+    assert.deepEqual(plain(a), [plain(record(f.api))]); assert.deepEqual(plain(b), plain(a));
+    assert.equal(a[0].durationMs, old.durationMs); assert.equal(a[0].checkedAt, old.checkedAt);
+    assert.equal(a[0].measurementVersion, 1); assert.equal(a[0].secondStatus, 'not-tested');
+    assert.equal(a[0].secondConnection, 'unknown'); assert.equal(Object.keys(a[0]).length, 12);
+    assert.equal(f.files.get(destination), before); assert.equal(f.state.events.length, events);
+    assert.equal(f.api.latencySecondaryLabel(a[0]), '复用延迟 未检测（旧记录）');
+  });
+  await test('Outdated completion cannot write even when existing history needs in-memory migration', () => {
+    const f = fixture(); f.seed(envelope([legacy(record(f.api, { checkedAt: 500 }))], 1));
+    const before = f.files.get(destination);
+    f.api.saveNodeLatency(dir, paired(f.api, { checkedAt: 100 }));
+    assert.equal(f.files.get(destination), before); assert.equal(f.state.events.length, 0);
+    assert.equal(JSON.parse(before).schemaVersion, 1);
+  });
+  await test('Next actual save atomically upgrades schema1 and retains untouched legacy measurements', () => {
+    const f = fixture(); const old = legacy(record(f.api)); f.seed(envelope([old], 1)); f.state.maxWrite = 7;
+    f.api.saveNodeLatency(dir, paired(f.api, { nodeId: 'n-new', checkedAt: 200 })); onlyDestination(f);
+    const raw = JSON.parse(f.files.get(destination)); assert.equal(raw.schemaVersion, 2);
+    assert(raw.results.every(r => Object.keys(r).length === 12));
+    const saved = f.api.readNodeLatencies(dir);
+    assert.deepEqual(plain(saved[0]), plain(paired(f.api, { nodeId: 'n-new', checkedAt: 200 })));
+    assert.deepEqual(legacy(saved[1]), old); assert.equal(saved[1].measurementVersion, 1);
+    assert.equal(saved[1].secondConnection, 'unknown');
+  });
+  await test('Storage schema and measurement version are separate; mixed old/new shapes fail closed', () => {
+    const f = fixture(); const modern = record(f.api), old = legacy(modern);
+    for (const value of [envelope([modern], 1), envelope([old], 2), envelope([old, paired(f.api)], 1),
+      envelope([{ ...old, measurementVersion: 1 }], 1), envelope([{ ...old, secondStatus: 'not-tested' }], 2)]) {
+      f.seed(value); const before = f.files.get(destination);
+      assert.throws(() => f.api.readNodeLatencies(dir), e => e.message === readError);
+      assert.throws(() => f.api.saveNodeLatency(dir, paired(f.api)), e => e.message === saveError);
+      assert.equal(f.files.get(destination), before); onlyDestination(f);
+    }
+    f.seed(envelope([modern], 2)); assert.equal(f.api.readNodeLatencies(dir)[0].measurementVersion, 1);
+  });
+  await test('V2 preserves both timings including slower second requests and all connection kinds', () => {
+    for (const duration of [0, 0.25, 321.5, 60000]) for (const connection of ['reused', 'new', 'unknown']) {
+      const f = fixture(), value = paired(f.api, { secondDurationMs: duration, secondConnection: connection });
+      f.api.saveNodeLatency(dir, value); assert.deepEqual(plain(f.api.readNodeLatencies(dir)[0]), plain(value));
+      assert.equal(f.api.readNodeLatencies(dir)[0].durationMs, 123.4);
+      const p = proof(f.protocol, { secondDurationMs: duration, secondConnection: connection });
+      f.protocol.writeLatencyProof(dir, p);
+      assert.deepEqual(plain(f.protocol.readLatencyProof(dir)), plain(p));
+      assert.equal(Object.keys(JSON.parse(f.files.get(`${dir}/latency-proof.json`))).length, 12);
+    }
+  });
+  await test('Second failure keeps a valid first result and writes explicit timeout or HTTPS failure', () => {
+    for (const reason of ['https', 'timeout']) {
+      const f = fixture(), value = paired(f.api, { secondStatus: 'failed', secondDurationMs: 0,
+        secondReason: reason, secondConnection: 'unknown' });
+      f.api.saveNodeLatency(dir, value); assert.deepEqual(plain(f.api.readNodeLatencies(dir)[0]), plain(value));
+      const p = proof(f.protocol, { secondStatus: 'failed', secondDurationMs: 0,
+        secondReason: reason, secondConnection: 'unknown' });
+      f.protocol.writeLatencyProof(dir, p); assert.deepEqual(plain(f.protocol.readLatencyProof(dir)), plain(p));
+    }
+  });
+  await test('Non-successful overall results permit only default untested second fields in either version', () => {
+    for (const version of [1, 2]) for (const status of ['failed', 'cancelled']) {
+      const f = fixture(), value = record(f.api, { measurementVersion: version, status, reason: 'stopped', durationMs: 0 });
+      f.api.saveNodeLatency(dir, value); assert.deepEqual(plain(f.api.readNodeLatencies(dir)[0]), plain(value));
+      const p = proof(f.protocol, { measurementVersion: version, status, reason: 'stopped', durationMs: 0,
+        secondStatus: 'not-tested', secondDurationMs: 0, secondReason: '', secondConnection: 'unknown' });
+      f.protocol.writeLatencyProof(dir, p); assert.deepEqual(plain(f.protocol.readLatencyProof(dir)), plain(p));
+    }
+  });
+  await test('Invalid secondary field types and cross-field combinations are rejected identically by both stores', () => {
+    const changes = [
+      ...[0, 3, '2', true, null, undefined, NaN].map(value => ({ measurementVersion: value })),
+      { measurementVersion: 1 }, { secondStatus: 'not-tested', secondDurationMs: 0, secondConnection: 'unknown' },
+      ...['cancelled', 'pending', '', null, undefined].map(value => ({ secondStatus: value })),
+      ...[-1, 60001, Infinity, NaN, '12', null, undefined].map(value => ({ secondDurationMs: value })),
+      ...['https', 'timeout', null, undefined].map(value => ({ secondReason: value })),
+      ...['reuse', 'direct', '', true, null, undefined].map(value => ({ secondConnection: value })),
+      { secondStatus: 'failed', secondDurationMs: 1, secondReason: 'https', secondConnection: 'unknown' },
+      { secondStatus: 'failed', secondDurationMs: 0, secondReason: '', secondConnection: 'unknown' },
+      { secondStatus: 'failed', secondDurationMs: 0, secondReason: 'dns', secondConnection: 'unknown' },
+      { secondStatus: 'failed', secondDurationMs: 0, secondReason: 'timeout', secondConnection: 'reused' },
+      { status: 'failed', reason: 'https' }, { status: 'cancelled', reason: 'stopped' },
+      { secret: 'synthetic-private' }
+    ];
+    for (const change of changes) {
+      const f = fixture(), bad = paired(f.api, change), p = proof(f.protocol, change);
+      assert.throws(() => f.api.saveNodeLatency(dir, bad), e => e.message === saveError);
+      assert.throws(() => f.protocol.writeLatencyProof(dir, p), e => e.message === 'LATENCY_PROTOCOL_WRITE_FAILED');
+      assert.equal(f.files.size, 0);
+      f.seed(envelope([bad])); const before = f.files.get(destination);
+      assert.throws(() => f.api.readNodeLatencies(dir), e => e.message === readError); assert.equal(f.files.get(destination), before);
+      f.files.set(`${dir}/latency-proof.json`, Buffer.from(JSON.stringify(p)));
+      assert.throws(() => f.protocol.readLatencyProof(dir), e => e.message === 'LATENCY_PROTOCOL_READ_FAILED');
+    }
+  });
+  await test('V1 rejects each non-default secondary field instead of pretending it was measured', () => {
+    for (const change of [{ secondStatus: 'passed' }, { secondDurationMs: 1 }, { secondReason: 'timeout' }, { secondConnection: 'reused' }]) {
+      const f = fixture(), value = record(f.api, change);
+      assert.throws(() => f.api.saveNodeLatency(dir, value), e => e.message === saveError);
+      const p = new f.protocol.LatencyProof('1789000000000', 'n-example', digest, 'passed', 123, '', 100);
+      Object.assign(p, change);
+      assert.throws(() => f.protocol.writeLatencyProof(dir, p), e => e.message === 'LATENCY_PROTOCOL_WRITE_FAILED');
+      assert.equal(f.files.size, 0);
+    }
+  });
+  await test('Protocol old seven-key proof reads as v1 without writing and new twelve-key proof round trips', () => {
+    const f = fixture(), p = new f.protocol.LatencyProof('1789000000000', 'n-example', digest, 'passed', 2345, '', 100);
+    const target = `${dir}/latency-proof.json`, old = legacy(p), bytes = Buffer.from(JSON.stringify(old));
+    f.files.set(target, bytes); const restored = f.protocol.readLatencyProof(dir);
+    assert.deepEqual(plain(restored), plain(p)); assert.equal(f.files.get(target), bytes); assert.equal(f.state.events.length, 0);
+    assert.throws(() => f.protocol.writeLatencyProof(dir, old), e => e.message === 'LATENCY_PROTOCOL_WRITE_FAILED');
+    f.protocol.writeLatencyProof(dir, restored); assert.equal(Object.keys(JSON.parse(f.files.get(target))).length, 12);
+    const partial = { ...old, measurementVersion: 1 }; f.files.set(target, Buffer.from(JSON.stringify(partial)));
+    assert.throws(() => f.protocol.readLatencyProof(dir), e => e.message === 'LATENCY_PROTOCOL_READ_FAILED');
+  });
+  await test('Protocol identity, fixed-field copying and atomic failure remain intact with both measurements', () => {
+    const target = `${dir}/latency-proof.json`;
+    for (const failure of ['open', 'write', 'fsync', 'rename']) {
+      const f = fixture(); f.protocol.writeLatencyProof(dir, proof(f.protocol));
+      const bytes = f.files.get(target); f.state.fail = failure;
+      assert.throws(() => f.protocol.writeLatencyProof(dir, proof(f.protocol, { checkedAt: 101, secondDurationMs: 4 })),
+        e => e.message === 'LATENCY_PROTOCOL_WRITE_FAILED');
+      assert.equal(f.files.get(target), bytes); assert.equal(f.handles.size, 0);
+      assert.equal([...f.files.keys()].filter(name => name.endsWith('.tmp')).length, 0);
+    }
+    const f = fixture();
+    for (const change of [{ runId: 'run-example' }, { nodeId: '../escape' }, { outboundFingerprint: 'A'.repeat(64) }]) {
+      assert.throws(() => f.protocol.writeLatencyProof(dir, proof(f.protocol, change)), e => e.message === 'LATENCY_PROTOCOL_WRITE_FAILED');
+    }
+    const value = paired(f.api); Object.setPrototypeOf(value, { toJSON: () => ({ private: 'synthetic-secret' }) });
+    f.api.saveNodeLatency(dir, value); assert.equal(f.files.get(destination).toString().includes('synthetic-secret'), false);
+    const p = proof(f.protocol); Object.setPrototypeOf(p, { toJSON: () => ({ private: 'synthetic-secret' }) });
+    f.protocol.writeLatencyProof(dir, p); assert.equal(f.files.get(target).toString().includes('synthetic-secret'), false);
+    assert.equal(f.protocol.readLatencyProof(dir).secondDurationMs, 321.5);
+  });
+  await test('Atomic upgrade failure keeps old seven-field history rather than partially migrating it', () => {
+    for (const failure of ['open', 'write', 'fsync', 'rename']) {
+      const f = fixture(); f.seed(envelope([legacy(record(f.api))], 1)); const before = f.files.get(destination);
+      f.state.fail = failure;
+      assert.throws(() => f.api.saveNodeLatency(dir, paired(f.api, { checkedAt: 101 })), e => e.message === saveError);
+      assert.equal(f.files.get(destination), before); assert.equal(JSON.parse(before).schemaVersion, 1); onlyDestination(f);
+    }
+  });
+  await test('Secondary labels distinguish measured reuse, new or unconfirmed connection, old data and failure', () => {
+    const f = fixture(); assert.equal(f.api.latencySecondaryLabel(), '');
+    assert.equal(f.api.latencySecondaryLabel(record(f.api)), '复用延迟 未检测（旧记录）');
+    assert.equal(f.api.latencySecondaryLabel(paired(f.api, { secondConnection: 'reused' })), '复用延迟 322 ms');
+    assert.equal(f.api.latencySecondaryLabel(paired(f.api, { secondConnection: 'new' })), '再次 HTTPS 322 ms（新建连接）');
+    assert.equal(f.api.latencySecondaryLabel(paired(f.api, { secondConnection: 'unknown' })), '再次 HTTPS 322 ms（复用未确认）');
+    assert.equal(f.api.latencySecondaryLabel(paired(f.api, { secondDurationMs: 0, secondConnection: 'reused' })), '复用延迟 0 ms');
+    for (const [reason, text] of [['timeout', '复用检测超时'], ['https', '复用检测未通过']]) {
+      assert.equal(f.api.latencySecondaryLabel(paired(f.api, { secondStatus: 'failed', secondDurationMs: 0,
+        secondReason: reason, secondConnection: 'unknown' })), text);
+    }
+    assert.equal(f.api.latencySecondaryLabel(record(f.api, { status: 'failed', reason: 'https' })), '');
+    assert.equal(f.api.latencySecondaryLabel(paired(f.api, { secondReason: 'private error' })), '');
+  });
   const report = { schemaVersion: 1, checkedAt: new Date().toISOString(), synthetic: true,
     testedFile: 'entry/src/main/ets/model/NodeLatency.ets',
     sourceSha256: crypto.createHash('sha256').update(source).digest('hex'),
+    protocolSourceSha256: crypto.createHash('sha256').update(protocolSource).digest('hex'),
     passed: cases.length, failed: 0, cases };
   fs.mkdirSync(path.join(root, 'build'), { recursive: true });
   fs.writeFileSync(path.join(root, 'build/node-latency-verification.json'), JSON.stringify(report, null, 2) + '\n');

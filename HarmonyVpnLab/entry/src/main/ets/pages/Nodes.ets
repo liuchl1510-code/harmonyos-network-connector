@@ -9,7 +9,7 @@ import { readImportedNodeIds, readImportedNavigationRequestId } from '../model/N
 import { isNodeManagementAllowed } from '../model/NodeEditGuard';
 import { ConnectionCommand, ConnectionStatus, readConnectionCommand, readConnectionStatus, writeConnectionCommand } from '../model/ConnectionControl';
 import { ProbeState, readProbeState, writeProbeState } from '../model/ProbeState';
-import { NodeLatencyResult, fingerprintOutbound, latencyLabel, readNodeLatencies } from '../model/NodeLatency';
+import { NodeLatencyResult, fingerprintOutbound, latencyLabel, latencySecondaryLabel, readNodeLatencies } from '../model/NodeLatency';
 import { LatencyRequest, writeLatencyRequest, writeLatencyProof } from '../model/LatencyProtocol';
 import { measureNodeLatency } from '../model/LatencyProbe';
 import { BatchLatencyTarget, BatchLatencyObservation, BatchLatencyQueue, latencySortRank } from '../model/BatchLatency';
@@ -184,7 +184,8 @@ struct Nodes {
     const year = date.getFullYear() === new Date().getFullYear() ? '' : date.getFullYear().toString() + '-';
     const stamp = year + (date.getMonth() + 1).toString().padStart(2, '0') + '-' + date.getDate().toString().padStart(2, '0') +
       ' ' + date.getHours().toString().padStart(2, '0') + ':' + date.getMinutes().toString().padStart(2, '0');
-    return latencyLabel(record) + ' · ' + stamp;
+    const secondary = latencySecondaryLabel(record);
+    return latencyLabel(record) + (secondary ? '\n' + secondary : '') + ' · ' + stamp;
   }
 
   private async startLatency(id: string, batchTarget?: BatchLatencyTarget): Promise<void> {
@@ -614,7 +615,7 @@ struct Nodes {
               .padding({ left: 10, right: 10, top: 10, bottom: 10 }).backgroundColor($r('app.color.accent_soft'))
               .enabled(VPN_CORE_AVAILABLE && this.editable && this.filtered().length > 0).onClick(() => { this.startBatch(); });
             Button({ type: ButtonType.Normal }) {
-              Text(this.sortByLatency ? '恢复原顺序' : '按 HTTPS 耗时排序').fontSize(13).fontColor($r('app.color.text_secondary'))
+              Text(this.sortByLatency ? '恢复原顺序' : '按首次耗时排序').fontSize(13).fontColor($r('app.color.text_secondary'))
                 .width('100%').textAlign(TextAlign.Center);
             }.id('sortNodeLatency').constraintSize({ minHeight: 44 }).borderRadius(14).layoutWeight(1)
               .padding({ left: 10, right: 10, top: 10, bottom: 10 }).backgroundColor($r('app.color.surface_secondary'))
@@ -633,7 +634,9 @@ struct Nodes {
             Column({ space: 8 }) {
               Text('批量检测在点击时固定筛选结果，包含尚未展开的节点，最多 500 个。之后切换搜索或排序不会改变已开始的队列；每个节点会逐个建立并清理临时 VPN。')
                 .fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
-              Text('结果是一次 HTTPS 请求耗时，包含域名解析，不含 VPN 启动时间，不代表带宽或 TCP 往返延迟。检测不会切换当前选中节点。')
+              Text('首次 HTTPS 包含本次域名解析、连接与响应耗时，不含 VPN 启动时间。随后向同一地址再次请求；系统确认连接复用时，单独显示复用延迟，否则注明新建连接或复用未确认。旧记录只保留原首次耗时。')
+                .fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
+              Text('每次请求最多 8 秒，两个请求最多 16 秒。第二次失败会单独提示；取消或网络变化会中止整次检测。排序始终使用首次耗时，结果不代表带宽或 TCP 往返延迟，检测不会切换当前选中节点。')
                 .fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
             }.id('nodeLatencyHelp').padding(14).width('100%').alignItems(HorizontalAlign.Start)
               .backgroundColor($r('app.color.surface_secondary')).borderRadius(12);

@@ -169,7 +169,7 @@ async function runBenchmark(options, adapters = {}) {
     }
     sameCandidate(expected);
     let controls = await until(items => items.some(item => item.id === 'nodeLatency-qa-load-001' &&
-      typeof item.text === 'string' && item.text.startsWith('HTTPS 500 ms')));
+      typeof item.text === 'string' && item.text.startsWith('首次 HTTPS 500 ms')));
     if (!controls.some(item => item.id === 'nodeCount' && item.text === '共 500 个节点')) {
       throw new BenchmarkError('SYNTHETIC_500_NODES_REQUIRED');
     }

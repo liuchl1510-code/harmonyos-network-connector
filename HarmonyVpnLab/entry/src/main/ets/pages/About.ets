@@ -1,3 +1,4 @@
+import { bundleManager } from '@kit.AbilityKit';
 import { formContentWidth } from '../model/AdaptiveLayout';
 import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
 
@@ -5,6 +6,20 @@ import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
 @Component
 struct About {
   @StorageProp('windowWidthVp') windowWidthVp: number = 360;
+  @State versionText: string = '版本信息暂不可用';
+
+  aboutToAppear(): void {
+    const previewLabel = VPN_CORE_AVAILABLE ? '' : ' · 界面预览';
+    this.versionText = '版本信息暂不可用' + previewLabel;
+    try {
+      const info = bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT);
+      const name = info.versionName;
+      const previewSuffix = '-ui-preview';
+      const displayName = !VPN_CORE_AVAILABLE && name.endsWith(previewSuffix)
+        ? name.substring(0, name.length - previewSuffix.length) : name;
+      if (displayName.length > 0) { this.versionText = '版本 ' + displayName + previewLabel; }
+    } catch (_) { /* Keep the unavailable label without exposing platform errors. */ }
+  }
 
   build() {
     Scroll() {
@@ -20,7 +35,8 @@ struct About {
             .width(72).height(72).textAlign(TextAlign.Center)
             .backgroundColor($r('app.color.accent_soft')).borderRadius(22);
           Text('Harmony VPN').fontSize(26).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'));
-          Text(VPN_CORE_AVAILABLE ? '版本 0.15.0' : '版本 0.15.0 · 界面预览').id('appVersion').fontSize(14).fontColor($r('app.color.text_secondary'));
+          Text(this.versionText).id('appVersion').fontSize(14).fontColor($r('app.color.text_secondary'))
+            .width('100%').textAlign(TextAlign.Center).wordBreak(WordBreak.BREAK_ALL);
           Text('管理节点，连接你的网络。').fontSize(14).fontColor($r('app.color.text_secondary'));
         }.padding(28).width('100%').backgroundColor($r('app.color.surface')).borderRadius(22);
 

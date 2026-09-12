@@ -95,14 +95,24 @@ function latencyLabel(text) {
   const parts = text.split(' · ');
   ensure(parts.length <= 2, 'LATENCY_LABEL_UNRECOGNIZED');
   const label = parts[0];
-  const passed = /^HTTPS (\d{1,5}) ms$/.exec(label);
+  const lines = label.split('\n');
+  ensure(lines.length <= 2, 'LATENCY_LABEL_UNRECOGNIZED');
+  const passed = /^(?:首次 )?HTTPS (\d{1,5}) ms$/.exec(lines[0]);
+  const secondary = lines[1];
+  const reused = secondary && /^复用延迟 (\d{1,5}) ms$/.exec(secondary);
+  const repeated = secondary && /^再次 HTTPS (\d{1,5}) ms（(新建连接|复用未确认)）$/.exec(secondary);
+  ensure(!secondary || (passed && (reused || repeated ||
+    ['复用延迟 未检测（旧记录）', '复用检测超时', '复用检测未通过'].includes(secondary))), 'LATENCY_SECONDARY_UNRECOGNIZED');
   const pending = ['正在检测 HTTPS…', '正在准备检测…'].includes(label);
   const result = /^(失败|已取消)：(DNS 检查未通过|HTTPS 检查未通过|检测超时|网络已变化|连接已停止|节点配置无效或已变化|检测未完成)$/.exec(label);
   ensure(passed || pending || result || ['未检测', '检测记录无效'].includes(label), 'LATENCY_LABEL_UNRECOGNIZED');
   const durationMs = passed ? Number(passed[1]) : null;
   ensure(durationMs === null || durationMs <= 60000, 'LATENCY_DURATION_INVALID');
   const checkedAtLabel = parts[1] && /^[0-9/\-:.\s年月日上下午夜早晚APMapm]{1,80}$/.test(parts[1]) ? parts[1] : null;
-  return { label, status: pending ? 'pending' : passed ? 'passed' : result ? (result[1] === '已取消' ? 'cancelled' : 'failed') : 'unmeasured', durationMs, checkedAtLabel };
+  const secondDurationMs = reused ? Number(reused[1]) : repeated ? Number(repeated[1]) : null;
+  ensure(secondDurationMs === null || secondDurationMs <= 60000, 'LATENCY_SECOND_DURATION_INVALID');
+  return { label, status: pending ? 'pending' : passed ? 'passed' : result ? (result[1] === '已取消' ? 'cancelled' : 'failed') : 'unmeasured', durationMs, checkedAtLabel,
+    secondDurationMs, secondConnection: reused ? 'reused' : repeated ? (repeated[2] === '新建连接' ? 'new' : 'unknown') : null };
 }
 function catalogState(nodes, requireEditable = false) {
   ensure(pageOf(nodes) === 'nodes', 'NODES_REQUIRED');

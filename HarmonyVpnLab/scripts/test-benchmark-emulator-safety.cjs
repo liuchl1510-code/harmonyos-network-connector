@@ -51,7 +51,7 @@ function fixture() {
     if (state.deepTree) return { attributes: {}, children: Array.from({ length: 20001 }, () => item('synthetic')) };
     const children = [item('nodeCount', state.count), item('sortNodeLatency', '', { bounds: state.bounds }),
       item(state.sorted ? 'nodeName-qa-load-500' : 'nodeName-qa-load-001')];
-    if (state.sentinel) children.push(item('nodeLatency-qa-load-001', 'HTTPS 500 ms'));
+    if (state.sentinel) children.push(item('nodeLatency-qa-load-001', '首次 HTTPS 500 ms\n复用延迟 未检测（旧记录）'));
     return { attributes: { bundleName: 'com.example.harmonyvpnlab', visible: 'true' }, children };
   }
   const execFileSync = (file, args, options) => {

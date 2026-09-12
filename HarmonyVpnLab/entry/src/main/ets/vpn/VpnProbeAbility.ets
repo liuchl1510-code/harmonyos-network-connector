@@ -17,7 +17,7 @@ import { NodeBootstrap, createNodeBootstrap, normalizeBootstrapHost, isBootstrap
 import { PhysicalNetwork, PhysicalNetworkWatcher, readPhysicalNetwork, resolvePhysicalIpv4 } from '../model/PhysicalNetwork';
 import { readNodeCatalog, SavedNode } from '../model/NodeCatalog';
 import { fingerprintOutbound, NodeLatencyResult, saveNodeLatency } from '../model/NodeLatency';
-import { readLatencyRequest, readLatencyProof } from '../model/LatencyProtocol';
+import { LatencyProof, readLatencyRequest, readLatencyProof } from '../model/LatencyProtocol';
 import { appendDiagnosticEvent } from '../model/DiagnosticJournal';
 import { readNetworkPolicy } from '../model/NetworkPolicyStore';
 import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
@@ -722,13 +722,15 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
     }
   }
 
-  private finishLatency(status: string, durationMs: number, reason: string): void {
+  private finishLatency(status: string, durationMs: number, reason: string, proof?: LatencyProof): void {
     if (this.latencyFinished || this.testKind !== 'node-latency') { return; }
     this.latencyFinished = true;
     if (this.latencyNodeId && this.latencyFingerprint) {
       try {
         saveNodeLatency(this.context.filesDir, new NodeLatencyResult(this.latencyNodeId, this.latencyFingerprint,
-          this.runId, status, durationMs, reason));
+          this.runId, status, durationMs, reason, Date.now(), proof?.measurementVersion ?? 2,
+          proof?.secondStatus ?? 'not-tested', proof?.secondDurationMs ?? 0,
+          proof?.secondReason ?? '', proof?.secondConnection ?? 'unknown'));
         this.journal(status === 'passed' ? 'latency-ok' : 'latency-failed', '', Math.round(durationMs));
         hilog.info(DOMAIN, TAG, 'NODE_LATENCY_RESULT runId=%{public}s status=%{public}s durationMs=%{public}d reason=%{public}s',
           this.runId, status, Math.round(durationMs), reason);
@@ -752,7 +754,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
           this.finishLatency('failed', 0, 'internal'); return;
         }
       }
-      this.finishLatency(proof.status, proof.durationMs, proof.reason);
+      this.finishLatency(proof.status, proof.durationMs, proof.reason, proof);
     } catch (_) { if (!this.stopRequested && !this.checkPersistentCancellation()) { this.finishLatency('failed', 0, 'internal'); } }
   }
 

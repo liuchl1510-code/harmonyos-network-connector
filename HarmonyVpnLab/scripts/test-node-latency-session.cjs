@@ -173,6 +173,48 @@ test('matching proof plus positive proxy traffic records success once and cleanu
   await s.service.acceptLatencyProof(); await s.service.requestStop(false); s.service.onDestroy(); await flush();
   assert.equal(s.calls.save.length, 1); assert.equal(s.calls.coreStop, 1);
 });
+test('dual proof preserves first timing and second connection evidence through service storage', async () => {
+  for (const secondConnection of ['reused', 'new', 'unknown']) {
+    const s = scenario(); await s.launch();
+    s.proof({ measurementVersion: 2, durationMs: 2400, secondStatus: 'passed', secondDurationMs: 230,
+      secondReason: '', secondConnection });
+    await s.service.acceptLatencyProof(); await s.settleCleanup();
+    const result = s.results()[0];
+    assert.equal(result.status, 'passed'); assert.equal(result.durationMs, 2400);
+    assert.equal(result.measurementVersion, 2); assert.equal(result.secondDurationMs, 230);
+    assert.equal(result.secondStatus, 'passed'); assert.equal(result.secondConnection, secondConnection);
+    assert.equal(s.catalog.activeNodeId, s.active.id); cleanedOnce(s);
+  }
+});
+
+test('second request failure preserves successful first measurement without claiming reuse', async () => {
+  for (const secondReason of ['https', 'timeout']) {
+    const s = scenario(); await s.launch();
+    s.proof({ measurementVersion: 2, durationMs: 2400, secondStatus: 'failed', secondDurationMs: 0,
+      secondReason, secondConnection: 'unknown' });
+    await s.service.acceptLatencyProof(); await s.settleCleanup();
+    const result = s.results()[0];
+    assert.equal(result.status, 'passed'); assert.equal(result.durationMs, 2400);
+    assert.equal(result.secondStatus, 'failed'); assert.equal(result.secondReason, secondReason);
+    assert.equal(result.secondDurationMs, 0); assert.equal(result.secondConnection, 'unknown'); cleanedOnce(s);
+  }
+});
+
+test('dual measurement still needs proxy traffic and cannot survive a persistent cancellation', async () => {
+  for (const cancelled of [false, true]) {
+    const s = scenario(); await s.launch();
+    s.proof({ measurementVersion: 2, durationMs: 2400, secondStatus: 'passed', secondDurationMs: 230,
+      secondReason: '', secondConnection: 'reused' });
+    if (cancelled) s.stopCommand(); else s.snapshot.uplink = 0;
+    await s.service.acceptLatencyProof();
+    if (cancelled) await s.service.requestStop(false);
+    await s.settleCleanup();
+    const result = s.results()[0];
+    assert.notEqual(result.status, 'passed'); assert.equal(result.secondStatus, 'not-tested');
+    assert.equal(result.secondDurationMs, 0); cleanedOnce(s);
+  }
+});
+
 test('wrong run, node or hash proof is ignored and cannot complete the test', async () => {
   for (const changes of [{ runId: nextRun }, { nodeId: 'different-node' }, { outboundFingerprint: 'b'.repeat(64) }]) {
     const s = scenario(); await s.launch(); s.proof(changes); await s.service.acceptLatencyProof();

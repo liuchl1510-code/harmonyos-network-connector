@@ -134,7 +134,7 @@ function projectLayout(tree, appFocused = false, expectedMenuNodeId = '') {
             for (const child of n?.children || []) collectLabel(child);
           }
           collectLabel(node);
-          if (id === 'sortNodeLatency') control.sorted = labels.includes('恢复原顺序') ? true : labels.includes('按 HTTPS 耗时排序') ? false : undefined;
+          if (id === 'sortNodeLatency') control.sorted = labels.includes('恢复原顺序') ? true : labels.includes('按首次耗时排序') ? false : undefined;
           else control.selected = labels.includes(id === 'routingGlobal' ? '✓ 全部代理' : '✓ 规则分流');
         }
         if (id === 'bypassLan') {

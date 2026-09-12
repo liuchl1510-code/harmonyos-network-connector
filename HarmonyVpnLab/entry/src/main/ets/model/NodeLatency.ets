@@ -16,8 +16,15 @@ export class NodeLatencyResult {
   status: string;
   durationMs: number;
   reason: string;
+  measurementVersion: number;
+  secondStatus: string;
+  secondDurationMs: number;
+  secondReason: string;
+  secondConnection: string;
   constructor(nodeId: string, outboundFingerprint: string, runId: string, status: string,
-    durationMs: number, reason: string, checkedAt: number = Date.now()) {
+    durationMs: number, reason: string, checkedAt: number = Date.now(), measurementVersion: number = 1,
+    secondStatus: string = 'not-tested', secondDurationMs: number = 0, secondReason: string = '',
+    secondConnection: string = 'unknown') {
     this.nodeId = nodeId;
     this.outboundFingerprint = outboundFingerprint;
     this.runId = runId;
@@ -25,11 +32,16 @@ export class NodeLatencyResult {
     this.status = status;
     this.durationMs = durationMs;
     this.reason = reason;
+    this.measurementVersion = measurementVersion;
+    this.secondStatus = secondStatus;
+    this.secondDurationMs = secondDurationMs;
+    this.secondReason = secondReason;
+    this.secondConnection = secondConnection;
   }
 }
 
 class NodeLatencyFile {
-  schemaVersion: number = 1;
+  schemaVersion: number = 2;
   results: NodeLatencyResult[] = [];
 }
 
@@ -44,31 +56,56 @@ function validId(value: string): boolean {
   return typeof value === 'string' && /^[a-zA-Z0-9_-]{1,96}$/.test(value);
 }
 
-function validateResult(result: NodeLatencyResult): void {
-  exactKeys(result, ['nodeId', 'outboundFingerprint', 'runId', 'checkedAt', 'status', 'durationMs', 'reason']);
+function validSecondMeasurement(result: NodeLatencyResult): boolean {
+  if (result.measurementVersion !== 1 && result.measurementVersion !== 2) { return false; }
+  const notTested = result.secondStatus === 'not-tested' && result.secondDurationMs === 0 &&
+    result.secondReason === '' && result.secondConnection === 'unknown';
+  if (result.measurementVersion === 1 || result.status !== 'passed') { return notTested; }
+  if (result.secondStatus === 'passed') {
+    return typeof result.secondDurationMs === 'number' && Number.isFinite(result.secondDurationMs) &&
+      result.secondDurationMs >= 0 && result.secondDurationMs <= 60000 && result.secondReason === '' &&
+      ['reused', 'new', 'unknown'].includes(result.secondConnection);
+  }
+  return result.secondStatus === 'failed' && result.secondDurationMs === 0 &&
+    ['https', 'timeout'].includes(result.secondReason) && result.secondConnection === 'unknown';
+}
+
+function validateResult(result: NodeLatencyResult, legacy: boolean = false): void {
+  exactKeys(result, legacy ? ['nodeId', 'outboundFingerprint', 'runId', 'checkedAt', 'status', 'durationMs', 'reason'] :
+    ['nodeId', 'outboundFingerprint', 'runId', 'checkedAt', 'status', 'durationMs', 'reason',
+      'measurementVersion', 'secondStatus', 'secondDurationMs', 'secondReason', 'secondConnection']);
   if (!validId(result.nodeId) || !validId(result.runId) || typeof result.outboundFingerprint !== 'string' ||
     !/^[0-9a-f]{64}$/.test(result.outboundFingerprint) || !Number.isSafeInteger(result.checkedAt) ||
     result.checkedAt < 0 || !['passed', 'failed', 'cancelled'].includes(result.status) ||
     typeof result.durationMs !== 'number' || !Number.isFinite(result.durationMs) ||
     result.durationMs < 0 || result.durationMs > 60000 ||
     !['', 'dns', 'https', 'timeout', 'network-changed', 'stopped', 'configuration', 'internal'].includes(result.reason) ||
-    (result.status === 'passed' ? result.reason !== '' : result.reason === '')) {
+    (result.status === 'passed' ? result.reason !== '' : result.reason === '') ||
+    (!legacy && !validSecondMeasurement(result))) {
     throw new Error(READ_ERROR);
   }
 }
 
 function validateFile(value: NodeLatencyFile): NodeLatencyResult[] {
   exactKeys(value, ['schemaVersion', 'results']);
-  if (value.schemaVersion !== 1 || !Array.isArray(value.results) || value.results.length > MAX_RESULTS) {
+  if ((value.schemaVersion !== 1 && value.schemaVersion !== 2) ||
+    !Array.isArray(value.results) || value.results.length > MAX_RESULTS) {
     throw new Error(READ_ERROR);
   }
   const ids: Set<string> = new Set<string>();
   for (const result of value.results) {
-    validateResult(result);
+    validateResult(result, value.schemaVersion === 1);
     if (ids.has(result.nodeId)) { throw new Error(READ_ERROR); }
     ids.add(result.nodeId);
   }
-  return value.results;
+  // Old files remain byte-for-byte untouched. Their single-request measurements
+  // become explicit v1 values in memory, never invented reuse measurements.
+  return value.results.map((result: NodeLatencyResult) => value.schemaVersion === 1 ?
+    new NodeLatencyResult(result.nodeId, result.outboundFingerprint, result.runId,
+      result.status, result.durationMs, result.reason, result.checkedAt) :
+    new NodeLatencyResult(result.nodeId, result.outboundFingerprint, result.runId,
+      result.status, result.durationMs, result.reason, result.checkedAt, result.measurementVersion,
+      result.secondStatus, result.secondDurationMs, result.secondReason, result.secondConnection));
 }
 
 // Exact outbound text is the identity: even a harmless formatting change requires
@@ -119,7 +156,8 @@ export function saveNodeLatency(filesDir: string, result: NodeLatencyResult): vo
     next.results = current.filter((entry: NodeLatencyResult) => entry.nodeId !== result.nodeId);
     // Copy fixed fields so a caller-supplied object cannot add a toJSON payload.
     next.results.push(new NodeLatencyResult(result.nodeId, result.outboundFingerprint, result.runId,
-      result.status, result.durationMs, result.reason, result.checkedAt));
+      result.status, result.durationMs, result.reason, result.checkedAt, result.measurementVersion,
+      result.secondStatus, result.secondDurationMs, result.secondReason, result.secondConnection));
     next.results.sort((left: NodeLatencyResult, right: NodeLatencyResult) => right.checkedAt - left.checkedAt);
     next.results = next.results.slice(0, MAX_RESULTS);
     const bytes = new util.TextEncoder().encodeInto(JSON.stringify(next));
@@ -150,7 +188,7 @@ export function saveNodeLatency(filesDir: string, result: NodeLatencyResult): vo
 export function latencyLabel(result?: NodeLatencyResult): string {
   if (!result) { return '未检测'; }
   try { validateResult(result); } catch (_) { return '检测记录无效'; }
-  if (result.status === 'passed') { return `HTTPS ${Math.round(result.durationMs)} ms`; }
+  if (result.status === 'passed') { return `首次 HTTPS ${Math.round(result.durationMs)} ms`; }
   const prefix = result.status === 'cancelled' ? '已取消：' : '失败：';
   switch (result.reason) {
     case 'dns': return `${prefix}DNS 检查未通过`;
@@ -161,4 +199,18 @@ export function latencyLabel(result?: NodeLatencyResult): string {
     case 'configuration': return `${prefix}节点配置无效或已变化`;
     default: return `${prefix}检测未完成`;
   }
+}
+
+export function latencySecondaryLabel(result?: NodeLatencyResult): string {
+  if (!result) { return ''; }
+  try { validateResult(result); } catch (_) { return ''; }
+  if (result.status !== 'passed') { return ''; }
+  if (result.measurementVersion === 1) { return '复用延迟 未检测（旧记录）'; }
+  if (result.secondStatus === 'failed') {
+    return result.secondReason === 'timeout' ? '复用检测超时' : '复用检测未通过';
+  }
+  const duration = Math.round(result.secondDurationMs);
+  if (result.secondConnection === 'reused') { return `复用延迟 ${duration} ms`; }
+  return result.secondConnection === 'new' ? `再次 HTTPS ${duration} ms（新建连接）` :
+    `再次 HTTPS ${duration} ms（复用未确认）`;
 }

@@ -26,8 +26,15 @@ export class LatencyProof {
   durationMs: number;
   reason: string;
   checkedAt: number;
+  measurementVersion: number;
+  secondStatus: string;
+  secondDurationMs: number;
+  secondReason: string;
+  secondConnection: string;
   constructor(runId: string, nodeId: string, outboundFingerprint: string, status: string,
-    durationMs: number, reason: string, checkedAt: number = Date.now()) {
+    durationMs: number, reason: string, checkedAt: number = Date.now(), measurementVersion: number = 1,
+    secondStatus: string = 'not-tested', secondDurationMs: number = 0, secondReason: string = '',
+    secondConnection: string = 'unknown') {
     this.runId = runId;
     this.nodeId = nodeId;
     this.outboundFingerprint = outboundFingerprint;
@@ -35,6 +42,11 @@ export class LatencyProof {
     this.durationMs = durationMs;
     this.reason = reason;
     this.checkedAt = checkedAt;
+    this.measurementVersion = measurementVersion;
+    this.secondStatus = secondStatus;
+    this.secondDurationMs = secondDurationMs;
+    this.secondReason = secondReason;
+    this.secondConnection = secondConnection;
   }
 }
 
@@ -55,14 +67,31 @@ export function validLatencyRequest(value: LatencyRequest): boolean {
     typeof value.createdAt === 'number' && Number.isSafeInteger(value.createdAt) && value.createdAt >= 0;
 }
 
-function validProof(value: LatencyProof): boolean {
-  return exactKeys(value, ['runId', 'nodeId', 'outboundFingerprint', 'status', 'durationMs', 'reason', 'checkedAt']) &&
+function validSecondMeasurement(value: LatencyProof): boolean {
+  if (value.measurementVersion !== 1 && value.measurementVersion !== 2) { return false; }
+  const notTested = value.secondStatus === 'not-tested' && value.secondDurationMs === 0 &&
+    value.secondReason === '' && value.secondConnection === 'unknown';
+  if (value.measurementVersion === 1 || value.status !== 'passed') { return notTested; }
+  if (value.secondStatus === 'passed') {
+    return typeof value.secondDurationMs === 'number' && Number.isFinite(value.secondDurationMs) &&
+      value.secondDurationMs >= 0 && value.secondDurationMs <= 60000 && value.secondReason === '' &&
+      ['reused', 'new', 'unknown'].includes(value.secondConnection);
+  }
+  return value.secondStatus === 'failed' && value.secondDurationMs === 0 &&
+    ['https', 'timeout'].includes(value.secondReason) && value.secondConnection === 'unknown';
+}
+
+function validProof(value: LatencyProof, legacy: boolean = false): boolean {
+  return exactKeys(value, legacy ? ['runId', 'nodeId', 'outboundFingerprint', 'status', 'durationMs', 'reason', 'checkedAt'] :
+    ['runId', 'nodeId', 'outboundFingerprint', 'status', 'durationMs', 'reason', 'checkedAt',
+      'measurementVersion', 'secondStatus', 'secondDurationMs', 'secondReason', 'secondConnection']) &&
     validIdentity(value.runId, value.nodeId, value.outboundFingerprint) &&
     typeof value.checkedAt === 'number' && Number.isSafeInteger(value.checkedAt) && value.checkedAt >= 0 &&
     typeof value.durationMs === 'number' && Number.isFinite(value.durationMs) && value.durationMs >= 0 && value.durationMs <= 60000 &&
     typeof value.status === 'string' && ['passed', 'failed', 'cancelled'].includes(value.status) &&
     typeof value.reason === 'string' && ['', 'dns', 'https', 'timeout', 'network-changed', 'stopped', 'configuration', 'internal'].includes(value.reason) &&
-    (value.status === 'passed' ? value.reason === '' : value.reason !== '');
+    (value.status === 'passed' ? value.reason === '' : value.reason !== '') &&
+    (legacy || validSecondMeasurement(value));
 }
 
 function readText(filesDir: string, name: string): string | undefined {
@@ -129,7 +158,8 @@ export function writeLatencyProof(filesDir: string, proof: LatencyProof): void {
   try {
     if (!validProof(proof)) { throw new Error(WRITE_ERROR); }
     writeText(filesDir, 'latency-proof.json', JSON.stringify(new LatencyProof(proof.runId,
-      proof.nodeId, proof.outboundFingerprint, proof.status, proof.durationMs, proof.reason, proof.checkedAt)));
+      proof.nodeId, proof.outboundFingerprint, proof.status, proof.durationMs, proof.reason, proof.checkedAt,
+      proof.measurementVersion, proof.secondStatus, proof.secondDurationMs, proof.secondReason, proof.secondConnection)));
   } catch (_) { throw new Error(WRITE_ERROR); }
 }
 
@@ -138,8 +168,13 @@ export function readLatencyProof(filesDir: string): LatencyProof | undefined {
     const text = readText(filesDir, 'latency-proof.json');
     if (text === undefined) { return undefined; }
     const proof = JSON.parse(text) as LatencyProof;
+    if (validProof(proof, true)) {
+      return new LatencyProof(proof.runId, proof.nodeId, proof.outboundFingerprint,
+        proof.status, proof.durationMs, proof.reason, proof.checkedAt);
+    }
     if (!validProof(proof)) { throw new Error(READ_ERROR); }
     return new LatencyProof(proof.runId, proof.nodeId, proof.outboundFingerprint,
-      proof.status, proof.durationMs, proof.reason, proof.checkedAt);
+      proof.status, proof.durationMs, proof.reason, proof.checkedAt, proof.measurementVersion,
+      proof.secondStatus, proof.secondDurationMs, proof.secondReason, proof.secondConnection);
   } catch (_) { throw new Error(READ_ERROR); }
 }

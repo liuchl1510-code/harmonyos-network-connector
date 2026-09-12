@@ -237,7 +237,11 @@ function harness(options = {}) {
                 if (options.hashDeferred) return new Promise((resolve, reject) => { request.resolve = resolve; request.reject = reject; });
                 return Promise.resolve(crypto.createHash('sha256').update(outboundJson).digest('hex'));
             },
-            latencyLabel: record => record ? (record.status === 'passed' ? `HTTPS ${record.durationMs} ms` : '检测未通过') : '未检测'
+            latencyLabel: record => record ? (record.status === 'passed' ? `首次 HTTPS ${record.durationMs} ms` : '检测未通过') : '未检测',
+            latencySecondaryLabel: record => record?.status !== 'passed' ? '' : record.measurementVersion !== 2 ? '复用延迟 未检测（旧记录）' :
+                record.secondStatus === 'failed' ? (record.secondReason === 'timeout' ? '复用检测超时' : '复用检测未通过') :
+                record.secondConnection === 'reused' ? `复用延迟 ${record.secondDurationMs} ms` :
+                `再次 HTTPS ${record.secondDurationMs} ms（${record.secondConnection === 'new' ? '新建连接' : '复用未确认'}）`
         },
         '../model/LatencyProtocol': {
             LatencyRequest: class {
@@ -852,6 +856,18 @@ function finishLatency(h, p, phase = 'stopped') {
 
 function casesNodeLatency() {
     const cases = [], add = (name, run) => cases.push({ name: 'Nodes latency: ' + name, run });
+    add('first and second timing labels remain separate and keep one timestamp', async () => {
+        const h = harness(), p = h.page('Nodes');
+        const record = latencyRecord(h.state.catalog.nodes[0]);
+        p.latencies = [{ ...record, durationMs: 2400, measurementVersion: 2,
+            secondStatus: 'passed', secondDurationMs: 230, secondConnection: 'reused', secondReason: '' }];
+        assert.match(p.latencyText('node-old'), /^首次 HTTPS 2400 ms\n复用延迟 230 ms · /);
+        p.latencies = [record];
+        assert.match(p.latencyText('node-old'), /\n复用延迟 未检测（旧记录） · /);
+        p.latencies = [{ ...record, measurementVersion: 2, secondStatus: 'failed', secondReason: 'timeout' }];
+        assert.match(p.latencyText('node-old'), /^首次 HTTPS 321 ms\n复用检测超时 · /);
+        assert.equal(p.latencyText('node-missing'), '未检测');
+    });
     add('temporary test targets requested node without changing selection or catalog', async () => {
         const h = harness(), p = h.page('Nodes'); h.state.catalog.nodes.push(savedNode(secondNode, 'node-second'));
         p.aboutToAppear(); const before = clone(h.state.catalog);
@@ -896,7 +912,7 @@ function casesNodeLatency() {
         const proof = proofFor(request); h.state.measurements[0].resolve(proof); await flush();
         assert.deepEqual(h.state.latencyProofs, [proof]); assert.equal(p.testingId, 'node-old'); assert.equal(p.editable, false);
         h.state.latencyRecords = [latencyRecord(h.state.catalog.nodes[0])]; finishLatency(h, p); await flush();
-        assert.equal(p.testingId, ''); assert.equal(p.editable, true); assert.match(p.latencyText('node-old'), /^HTTPS 321 ms/);
+        assert.equal(p.testingId, ''); assert.equal(p.editable, true); assert.match(p.latencyText('node-old'), /^首次 HTTPS 321 ms/);
         assert.equal(h.state.catalog.activeNodeId, 'node-old'); assert.equal(h.state.writes.length, 0);
     });
     add('negative HTTPS proof retains failure classification instead of successful zero latency', async () => {
@@ -983,14 +999,14 @@ function casesNodeLatency() {
             latencyRecord(h.state.catalog.nodes[0], { nodeId: 'deleted-node' })];
         await p.refreshLatencies();
         assert.deepEqual(clone(p.latencies).map(record => record.nodeId), ['node-old']);
-        assert.match(p.latencyText('node-old'), /^HTTPS 321 ms/); assert.equal(p.latencyText('node-second'), '未检测');
+        assert.match(p.latencyText('node-old'), /^首次 HTTPS 321 ms/); assert.equal(p.latencyText('node-second'), '未检测');
         assert.equal(p.latencyText('deleted-node'), '未检测');
     });
     add('configuration refresh hides previous result before asynchronous hash finishes', async () => {
         const h = harness({ hashDeferred: true }), p = h.page('Nodes');
         const old = latencyRecord(h.state.catalog.nodes[0]);
         p.nodes = clone(h.state.catalog.nodes); p.latencies = [old];
-        assert.match(p.latencyText('node-old'), /^HTTPS 321 ms/);
+        assert.match(p.latencyText('node-old'), /^首次 HTTPS 321 ms/);
         h.state.catalog.nodes[0].outboundJson = secondNode.outboundJson;
         p.nodes = clone(h.state.catalog.nodes); h.state.latencyRecords = [old];
         const pending = p.refreshLatencies();
