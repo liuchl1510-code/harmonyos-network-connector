@@ -10,7 +10,7 @@ const root = path.resolve(__dirname, '..');
 const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio';
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
 const names = ['model/ConnectionControl.ets', 'model/ConnectionSnapshot.ets', 'model/ConnectionNotification.ets', 'model/TransferRate.ets',
-  'model/ProbeState.ets', 'model/NodeBootstrap.ets', 'model/NetworkPolicy.ets', 'model/VpnAuthorization.ets', 'vpn/VpnProbeAbility.ets', 'pages/Home.ets', 'pages/Index.ets'];
+  'model/ProbeState.ets', 'model/ConnectionLifecycle.ets', 'model/NodeEditGuard.ets', 'model/NodeBootstrap.ets', 'model/NetworkPolicy.ets', 'model/VpnAuthorization.ets', 'vpn/VpnProbeAbility.ets', 'pages/Home.ets', 'pages/Index.ets'];
 const sources = new Map(names.map(name => [name, fs.readFileSync(path.join(root, 'entry/src/main/ets', name), 'utf8')]));
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 async function flush() { for (let i = 0; i < 35; i++) await Promise.resolve(); }
@@ -23,7 +23,7 @@ function scenario(options = {}) {
     publish: [], cancel: [], transfer: 0, ipv6Datagrams: 0, partialWrites: 0, processAliveQueries: [],
     observerCreate: 0, observerOn: 0, observerOff: 0, coreConstruct: 0, coreSuspend: 0, coreResume: 0,
     coreStartArgs: [], coreResumeArgs: [], snapshot: 0, protect: [], networkRead: 0, dns: [], watcherStart: 0, watcherStop: 0,
-    commandWrites: [], resourceReads: [] };
+    commandWrites: [], resourceReads: [], recoveryObservations: [], vpnStarts: [] };
   class PhysicalNetwork {
     constructor(netId = 100, kind = 'wifi', key = `${netId}/${kind}/synthetic`) { Object.assign(this, { netId, kind, key }); }
   }
@@ -72,6 +72,7 @@ function scenario(options = {}) {
     clearTimeout: id => timers.delete(id),
     console: { info() {}, log() {}, warn() {}, error() {} },
     readNodeProfile: () => selectedNode,
+    recordConnectionRecovery: (_, value) => { calls.recoveryObservations.push(value); if (options.recoveryWriteThrows) throw new Error('synthetic recovery write failure'); },
     readNetworkPolicy: () => options.readNetworkPolicy ? options.readNetworkPolicy() : undefined,
     nodeServerAddress: node => JSON.parse(node.outboundJson).settings.vnext[0].address,
     PhysicalNetwork, PhysicalNetworkWatcher: class {
@@ -92,7 +93,7 @@ function scenario(options = {}) {
     }
   };
   function load(name, extra = {}) {
-    let source = sources.get(name).replace(/^import[^\n]*\n/gm, '');
+    let source = sources.get(name).replace(/^import[\s\S]*?;\r?\n/gm, '');
     if (name === 'pages/Home.ets' || name === 'pages/Index.ets') {
       const pageName = name === 'pages/Home.ets' ? 'Home' : 'Index';
       source = source.slice(0, source.indexOf('\n  build() {')) + '\n}\n';
@@ -139,7 +140,7 @@ function scenario(options = {}) {
   let service;
   let authorizationCallback;
   const vpnExtension = { createVpnConnection: () => connection,
-    startVpnExtensionAbility: async want => { if (options.startVpnRequest) await options.startVpnRequest(want); },
+    startVpnExtensionAbility: async want => { calls.vpnStarts.push(want); if (options.startVpnRequest) await options.startVpnRequest(want); },
     stopVpnExtensionAbility: async () => { calls.serviceStop++; if (options.autoDestroy !== false) service?.onDestroy(); },
     createVpnObserver: () => {
       calls.observerCreate++;
@@ -157,6 +158,9 @@ function scenario(options = {}) {
     native: { inspectFd: () => 'synthetic fd OK', inspectTunAddresses: () => 'synthetic TUN addresses', currentProcessId: () => 4242 },
     nativeBridge: { selfCheck: () => 'NATIVE_OK synthetic',
       processAlive: pid => { calls.processAliveQueries.push(pid); return options.processAlive ? options.processAlive(pid) : true; } } });
+  shared.native.processAlive = shared.nativeBridge.processAlive;
+  Object.assign(shared, load('model/ConnectionLifecycle.ets'));
+  Object.assign(shared, load('model/NodeEditGuard.ets'));
   Object.assign(shared, load('model/VpnAuthorization.ets'));
   const Service = load('vpn/VpnProbeAbility.ets').default;
   const Home = load('pages/Home.ets').Home;
@@ -346,7 +350,7 @@ test('unstarted timeout cannot cancel another UI process owner', async () => {
   const s = scenario({ sdkApiVersion: 24 }); s.prepare();
   s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'start', 'different-owner'));
   s.clock.now += 25001; s.home.refresh();
-  assert.equal(s.command().action, 'start'); assert.equal(s.home.phase, 'interrupted');
+  assert.equal(s.command().action, 'start'); assert.equal(s.home.phase, 'unknown'); assert.equal(s.home.closed, false);
 });
 
 test('Home first-run primary action opens import without a VPN start', async () => {
@@ -509,7 +513,7 @@ test('confirmed dead service permits local reconnect without forging cleanup rec
 test('service not proven dead preserves conservative reconnect gate', async () => {
   const s = scenario({ processAlive: () => true }); s.prepare('run-one', 'active');
   s.shared.writeConnectionStatus(s.context.filesDir, new s.shared.ConnectionStatus('run-one', 'destroying', s.snapshot, false, 4242));
-  s.home.refresh(); assert.equal(s.home.closed, false); assert.equal(s.home.phase, 'active');
+  s.home.refresh(); assert.equal(s.home.closed, false); assert.equal(s.home.phase, 'stopping');
   assert.equal(s.status().cleanupConfirmed, false);
 });
 
@@ -517,8 +521,201 @@ test('new UI epoch does not display previous process connection as live', async 
   const s = scenario(); s.prepare('run-one', 'active');
   s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'start', 'previous-ui-epoch'));
   s.shared.writeConnectionStatus(s.context.filesDir, new s.shared.ConnectionStatus('run-one', 'active', s.snapshot, false, 4242));
-  s.home.refresh(); assert.equal(s.home.phase, 'interrupted'); assert.equal(s.home.closed, true);
+  s.home.refresh(); assert.equal(s.home.phase, 'unknown'); assert.equal(s.home.closed, false);
   assert.equal(s.status().phase, 'active'); assert.equal(s.status().cleanupConfirmed, false);
+});
+
+for (const kind of ['connection', 'node-latency']) {
+  for (const phase of ['starting', 'active', 'recovering', 'waiting-network', 'stopping']) {
+    test('recreated UI and editing guard agree after confirmed process exit: ' + kind + '/' + phase, async () => {
+      const s = scenario({ processAlive: () => false }); s.prepare('run-one', phase, kind);
+      s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'start', 'previous-ui'));
+      s.shared.writeConnectionStatus(s.context.filesDir, new s.shared.ConnectionStatus('run-one', 'destroying', s.snapshot, false, 4242));
+      const original = s.files.get('/synthetic-vpn/connection-status.json').toString();
+      s.home.refresh(); s.index.refreshState();
+      assert.equal(s.home.phase, 'interrupted'); assert.equal(s.home.closed, true); assert.equal(s.home.busy(), false);
+      assert.equal(s.index.phase, s.home.phase); assert.equal(s.shared.isNodeManagementAllowed(s.context.filesDir), true);
+      assert.equal(s.home.rateAvailable, false); assert.equal(s.calls.recoveryObservations.length, 1);
+      assert.equal(s.calls.recoveryObservations[0].serviceExited, true);
+      assert.equal(s.files.get('/synthetic-vpn/connection-status.json').toString(), original, 'UI cannot forge service cleanup');
+      s.home.hasNode = true; await s.home.connect();
+      assert.equal(s.calls.vpnStarts.length, 1); assert.notEqual(s.command().runId, 'run-one');
+      assert.equal(s.command().action, 'start');
+    });
+  }
+}
+
+for (const processState of ['present', 'unknown']) {
+  test('new UI cannot overlap an unresolved previous service: ' + processState, async () => {
+    const s = scenario({ processAlive: () => { if (processState === 'unknown') throw new Error('synthetic PID query failure'); return true; } });
+    s.prepare('run-one', 'active', 'node-latency');
+    s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'start', 'previous-ui'));
+    s.shared.writeConnectionStatus(s.context.filesDir, new s.shared.ConnectionStatus('run-one', 'active', s.snapshot, false, 4242));
+    assert.doesNotThrow(() => s.home.refresh()); s.index.refreshState();
+    assert.equal(s.home.phase, 'unknown'); assert.equal(s.home.closed, false); assert.equal(s.index.phase, 'unknown');
+    assert.equal(s.shared.isNodeManagementAllowed(s.context.filesDir), false);
+    s.home.hasNode = true; await s.home.connect(); assert.equal(s.calls.vpnStarts.length, 0);
+    assert.equal(s.calls.recoveryObservations.length, 0); assert.equal(s.command().action, 'start');
+  });
+}
+
+test('normal cleaned shutdown reopened by another UI epoch remains a normal disconnection', async () => {
+  const s = scenario(); s.prepare('run-one', 'stopped');
+  s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'stop', 'previous-ui'));
+  s.shared.writeConnectionStatus(s.context.filesDir, new s.shared.ConnectionStatus('run-one', 'destroyed', s.snapshot, true, 4242));
+  s.home.refresh(); assert.equal(s.home.phase, 'stopped'); assert.equal(s.home.closed, true);
+  assert.equal(s.shared.isNodeManagementAllowed(s.context.filesDir), true); assert.equal(s.calls.recoveryObservations.length, 0);
+});
+
+test('foreign old command epoch never releases or interrupts the current active run', async () => {
+  const s = scenario(); s.activate('run-two');
+  s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'stop', 'previous-ui'));
+  s.home.refresh(); assert.equal(s.home.closed, false); assert.notEqual(s.home.phase, 'interrupted');
+  assert.equal(s.shared.isNodeManagementAllowed(s.context.filesDir), false);
+  const before = s.calls.commandWrites.length; await s.home.disconnect();
+  assert.equal(s.calls.commandWrites.length, before); assert.equal(s.calls.serviceStop, 0);
+});
+
+test('diagnostic observation persistence failure cannot block confirmed-exit recovery', async () => {
+  const s = scenario({ processAlive: () => false, recoveryWriteThrows: true }); s.activate();
+  assert.doesNotThrow(() => s.home.refresh()); assert.equal(s.home.closed, true);
+  s.home.hasNode = true; await s.home.connect(); assert.equal(s.calls.vpnStarts.length, 1);
+});
+
+test('notification permission completion cannot replace a newer active connection', async () => {
+  const gate = deferred(), s = scenario({ notificationEnabled: () => gate.promise });
+  s.home.hasNode = true; const pending = s.home.connect(); await flush(); assert.equal(s.home.requesting, true);
+  s.activate('run-two'); const before = s.calls.commandWrites.length;
+  gate.resolve(true); await pending;
+  assert.equal(s.calls.vpnStarts.length, 0); assert.equal(s.calls.commandWrites.length, before);
+  assert.equal(s.command().runId, 'run-two'); assert.equal(s.home.phase, 'active'); assert.equal(s.home.requesting, false);
+});
+
+test('notification permission completion cannot replace a newer already-ended request', async () => {
+  const gate = deferred(), s = scenario({ notificationEnabled: () => gate.promise });
+  s.home.hasNode = true; const pending = s.home.connect(); await flush();
+  s.prepare('newer-ended-run', 'stopped'); const before = s.calls.commandWrites.length;
+  gate.resolve(true); await pending;
+  assert.equal(s.calls.vpnStarts.length, 0); assert.equal(s.calls.commandWrites.length, before);
+  assert.equal(s.command().runId, 'newer-ended-run'); assert.equal(s.home.requesting, false);
+});
+
+test('notification permission completion cannot overwrite a same-run newer stop command', async () => {
+  const gate = deferred(), s = scenario({ notificationEnabled: () => gate.promise });
+  s.prepare('run-one', 'stopped'); s.home.hasNode = true;
+  const pending = s.home.connect(); await flush(); s.clock.now++;
+  s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'stop'));
+  const before = s.calls.commandWrites.length; gate.resolve(true); await pending;
+  assert.equal(s.calls.vpnStarts.length, 0); assert.equal(s.calls.commandWrites.length, before); assert.equal(s.command().action, 'stop');
+});
+
+for (const action of ['disconnect', 'reconnect']) {
+  test('a stale Home ' + action + ' action cannot alter a newer run before its next refresh', async () => {
+    const s = scenario(); s.activate('run-one'); s.home.refresh();
+    s.activate('run-two'); const before = s.calls.commandWrites.length;
+    await s.home[action]();
+    assert.equal(s.calls.commandWrites.length, before); assert.equal(s.calls.serviceStop, 0);
+    assert.equal(s.command().runId, 'run-two'); assert.equal(s.command().action, 'start');
+  });
+}
+
+test('expired unadmitted request never releases another still-live service', async () => {
+  const s = scenario(); s.prepare('run-two');
+  s.shared.writeConnectionStatus(s.context.filesDir, new s.shared.ConnectionStatus('run-one', 'destroying', s.snapshot, false, 4242));
+  s.clock.now += 25001; s.home.refresh();
+  assert.equal(s.home.phase, 'unknown'); assert.equal(s.home.closed, false); assert.equal(s.command().action, 'start');
+  assert.equal(s.shared.isNodeManagementAllowed(s.context.filesDir), false);
+});
+
+test('Index displays a stale connection without overwriting its service-owned progress', async () => {
+  const s = scenario(); s.activate(); const before = s.files.get('/synthetic-vpn/vpn-probe.json').toString();
+  s.clock.now += 30000; s.index.refreshState();
+  assert.equal(s.index.phase, 'unknown'); assert.equal(s.files.get('/synthetic-vpn/vpn-probe.json').toString(), before);
+  assert.equal(s.status().phase, 'active'); assert.equal(s.status().cleanupConfirmed, false);
+});
+
+test('long-unconfirmed destroying state exposes cleanup recovery without authorizing a new connection', async () => {
+  const s = scenario({ autoDestroy: false }); s.activate();
+  s.shared.writeConnectionStatus(s.context.filesDir, new s.shared.ConnectionStatus('run-one', 'destroying', s.snapshot, false, 4242));
+  s.clock.now += 12001; s.home.refresh();
+  assert.equal(s.home.phase, 'unknown'); assert.equal(s.home.closed, false);
+  s.home.hasNode = true; await s.home.connect(); assert.equal(s.calls.vpnStarts.length, 0);
+  await s.home.disconnect(); assert.equal(s.command().action, 'stop'); assert.equal(s.calls.serviceStop, 1);
+  assert.equal(s.status().phase, 'destroying'); assert.equal(s.status().cleanupConfirmed, false);
+});
+
+test('a fresh cleanup heartbeat remains stopping rather than exposing an artificial interruption', async () => {
+  const s = scenario(); s.activate(); s.clock.now += 12001;
+  s.shared.writeConnectionStatus(s.context.filesDir, new s.shared.ConnectionStatus('run-one', 'destroying', s.snapshot, false, 4242));
+  s.home.refresh(); assert.equal(s.home.phase, 'stopping'); assert.equal(s.home.closed, false);
+  assert.equal(s.calls.recoveryObservations.length, 0);
+});
+
+test('authorization refusal cannot write a cancellation through a different-run command', async () => {
+  const s = scenario(); s.home.aboutToAppear(); s.prepare('run-two', 'starting');
+  s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'start'));
+  const before = s.calls.commandWrites.length; s.emitAuthorization(false);
+  assert.equal(s.calls.commandWrites.length, before); assert.equal(s.shared.readProbeState(s.context.filesDir).phase, 'starting');
+});
+
+test('previous UI cancelled an unadmitted request and reopening remains safely retryable', async () => {
+  const s = scenario(); s.prepare('run-one', 'failed');
+  s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'stop', 'previous-ui'));
+  s.home.refresh(); assert.equal(s.home.closed, true); assert.equal(s.home.phase, 'failed');
+  assert.equal(s.shared.isNodeManagementAllowed(s.context.filesDir), true); assert.equal(s.status(), undefined);
+  assert.equal(s.calls.recoveryObservations.length, 0);
+  s.home.hasNode = true; await s.home.connect(); assert.equal(s.calls.vpnStarts.length, 1);
+});
+
+for (const kind of ['connection', 'node-latency']) {
+  test('explicit recovery cancels the previous UI expired unadmitted request: ' + kind, async () => {
+    const s = scenario({ autoDestroy: false }); s.prepare('run-one', 'starting', kind);
+    s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'start', 'previous-ui'));
+    s.clock.now += 25001; s.home.refresh(); assert.equal(s.home.phase, 'unknown'); assert.equal(s.home.closed, false);
+    await s.home.disconnect(); assert.equal(s.command().action, 'stop'); assert.equal(s.home.phase, 'failed');
+    assert.equal(s.home.closed, true); assert.equal(s.status(), undefined); assert.equal(s.calls.recoveryObservations.length, 0);
+    assert.equal(s.shared.isNodeManagementAllowed(s.context.filesDir), true);
+    s.service.onCreate({ parameters: { runId: 'run-one', kind } }); await s.service.initialization; await flush();
+    assert.equal(s.calls.create, 0); assert.equal(s.calls.coreStart, 0, 'late authorization cannot create the cancelled TUN/core');
+  });
+}
+
+test('explicit recovery never cancels an unexpired previous UI admission as if it never started', async () => {
+  const s = scenario({ autoDestroy: false }); s.prepare('run-one', 'starting');
+  s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'start', 'previous-ui'));
+  s.clock.now += 20000; s.home.refresh(); await s.home.disconnect();
+  assert.equal(s.command().action, 'stop'); assert.equal(s.shared.readProbeState(s.context.filesDir).phase, 'starting');
+  assert.equal(s.home.closed, false); assert.equal(s.calls.serviceStop, 1);
+});
+
+test('explicit recovery cannot release active previous UI state whose service PID is unavailable', async () => {
+  const s = scenario({ autoDestroy: false }); s.prepare('run-one', 'active');
+  s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'start', 'previous-ui'));
+  s.clock.now += 30000; s.home.refresh(); await s.home.disconnect();
+  assert.equal(s.command().action, 'stop'); assert.equal(s.shared.readProbeState(s.context.filesDir).phase, 'active');
+  assert.equal(s.home.closed, false); assert.equal(s.status(), undefined);
+});
+
+test('developer probe checks current lifecycle before starting and cannot bypass unresolved old connection', async () => {
+  const s = scenario(); s.activate();
+  s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'start', 'previous-ui'));
+  s.index.refreshState(); assert.equal(s.index.phase, 'unknown'); assert.equal(s.index.busy(), true);
+  const original = s.files.get('/synthetic-vpn/vpn-probe.json').toString(); await s.index.startProbe();
+  assert.equal(s.calls.vpnStarts.length, 0); assert.equal(s.files.get('/synthetic-vpn/vpn-probe.json').toString(), original);
+});
+
+test('developer probe cannot reuse the previous terminal service before its known PID exits', async () => {
+  const s = scenario(); s.prepare('run-one', 'stopped');
+  s.shared.writeConnectionStatus(s.context.filesDir, new s.shared.ConnectionStatus('run-one', 'destroyed', s.snapshot, true, 4242));
+  const original = s.files.get('/synthetic-vpn/vpn-probe.json').toString(); await s.index.startProbe();
+  assert.equal(s.calls.vpnStarts.length, 0); assert.equal(s.files.get('/synthetic-vpn/vpn-probe.json').toString(), original);
+});
+
+test('service exit invalidates in-flight HTTP before Home polls and preserves terminal observation', async () => {
+  let alive = true; const gate = deferred(), s = scenario({ processAlive: () => alive, httpRequest: () => gate.promise });
+  s.activate(); s.home.refresh(); const pending = s.home.checkConnection(false); await flush();
+  alive = false; gate.resolve({ responseCode: 200, result: 'h=www.cloudflare.com\nip=late-synthetic\n' }); await pending;
+  assert.equal(s.home.exitMarker, ''); s.home.refresh(); assert.equal(s.home.phase, 'interrupted');
 });
 
 test('late failed connectivity check cannot replace newer run result', async () => {

@@ -33,7 +33,7 @@ function compile(relative, page = false) {
     assert.equal(output.diagnostics.length, 0, 'SDK transpilation failed: ' + relative);
     compiledFiles.set(relative, output.outputText);
 }
-for (const file of ['model/NodeImport.ets', 'model/NodeBatchImport.ets', 'model/SubscriptionFetch.ets', 'model/NodeEditGuard.ets', 'model/BatchLatency.ets', 'model/NodeScanner.ets', 'model/AdaptiveLayout.ets', 'model/NodeListFilter.ets', 'model/NodeListNavigation.ets', 'model/NodeLatencySort.ets']) compile(file);
+for (const file of ['model/NodeImport.ets', 'model/NodeBatchImport.ets', 'model/SubscriptionFetch.ets', 'model/ConnectionLifecycle.ets', 'model/NodeEditGuard.ets', 'model/BatchLatency.ets', 'model/NodeScanner.ets', 'model/AdaptiveLayout.ets', 'model/NodeListFilter.ets', 'model/NodeListNavigation.ets', 'model/NodeLatencySort.ets']) compile(file);
 for (const file of ['pages/NodeConfig.ets', 'pages/Subscriptions.ets', 'pages/Nodes.ets']) compile(file, true);
 function execute(relative, imports, timers = {}) {
     const context = { VPN_CORE_AVAILABLE: true, exports: {}, Error, Date, Uint8Array, ArrayBuffer, Promise, URL, TextDecoder, $r: name => name,
@@ -87,11 +87,15 @@ function harness(options = {}) {
         clearInterval(id) { state.timers.delete(id); },
         Date: class extends Date { static now() { return state.wallNow++; } }
     };
-    const guard = execute('model/NodeEditGuard.ets', {
+    const lifecycle = execute('model/ConnectionLifecycle.ets', {
         'libvpnbridge.so': { default: { processAlive: () => { if (state.processCheckThrows) throw RAW_ERROR; return state.processAlive; } } },
         './ProbeState': { readProbeState: () => clone(state.probeState) },
-        './ConnectionControl': { readConnectionStatus: () => state.connectionStatus && clone(state.connectionStatus) }
-    });
+        './ConnectionControl': { CONNECTION_UI_EPOCH: 'synthetic-current-ui',
+            isConnectionKind: kind => ['connection', 'connection-test', 'connection-app-test', 'node-latency'].includes(kind),
+            readConnectionCommand: () => state.command && clone(state.command),
+            readConnectionStatus: () => state.connectionStatus && clone(state.connectionStatus) }
+    }, timers);
+    const guard = execute('model/NodeEditGuard.ets', { './ConnectionLifecycle': lifecycle });
     function managementAllowed() { return state.allowed && guard.isNodeManagementAllowed('synthetic-memory-only'); }
     function allowed() { if (!managementAllowed()) throw new Error('连接运行期间请先断开。'); }
     function readCatalog() {
@@ -217,6 +221,7 @@ function harness(options = {}) {
         } } },
         '../model/NodeImport': single, '../model/NodeBatchImport': batch, '../model/NodeCatalog': catalog,
         '../model/NodeEditGuard': { assertNodeManagementAllowed: allowed, isNodeManagementAllowed: managementAllowed },
+        '../model/ConnectionLifecycle': lifecycle,
         '../model/ConnectionControl': {
             ConnectionCommand: class { constructor(runId, action) { this.runId = runId; this.action = action; } },
             readConnectionCommand: () => state.command && clone(state.command),
@@ -1199,6 +1204,51 @@ function casesBatchLatency() {
         assert.equal(p.editable, false); await p.startLatency('node-old'); assert.equal(h.state.vpnStarts.length, 0);
         h.state.processCheckThrows = false; p.pollLatency(); assert.equal(p.editable, true);
         await p.startBatch(); assert.equal(h.state.vpnStarts.length, 1);
+    });
+    for (const processState of ['present', 'absent', 'unknown']) {
+        add('recreated node page handles interrupted latency through the shared lifecycle: ' + processState, async () => {
+            const { h } = setup(); const before = clone(h.state.catalog);
+            h.state.probeState = { ...h.state.probeState, runId: 'old-run', phase: 'active', kind: 'node-latency' };
+            h.state.command = { runId: 'old-run', action: 'start', ownerEpoch: 'previous-ui' };
+            h.state.connectionStatus = { runId: 'old-run', phase: 'destroying', cleanupConfirmed: false, servicePid: 123 };
+            h.state.processAlive = processState !== 'absent'; h.state.processCheckThrows = processState === 'unknown';
+            const p = h.page('Nodes'); p.aboutToAppear(); p.pollLatency();
+            assert.equal(p.editable, processState === 'absent'); assert.equal(p.testingId, ''); assert.equal(p.batchActive, false);
+            await p.startLatency('node-old'); assert.equal(h.state.vpnStarts.length, processState === 'absent' ? 1 : 0);
+            assert.deepEqual(h.state.catalog, before); assert.equal(h.state.writes.length, 0);
+        });
+    }
+    for (const servicePid of [2147483648, 4294967419, -1, '123']) {
+        add('a malformed terminal PID cannot be truncated into authorization to start: ' + servicePid, async () => {
+            const { h } = setup();
+            h.state.probeState = { ...h.state.probeState, runId: 'old-run', phase: 'stopped', kind: 'node-latency' };
+            h.state.connectionStatus = { runId: 'old-run', phase: 'destroyed', cleanupConfirmed: true, servicePid };
+            h.state.processAlive = false;
+            const p = h.page('Nodes'); p.aboutToAppear();
+            assert.equal(p.editable, false); await p.startBatch(); assert.equal(h.state.vpnStarts.length, 0);
+        });
+    }
+    for (const batching of [false, true]) {
+        add('service disappearance terminates the in-memory ' + (batching ? 'batch' : 'single') + ' without stale results or successors', async () => {
+            const { h, p } = setup(); const before = clone(h.state.catalog);
+            if (batching) await p.startBatch(); else await p.startLatency('node-old');
+            const request = activateLatency(h, p); assert.equal(h.state.measurements.length, 1);
+            const originalStatus = clone(h.state.connectionStatus);
+            h.state.processAlive = false; p.pollLatency(); p.pollLatency(); await flush();
+            assert.equal(p.testingId, ''); assert.equal(p.batchActive, false); assert.equal(p.cancelling, false); assert.equal(p.editable, true);
+            assert.equal(h.state.vpnStarts.length, 1); assert.match(p.message, /意外结束.*进程已退出/);
+            assert.deepEqual(h.state.connectionStatus, originalStatus);
+            h.state.measurements[0].resolve(proofFor(request)); await flush();
+            assert.equal(h.state.latencyProofs.length, 0); assert.equal(h.state.vpnStarts.length, 1);
+            assert.deepEqual(h.state.catalog, before); assert.equal(h.state.writes.length, 0);
+        });
+    }
+    add('a stale latency cancellation cannot replace a newer command before its probe state arrives', async () => {
+        const { h, p } = setup(); await p.startLatency('node-old'); activateLatency(h, p);
+        h.state.command = { runId: 'new-run', action: 'start', ownerEpoch: 'new-owner' };
+        const before = h.state.commands.length; p.cancelLatency();
+        assert.equal(h.state.commands.length, before); assert.equal(h.state.command.runId, 'new-run');
+        assert.equal(h.state.command.action, 'start');
     });
     add('changed next-node configuration aborts before another VPN start', async () => {
         const { h, p } = setup(); await p.startBatch(); activateLatency(h, p); recordCurrent(h);

@@ -1,12 +1,11 @@
 import { common } from '@kit.AbilityKit';
 import { vpnExtension, http } from '@kit.NetworkKit';
 import { notificationManager } from '@kit.NotificationKit';
-import nativeBridge from 'libvpnbridge.so';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { ProbeState, readProbeState, writeProbeState } from '../model/ProbeState';
 import { readNodeProfile } from '../model/NodeProfile';
 import { describeError } from '../model/ErrorInfo';
-import { CONNECTION_UI_EPOCH, ConnectionCommand, isConnectionKind, readConnectionCommand, readConnectionStatus, writeConnectionCommand } from '../model/ConnectionControl';
+import { CONNECTION_UI_EPOCH, ConnectionCommand, isConnectionKind, readConnectionCommand, writeConnectionCommand } from '../model/ConnectionControl';
 import { formatBytes, prepareConnectionNotifications } from '../model/ConnectionNotification';
 import { checkProxyDns, connectionExitMarker, probeIpv6Datagram } from '../model/ConnectionDiagnostics';
 import { subscribeVpnAuthorization, unsubscribeVpnAuthorization } from '../model/VpnAuthorization';
@@ -19,6 +18,8 @@ import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
 import { readNetworkPolicy } from '../model/NetworkPolicyStore';
 import { networkPolicyLabel } from '../model/NetworkPolicy';
 import { TransferRateTracker, formatTransferRate } from '../model/TransferRate';
+import { readConnectionLifecycle } from '../model/ConnectionLifecycle';
+import { recordConnectionRecovery } from '../model/ConnectionRecoveryStore';
 
 @Entry
 @Component
@@ -71,7 +72,8 @@ struct Home {
         if (!allowed) {
           const current = readProbeState(this.context().filesDir);
           const command = readConnectionCommand(this.context().filesDir);
-          if (isConnectionKind(current.kind) && current.phase === 'starting' && command?.ownerEpoch === CONNECTION_UI_EPOCH) {
+          if (isConnectionKind(current.kind) && current.phase === 'starting' && command?.runId === current.runId &&
+            command.ownerEpoch === CONNECTION_UI_EPOCH) {
             writeConnectionCommand(this.context().filesDir, new ConnectionCommand(current.runId, 'stop'));
             writeProbeState(this.context().filesDir, new ProbeState('failed', '未获得 VPN 授权。', current.runId, current.kind));
             this.startGeneration++; this.requesting = false;
@@ -127,6 +129,7 @@ struct Home {
       case 'waiting-network': return '等待 Wi-Fi 或移动网络，也可以随时断开。';
       case 'stopping': case 'stop_requested': return '正在结束连接并释放资源。';
       case 'failed': case 'unknown': return '连接需要处理，可先断开或查看诊断记录。';
+      case 'interrupted': return '上次 VPN 服务已结束，可重新连接。';
       case 'diagnostic': return '检测正在进行，结束后即可连接。';
       default: return '节点已就绪，点击连接即可开始。';
     }
@@ -176,39 +179,19 @@ struct Home {
   private refresh(): void {
     const filesDir = this.context().filesDir;
     this.now = Date.now();
-    const state = readProbeState(filesDir);
-    if (this.phase === 'active' && state.phase !== 'active') {
+    const assessment = readConnectionLifecycle(filesDir, this.now);
+    const state = assessment.state, command = assessment.command, status = assessment.status;
+    if (assessment.interruptionObserved) {
+      try { recordConnectionRecovery(filesDir, assessment); } catch (_) { /* Diagnostic storage cannot block recovery. */ }
+    }
+    if ((this.phase === 'active' && assessment.phase !== 'active') || this.runId !== state.runId) {
       this.checkGeneration++; this.checking = false; this.exitMarker = ''; this.checkResult = '网络状态已变化，请重新检查连接。';
     }
-    const active = ['starting', 'active', 'recovering', 'waiting-network', 'stopping', 'stop_requested'].includes(state.phase);
-    if (state.kind === 'node-latency') {
-      this.resetTransferRate();
-      this.phase = active ? 'diagnostic' : 'idle'; this.closed = !active;
-      this.detail = active ? '节点延迟检测正在运行，请在节点列表中查看或取消。' : '';
-      return;
-    }
-    if (!isConnectionKind(state.kind)) {
-      this.resetTransferRate();
-      this.phase = active ? 'diagnostic' : 'idle';
-      this.detail = active ? '开发验证正在运行，请等待它结束。' : '';
-      this.closed = !active;
-      return;
-    }
     this.runId = state.runId;
-    const command = readConnectionCommand(filesDir);
-    if (command?.ownerEpoch && command.ownerEpoch !== CONNECTION_UI_EPOCH) {
-      this.resetTransferRate();
-      // The platform ties VPN lifetime to its starting UI process. A new UI
-      // process must not display the old process's persisted connection as live.
-      this.phase = 'interrupted';
-      this.detail = '上次应用进程已结束，需要重新连接 VPN。';
-      this.closed = true;
-      return;
-    }
-    this.phase = state.phase;
-    this.detail = state.detail;
-    const status = readConnectionStatus(filesDir);
-    if (state.phase === 'starting' && this.now - state.updatedAt > 25000 &&
+    this.phase = assessment.phase;
+    this.detail = assessment.detail;
+    this.closed = assessment.closed;
+    if (!assessment.priorServiceUnresolved && isConnectionKind(state.kind) && state.phase === 'starting' && this.now - state.updatedAt > 25000 &&
       status?.runId !== state.runId && command?.runId === state.runId && command.ownerEpoch === CONNECTION_UI_EPOCH) {
       // API 24 has no authorization-result observer. No service has reported
       // this request, and the extension's 20-second admission window expired.
@@ -222,22 +205,22 @@ struct Home {
       this.resetTransferRate();
       return;
     }
+    const diagnostic = state.kind === 'node-latency' || !isConnectionKind(state.kind);
+    if (diagnostic) {
+      this.resetTransferRate();
+      if (!assessment.closed && ['starting', 'active', 'recovering', 'waiting-network', 'stopping', 'stop_requested'].includes(assessment.phase)) {
+        this.phase = 'diagnostic';
+        this.detail = state.kind === 'node-latency' ? '节点延迟检测正在运行，请在节点列表中查看或取消。' :
+          '开发验证正在运行，请等待它结束。';
+      }
+      return;
+    }
     if (status?.runId === state.runId && (status.reconnectCount ?? 0) !== this.reconnectCount) {
       this.checkGeneration++; this.checking = false; this.exitMarker = '';
       this.checkResult = '网络状态已变化，请重新检查连接。';
     }
     this.networkKind = status?.runId === state.runId ? (status.networkKind ?? '') : '';
     this.reconnectCount = status?.runId === state.runId ? (status.reconnectCount ?? 0) : 0;
-    this.closed = status?.runId === state.runId && status.phase === 'destroyed' && status.cleanupConfirmed === true;
-    const serviceGone = status?.runId === state.runId && Number.isInteger(status.servicePid) &&
-      status.servicePid > 0 && !nativeBridge.processAlive(status.servicePid);
-    if (serviceGone) {
-      this.closed = true;
-      if (active) {
-        this.phase = 'interrupted';
-        this.detail = 'VPN 服务进程已结束，需要重新连接。';
-      }
-    }
     if (status?.runId === state.runId && status.snapshot) {
       this.uplink = status.snapshot.uplink;
       this.downlink = status.snapshot.downlink;
@@ -245,13 +228,7 @@ struct Home {
       this.ipv6Blocked = status.snapshot.ipv6BlockedRequests;
       this.dnsRequests = status.snapshot.dnsRequests;
     }
-    if (active && !serviceGone && command?.runId === state.runId && command.action === 'stop') { this.phase = 'stopping'; }
-    if (active && !serviceGone && this.now - state.updatedAt > (state.phase === 'starting' ? 25000 : 12000)) {
-      this.phase = 'unknown';
-      this.detail = '连接状态更新中断，请先断开或恢复清理。';
-    }
-    if (!active && status?.runId !== state.runId) { this.closed = true; }
-    if (this.phase === 'active' && status?.runId === state.runId && status.phase === 'active' && !serviceGone) {
+    if (this.phase === 'active' && status?.runId === state.runId && status.phase === 'active' && !assessment.serviceExited) {
       const rate = this.rateTracker.update(state.runId, status.reconnectCount ?? 0, status.snapshot, this.now);
       this.rateAvailable = rate.available;
       this.uplinkRate = formatTransferRate(rate.available, rate.uplinkPerSecond);
@@ -291,13 +268,24 @@ struct Home {
 
   private async connect(kind: string = 'connection'): Promise<void> {
     if (!VPN_CORE_AVAILABLE) { this.detail = '模拟器界面预览不包含 VPN 转发核心。'; return; }
+    this.refresh();
     if (this.busy() || this.requesting || !this.hasNode || !this.closed) { return; }
+    const filesDir = this.context().filesDir;
+    const before = readConnectionLifecycle(filesDir);
+    if (!before.closed) { this.refresh(); return; }
     this.requesting = true;
     const generation = ++this.startGeneration;
     let startedRunId: string = '';
     try {
       try { this.notificationsEnabled = await prepareConnectionNotifications(this.context()); } catch (_) { this.notificationsEnabled = false; }
       if (generation !== this.startGeneration) { return; }
+      const current = readConnectionLifecycle(filesDir);
+      if (!current.closed || current.state.runId !== before.state.runId ||
+        (before.state.runId.length > 0 && current.state.updatedAt !== before.state.updatedAt) ||
+        current.command?.runId !== before.command?.runId || current.command?.action !== before.command?.action ||
+        current.command?.createdAt !== before.command?.createdAt || current.command?.ownerEpoch !== before.command?.ownerEpoch) {
+        this.refresh(); return;
+      }
       const runId = Date.now().toString();
       startedRunId = runId;
       writeConnectionCommand(this.context().filesDir, new ConnectionCommand(runId, 'start'));
@@ -327,13 +315,33 @@ struct Home {
   }
 
   private async disconnect(): Promise<void> {
-    const state = readProbeState(this.context().filesDir);
-    if (!isConnectionKind(state.kind)) { return; }
+    const filesDir = this.context().filesDir;
+    const observedRunId = this.runId;
     try {
-      const command = readConnectionCommand(this.context().filesDir);
-      writeConnectionCommand(this.context().filesDir, new ConnectionCommand(state.runId, 'stop', command?.ownerEpoch ?? CONNECTION_UI_EPOCH));
-      if (this.phase === 'unknown' || this.phase === 'failed') {
-        await vpnExtension.stopVpnExtensionAbility({ bundleName: 'com.example.harmonyvpnlab', abilityName: 'VpnProbeAbility' });
+      const current = readConnectionLifecycle(filesDir);
+      const state = current.state, command = current.command;
+      if (state.runId !== observedRunId || !isConnectionKind(state.kind) || current.closed ||
+        (command !== undefined && command.runId !== state.runId)) { this.refresh(); return; }
+      writeConnectionCommand(filesDir, new ConnectionCommand(state.runId, 'stop', command?.ownerEpoch ?? CONNECTION_UI_EPOCH));
+      const pendingAge = Date.now() - state.updatedAt;
+      if (!current.priorServiceUnresolved && current.status?.runId !== state.runId && state.phase === 'starting' &&
+        Number.isFinite(pendingAge) && pendingAge > 25000) {
+        // Explicitly cancel an expired request from the prior UI. The service's
+        // admission window is over; this does not claim a cleanup receipt.
+        const pendingState = readProbeState(filesDir), pendingCommand = readConnectionCommand(filesDir);
+        if (pendingState.runId === observedRunId && pendingState.phase === 'starting' &&
+          pendingState.updatedAt === state.updatedAt && pendingCommand?.runId === observedRunId && pendingCommand.action === 'stop') {
+          writeProbeState(filesDir, new ProbeState('failed', '上次连接请求已取消，可重新连接。', observedRunId, state.kind));
+          this.startGeneration++; this.requesting = false;
+          this.refresh(); return;
+        }
+        this.refresh(); return;
+      }
+      if (current.phase === 'unknown' || current.phase === 'failed') {
+        const latestState = readProbeState(filesDir), latestCommand = readConnectionCommand(filesDir);
+        if (latestState.runId === observedRunId && latestCommand?.runId === observedRunId && latestCommand.action === 'stop') {
+          await vpnExtension.stopVpnExtensionAbility({ bundleName: 'com.example.harmonyvpnlab', abilityName: 'VpnProbeAbility' });
+        }
       }
       this.refresh();
     } catch (error) { this.detail = '断开请求未完成：' + describeError(error); }
@@ -341,8 +349,10 @@ struct Home {
 
   private reconnect(): void {
     if (this.phase !== 'active') { return; }
-    const command = readConnectionCommand(this.context().filesDir);
-    if (!command || command.runId !== this.runId || command.action === 'stop') { return; }
+    const current = readConnectionLifecycle(this.context().filesDir);
+    const command = current.command;
+    if (current.state.runId !== this.runId || current.phase !== 'active' || !command ||
+      command.runId !== this.runId || command.action === 'stop') { this.refresh(); return; }
     try {
       writeConnectionCommand(this.context().filesDir, new ConnectionCommand(this.runId, 'reconnect', command.ownerEpoch));
       this.checkGeneration++; this.checking = false; this.phase = 'recovering';
@@ -371,9 +381,9 @@ struct Home {
 
   private checkStillCurrent(runId: string, generation: number): boolean {
     if (this.runId !== runId || this.phase !== 'active' || generation !== this.checkGeneration) { return false; }
-    const state = readProbeState(this.context().filesDir);
-    const status = readConnectionStatus(this.context().filesDir);
-    return state.runId === runId && state.phase === 'active' && status?.runId === runId &&
+    const current = readConnectionLifecycle(this.context().filesDir);
+    const state = current.state, status = current.status;
+    return state.runId === runId && current.phase === 'active' && status?.runId === runId &&
       status.phase === 'active' && (status.reconnectCount ?? 0) === this.reconnectCount;
   }
 
@@ -481,7 +491,7 @@ struct Home {
             if (this.busy()) { this.connectionCheckCard(); }
             this.connectionFootnote();
             }
-            if (this.phase === 'failed' || this.phase === 'unknown') {
+            if (this.phase === 'failed' || this.phase === 'unknown' || this.phase === 'interrupted') {
               Column({ space: 10 }) {
                 Text(this.detail).fontSize(14).fontColor($r('app.color.text_secondary'));
                 Button('查看连接诊断').id('openConnectionIssueDiagnostics').fontColor($r('app.color.accent'))
@@ -533,7 +543,7 @@ struct Home {
         Button('重新连接').id('reconnectConnection').fontSize(14).fontColor($r('app.color.accent'))
           .backgroundColor(Color.Transparent).enabled(!this.checking).onClick(() => { this.reconnect(); });
       }
-      if (this.phase === 'failed' || this.phase === 'unknown') {
+      if (!this.closed && (this.phase === 'failed' || this.phase === 'unknown')) {
         Button('恢复清理').id('recoverConnection').fontColor($r('app.color.danger'))
           .backgroundColor($r('app.color.surface_secondary')).onClick(() => { this.disconnect(); });
       }

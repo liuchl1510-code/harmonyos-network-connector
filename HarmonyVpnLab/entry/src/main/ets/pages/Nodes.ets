@@ -9,6 +9,7 @@ import { readImportedNodeIds, readImportedNavigationRequestId } from '../model/N
 import { isNodeManagementAllowed } from '../model/NodeEditGuard';
 import { ConnectionCommand, ConnectionStatus, readConnectionCommand, readConnectionStatus, writeConnectionCommand } from '../model/ConnectionControl';
 import { ProbeState, readProbeState, writeProbeState } from '../model/ProbeState';
+import { readConnectionLifecycle } from '../model/ConnectionLifecycle';
 import { NodeLatencyResult, fingerprintOutbound, latencyLabel, latencySecondaryLabel, readNodeLatencies } from '../model/NodeLatency';
 import { NodeLatencySortMode, nodeLatencySortLabel, sortCatalogNodes } from '../model/NodeLatencySort';
 import { LatencyRequest, writeLatencyRequest, writeLatencyProof } from '../model/LatencyProtocol';
@@ -94,14 +95,15 @@ struct Nodes {
     // Also protect a newly created Nodes page, which has no in-memory request
     // but can still see a previous extension's terminal status and live PID.
     const status = readConnectionStatus(filesDir);
-    if (status && Number.isSafeInteger(status.servicePid) && status.servicePid > 0) {
+    if (status && status.servicePid !== undefined && status.servicePid !== 0) {
+      if (!Number.isSafeInteger(status.servicePid) || status.servicePid <= 0 || status.servicePid > 2147483647) { return false; }
       try { return native.processAlive(status.servicePid) === false; } catch (_) { return false; }
     }
     return true;
   }
 
   private serviceExitConfirmed(request: LatencyRequest, status?: ConnectionStatus): boolean {
-    if (status?.runId === request.runId && Number.isSafeInteger(status.servicePid) && status.servicePid > 0) {
+    if (status?.runId === request.runId && Number.isSafeInteger(status.servicePid) && status.servicePid > 0 && status.servicePid <= 2147483647) {
       if (this.latencyServicePid > 0 && this.latencyServicePid !== status.servicePid) { return false; }
       this.latencyServicePid = status.servicePid;
     }
@@ -299,7 +301,7 @@ struct Nodes {
       value.commandRunId = command?.runId ?? ''; value.commandAction = command?.action ?? '';
       value.statusRunId = status?.runId ?? ''; value.statusPhase = status?.phase ?? '';
       value.cleanupConfirmed = status?.cleanupConfirmed === true; value.reconnectCount = status?.reconnectCount ?? 0;
-      value.servicePid = status?.runId === request.runId && Number.isSafeInteger(status.servicePid) && status.servicePid > 0 ?
+      value.servicePid = status?.runId === request.runId && Number.isSafeInteger(status.servicePid) && status.servicePid > 0 && status.servicePid <= 2147483647 ?
         status.servicePid : this.latencyServicePid;
       value.serviceExited = serviceExited;
       if (['stopped', 'failed'].includes(state.phase)) {
@@ -315,10 +317,9 @@ struct Nodes {
 
   private probeCurrent(request: LatencyRequest, epoch: number): boolean {
     if (this.cancelling || epoch !== this.pageEpoch || this.latencyRequest?.runId !== request.runId) { return false; }
-    const state = readProbeState(this.context().filesDir);
-    const status = readConnectionStatus(this.context().filesDir);
-    const command = readConnectionCommand(this.context().filesDir);
-    return state.runId === request.runId && state.kind === 'node-latency' && state.phase === 'active' &&
+    const assessment = readConnectionLifecycle(this.context().filesDir);
+    const state = assessment.state, status = assessment.status, command = assessment.command;
+    return state.runId === request.runId && state.kind === 'node-latency' && assessment.phase === 'active' &&
       command?.runId === request.runId && command.action !== 'stop' &&
       status?.runId === request.runId && status.phase === 'active' && (status.reconnectCount ?? 0) === 0;
   }
@@ -343,6 +344,10 @@ struct Nodes {
     const state = readProbeState(filesDir);
     const status = readConnectionStatus(filesDir);
     const serviceExited = this.serviceExitConfirmed(request, status);
+    const serviceInterrupted = serviceExited && state.runId === request.runId && !['stopped', 'failed'].includes(state.phase);
+    if (serviceInterrupted) {
+      this.stopBatch('service-exited'); this.cancelLatency();
+    }
     const batchAction = this.observeBatch(request, status, serviceExited);
     if (batchAction === 'aborted') {
       this.stopBatch(this.batchQueue?.reason ?? 'state-changed'); this.cancelLatency();
@@ -372,7 +377,9 @@ struct Nodes {
       if (batchAction === 'completed') {
         this.batchActive = false; this.updateBatchProgress(); this.message = '筛选结果已依次检测完毕，临时 VPN 已停止；当前选中节点保持不变。';
       } else if (this.batchProgress) {
-        if (this.batchQueue?.reason === 'cancelled') {
+        if (this.batchQueue?.reason === 'service-exited') {
+          this.message = `检测服务意外结束，${cleanupDetail}，已停止后续节点；请重新开始检测。`;
+        } else if (this.batchQueue?.reason === 'cancelled') {
           this.message = `批量检测已停止，${cleanupDetail}，未启动后续节点。`;
         } else if (this.batchQueue?.reason === 'start-failed') {
           this.message = '批量检测未能启动，未继续检测后续节点；请检查节点配置或 VPN 授权后重试。';
@@ -380,7 +387,8 @@ struct Nodes {
           this.message = `批量检测已停止，${cleanupDetail}；请检查授权、节点或网络后重新开始。`;
         }
       } else {
-        this.message = wasCancelling ? `检测已取消，${cleanupDetail}。` :
+        this.message = serviceInterrupted ? `检测服务意外结束，${cleanupDetail}，请重新检测。` :
+          wasCancelling ? `检测已取消，${cleanupDetail}。` :
           state.runId === request.runId && state.phase === 'failed' ? '检测未完成，请检查授权、节点和网络后重试。' : '检测已结束，临时 VPN 已停止。';
       }
       this.editable = this.canEdit();
@@ -396,7 +404,10 @@ struct Nodes {
     if (!request) { if (hadWork) { this.message = '已取消检测，未启动后续节点。'; } this.editable = this.canEdit(); return; }
     try {
       const state = readProbeState(this.context().filesDir);
-      if (state.runId === request.runId) { writeConnectionCommand(this.context().filesDir, new ConnectionCommand(request.runId, 'stop')); }
+      const command = readConnectionCommand(this.context().filesDir);
+      if (state.runId === request.runId && command?.runId === request.runId) {
+        writeConnectionCommand(this.context().filesDir, new ConnectionCommand(request.runId, 'stop', command.ownerEpoch));
+      }
     } catch (_) { this.message = '取消请求未保存，检测将在时限内自动结束。'; }
     this.message = '正在取消检测并清理临时 VPN…';
   }

@@ -10,6 +10,7 @@ import { describeError } from '../model/ErrorInfo';
 import { ConnectionCommand, isConnectionKind, writeConnectionCommand } from '../model/ConnectionControl';
 import { subscribeVpnAuthorization, unsubscribeVpnAuthorization } from '../model/VpnAuthorization';
 import { formContentWidth } from '../model/AdaptiveLayout';
+import { readConnectionLifecycle } from '../model/ConnectionLifecycle';
 
 interface FixtureReply {
   token: string;
@@ -98,6 +99,12 @@ struct Index {
 
   private refreshState(): void {
     let state = readProbeState(this.context().filesDir);
+    if (isConnectionKind(state.kind)) {
+      const assessment = readConnectionLifecycle(this.context().filesDir);
+      this.phase = assessment.phase; this.detail = assessment.detail;
+      this.runId = assessment.state.runId; this.testKind = assessment.state.kind;
+      return;
+    }
     const running = ['starting', 'active', 'recovering', 'waiting-network', 'stopping', 'stop_requested'].includes(state.phase);
     if (running && Date.now() - state.updatedAt > (state.kind === 'node' ? 30000 : 20000)) {
       state = new ProbeState('failed',
@@ -157,6 +164,12 @@ struct Index {
   }
 
   private async startProbe(): Promise<void> {
+    const assessment = readConnectionLifecycle(this.context().filesDir);
+    const status = assessment.status;
+    if (!assessment.managementAllowed || (status && status.servicePid !== undefined && status.servicePid !== 0 &&
+      assessment.servicePresence !== 'absent')) {
+      this.refreshState(); this.detail = '请先在首页结束连接并等待服务退出，再启动验证。'; return;
+    }
     const startedRunId = Date.now().toString();
     const startedKind = this.selectedKind;
     this.runId = startedRunId;
@@ -215,7 +228,7 @@ struct Index {
   }
 
   private busy(): boolean {
-    return ['starting', 'active', 'recovering', 'waiting-network', 'stopping', 'stop_requested'].includes(this.phase);
+    return ['starting', 'active', 'recovering', 'waiting-network', 'stopping', 'stop_requested', 'unknown', 'diagnostic'].includes(this.phase);
   }
 
   private phaseLabel(): string {
@@ -228,6 +241,9 @@ struct Index {
         : this.testKind === 'lifecycle' ? '网卡创建与释放检查通过' : '真实流量与清理检查通过';
       case 'failed': return '本次检查失败';
       case 'stopped': return '已停止';
+      case 'interrupted': return '连接已结束';
+      case 'unknown': return '连接状态待确认';
+      case 'diagnostic': return '其他验证正在运行';
       default: return '等待测试';
     }
   }

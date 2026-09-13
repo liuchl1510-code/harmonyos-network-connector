@@ -2,7 +2,9 @@
 
 使用 ArkTS / ArkUI 构建的鸿蒙原生节点管理与 IPv4 代理客户端，集成 Xray 26.6.1、Hev SOCKS5 Tunnel 2.9.0 和本地适配的 Go 1.26.7 工具链。
 
-应用显示名称为 **Harmony VPN**，当前开发版本为 **0.17.0/code38**。这是独立的开发项目，参考 v2rayNG 的功能与分享链接格式，不是 v2rayNG 或华为的官方客户端。完整 Android 功能对等和商店发布尚未完成。
+应用显示名称为 **Harmony VPN**，当前开发版本为 **0.18.0/code39**。这是独立的开发项目，参考 v2rayNG 的功能与分享链接格式，不是 v2rayNG 或华为的官方客户端。完整 Android 功能对等和商店发布尚未完成。
+
+0.18.0 统一异常退出后的连接状态，增加独立的服务退出观察记录，并保护重新连接与旧回调交错的边界。实现与验证状态见[阶段二十二记录](HarmonyVpnLab/docs/phase22-session-recovery.md)。
 
 0.17.0 增加首页实时代理网速及三种节点排序，保留累计流量、时长与原有检测指标。实现与当前验证状态见[阶段二十一记录](HarmonyVpnLab/docs/phase21-rates-and-sorting.md)。
 

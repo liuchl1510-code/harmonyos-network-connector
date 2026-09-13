@@ -13,6 +13,11 @@ const output = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true
 });
 assert.equal(output.diagnostics.length, 0, 'Guard must transpile without diagnostics');
+const lifecycleFilename = path.join(project, 'entry/src/main/ets/model/ConnectionLifecycle.ets');
+const lifecycleOutput = ts.transpileModule(fs.readFileSync(lifecycleFilename, 'utf8'), {
+  compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true
+});
+assert.equal(lifecycleOutput.diagnostics.length, 0, 'Shared lifecycle must transpile without diagnostics');
 
 const FILES = '/synthetic/safe-state';
 const RUN = 'synthetic-current-run';
@@ -43,17 +48,24 @@ class ConnectionStatus {
   }
 }
 
-function harness(state, status, processResult = true) {
+function harness(state, status, processResult = true, command = undefined) {
   const calls = { probeReads: [], statusReads: [], pids: [] };
   const imports = {
     './ProbeState': { readProbeState(filesDir) { calls.probeReads.push(filesDir); return state; } },
-    './ConnectionControl': { readConnectionStatus(filesDir) { calls.statusReads.push(filesDir); return status; } },
+    './ConnectionControl': { CONNECTION_UI_EPOCH: 'synthetic-current-ui',
+      isConnectionKind: kind => ['connection', 'connection-test', 'connection-app-test', 'node-latency'].includes(kind),
+      readConnectionCommand() { return command; },
+      readConnectionStatus(filesDir) { calls.statusReads.push(filesDir); return status; } },
     'libvpnbridge.so': { default: { processAlive(pid) {
       calls.pids.push(pid);
       if (processResult === 'throws') throw NATIVE_ERROR;
       return processResult;
     } } }
   };
+  const lifecycle = new Module(lifecycleFilename);
+  lifecycle.require = name => { assert(Object.hasOwn(imports, name)); return imports[name]; };
+  lifecycle._compile(lifecycleOutput.outputText, lifecycleFilename);
+  imports['./ConnectionLifecycle'] = lifecycle.exports;
   const module = new Module(filename);
   module.require = name => {
     assert(Object.hasOwn(imports, name), 'Unexpected production dependency in guard test');
@@ -79,7 +91,8 @@ function verify(state, status, allowed, processResult = true, queriedPid = undef
   }
   assert.deepEqual(h.calls.probeReads, [FILES, FILES]);
   assert.deepEqual(h.calls.statusReads, [FILES, FILES]);
-  assert.deepEqual(h.calls.pids, queriedPid === undefined ? [] : [queriedPid, queriedPid]);
+  const validPid = status && Number.isSafeInteger(status.servicePid) && status.servicePid > 0 && status.servicePid <= 2147483647;
+  assert.deepEqual(h.calls.pids, validPid ? [status.servicePid, status.servicePid] : []);
   cases++;
 }
 
@@ -99,7 +112,7 @@ check('all matching busy service states including recovery and network waiting d
     }
   }
 });
-check('confirmed destroyed for this run permits editing without probing the PID', () => {
+check('confirmed destroyed for this run permits editing even when PID inspection fails', () => {
   for (const phase of [...PROBE_BUSY, 'failed']) {
     verify(new ProbeState(phase),
       new ConnectionStatus('destroyed', { cleanupConfirmed: true, servicePid: 321 }), true, 'throws');
@@ -133,9 +146,10 @@ check('destroyed without cleanup acknowledgement cannot override active, recover
     verify(new ProbeState(phase), new ConnectionStatus('destroyed', { servicePid: 321 }), false, 'throws', 321);
   }
 });
-check('different-run active status cannot block a new idle state or query its PID', () => {
+check('different-run unresolved service blocks idle state until process absence is confirmed', () => {
   for (const phase of SERVICE_BUSY) {
-    verify(new ProbeState('idle'), new ConnectionStatus(phase, { runId: OLD_RUN, servicePid: 321 }), true, 'throws');
+    verify(new ProbeState('idle'), new ConnectionStatus(phase, { runId: OLD_RUN, servicePid: 321 }), false, 'throws');
+    verify(new ProbeState('idle'), new ConnectionStatus(phase, { runId: OLD_RUN, servicePid: 321 }), true, false);
   }
 });
 check('old-run cleanup acknowledgement or dead PID cannot authorize editing a new busy run', () => {

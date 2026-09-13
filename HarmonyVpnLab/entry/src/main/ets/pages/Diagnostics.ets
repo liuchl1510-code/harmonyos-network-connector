@@ -1,5 +1,7 @@
 import { common } from '@kit.AbilityKit';
 import { DiagnosticEvent, readDiagnosticEvents } from '../model/DiagnosticJournal';
+import { readConnectionRecoveries } from '../model/ConnectionRecoveryStore';
+import { readConnectionLifecycle } from '../model/ConnectionLifecycle';
 import { formContentWidth } from '../model/AdaptiveLayout';
 
 @Entry
@@ -8,17 +10,51 @@ struct Diagnostics {
   @StorageProp('windowWidthVp') windowWidthVp: number = 360;
   @State events: DiagnosticEvent[] = [];
   @State message: string = '';
+  @State connectionLabel: string = '状态待刷新';
+  @State connectionHint: string = '';
 
   private context(): common.UIAbilityContext { return this.getUIContext().getHostContext() as common.UIAbilityContext; }
   onPageShow(): void { this.reload(); }
 
   private reload(): void {
+    const filesDir = this.context().filesDir;
+    const events: DiagnosticEvent[] = [];
+    const messages: string[] = [];
     try {
-      this.events = readDiagnosticEvents(this.context().filesDir).slice().reverse();
-      this.message = this.events.length === 0 ? '暂无诊断记录。' : '';
-    } catch (_) {
-      this.events = [];
-      this.message = '诊断记录暂时无法读取，请稍后刷新。';
+      for (const event of readDiagnosticEvents(filesDir)) { events.push(event); }
+    } catch (_) { messages.push('服务诊断记录暂时无法读取，请稍后刷新。'); }
+    try {
+      for (const observation of readConnectionRecoveries(filesDir)) {
+        events.push(new DiagnosticEvent(observation.at, observation.runId, 'service-exit-observed', '', 0));
+      }
+    } catch (_) { messages.push('恢复观察记录暂时无法读取，原记录已保留。'); }
+    this.events = events.sort((left: DiagnosticEvent, right: DiagnosticEvent) => right.at - left.at);
+    this.message = messages.join(' ');
+    try {
+      const assessment = readConnectionLifecycle(filesDir);
+      const diagnostic = !['connection', 'connection-test', 'connection-app-test'].includes(assessment.state.kind);
+      this.connectionLabel = diagnostic && !assessment.closed &&
+        ['starting', 'active', 'recovering', 'waiting-network', 'stopping', 'stop_requested'].includes(assessment.phase) ?
+        '正在验证' : this.phaseLabel(assessment.phase);
+      this.connectionHint = assessment.cleanupConfirmed ? '已收到服务的清理完成回执。' :
+        assessment.serviceExited ? '记录的服务进程已结束，尚未收到清理完成回执。' :
+        assessment.phase === 'unknown' ? '当前服务状态尚未确认，可返回首页恢复清理。' :
+        assessment.closed ? '当前没有进行中的连接。' : '点击刷新可同步当前状态和记录。';
+    } catch (_) { this.connectionLabel = '状态暂不可用'; this.connectionHint = '请稍后刷新，或返回首页查看。'; }
+  }
+
+  private phaseLabel(phase: string): string {
+    switch (phase) {
+      case 'active': return '已连接';
+      case 'starting': return '正在连接';
+      case 'recovering': return '正在恢复连接';
+      case 'waiting-network': return '等待网络';
+      case 'stopping': case 'stop_requested': case 'destroying': return '正在断开';
+      case 'interrupted': return '连接已结束';
+      case 'failed': return '连接中断';
+      case 'unknown': return '连接状态未知';
+      case 'diagnostic': return '正在验证';
+      default: return '未连接';
     }
   }
 
@@ -43,6 +79,7 @@ struct Diagnostics {
       case 'protect-api-failed': return '连接保护失败';
       case 'stop-requested': return '收到断开请求';
       case 'session-stopped': return '连接已停止';
+      case 'service-exit-observed': return '观察到服务已结束';
       case 'latency-start': return '开始延迟检测';
       case 'latency-ok': return '延迟检测成功';
       case 'latency-failed': return '延迟检测未通过';
@@ -69,6 +106,7 @@ struct Diagnostics {
       case 'protect-stale-after': return `本次连接累计丢弃：${event.value} 次`;
       case 'protect-api-failed': return `本次连接累计保护失败：${event.value} 次`;
       case 'session-stopped': return event.value === 1 ? '资源清理已确认' : '资源清理尚未确认';
+      case 'service-exit-observed': return '检测时未收到清理完成回执；此记录不说明服务退出的具体原因。';
       case 'latency-ok': return `HTTPS 耗时：${event.value} ms`;
       default: return '';
     }
@@ -91,6 +129,13 @@ struct Diagnostics {
               .fontSize(15).fontColor($r('app.color.text_secondary'));
             Text('这里仅展示事件、时间、网络类型及相关计数。')
               .fontSize(14).fontColor($r('app.color.text_secondary'));
+            Column({ space: 8 }) {
+              Text(this.connectionLabel).id('diagnosticConnectionState').fontSize(17).fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_primary')).width('100%');
+              Text(this.connectionHint).id('diagnosticConnectionHint').fontSize(13)
+                .fontColor($r('app.color.text_secondary')).width('100%');
+            }.width('100%').padding(14).alignItems(HorizontalAlign.Start)
+              .backgroundColor($r('app.color.surface_secondary')).borderRadius(12);
             Button('刷新记录').id('refreshDiagnosticJournal').width('100%').constraintSize({ minHeight: 48 })
               .fontSize(16).fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
               .onClick(() => { this.reload(); });
@@ -98,13 +143,14 @@ struct Diagnostics {
             .backgroundColor($r('app.color.surface')).borderRadius(20)
             .border({ width: 1, color: $r('app.color.border') });
 
+          if (this.message.length > 0) {
+            Text(this.message).id('diagnosticJournalMessage').fontSize(14).width('100%')
+              .fontColor($r('app.color.warning'));
+          }
           if (this.events.length === 0) {
             Column({ space: 10 }) {
               Text('还没有可展示的事件').fontSize(18).fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.text_primary'));
-              if (this.message.length > 0) {
-                Text(this.message).id('diagnosticJournalMessage').fontSize(14).fontColor($r('app.color.text_secondary'));
-              }
               Text('连接、断开或检测延迟后，可点击“刷新记录”查看。')
                 .fontSize(14).fontColor($r('app.color.text_secondary'));
             }.id('diagnosticEmptyState').width('100%').padding(24).alignItems(HorizontalAlign.Start)
@@ -118,7 +164,8 @@ struct Diagnostics {
                 .fontColor(event.code === 'recovery-failed' || event.code === 'protect-api-failed' || event.code === 'latency-failed' ?
                   $r('app.color.danger') : $r('app.color.text_primary')).width('100%');
               Column({ space: 6 }) {
-                Text(`网络：${this.networkLabel(event.kind)}`).fontSize(13).fontColor($r('app.color.text_secondary'));
+                Text(event.code === 'service-exit-observed' ? '来源：应用状态检查' : `网络：${this.networkLabel(event.kind)}`)
+                  .fontSize(13).fontColor($r('app.color.text_secondary'));
                 if (this.countLabel(event).length > 0) {
                   Text(this.countLabel(event)).fontSize(13).fontColor($r('app.color.text_primary'));
                 }

@@ -30,6 +30,7 @@ function compile(relative, page = false) {
 const modelCode = compile('model/TransferRate.ets');
 const snapshotCode = compile('model/ConnectionSnapshot.ets');
 const homeCode = compile('pages/Home.ets', true);
+const lifecycleCode = compile('model/ConnectionLifecycle.ets');
 function execute(code, imports = {}, extra = {}) {
   const context = { exports: {}, require(name) { assert(Object.hasOwn(imports, name), name); return imports[name]; }, ...extra };
   vm.runInNewContext(code, context);
@@ -186,7 +187,7 @@ function homeHarness() {
   const state = { now: 10000, processAlive: true, timers: new Map(), nextTimer: 1, writes: [],
     probe: { runId: 'run-one', kind: 'connection', phase: 'active', updatedAt: 10000, detail: '' },
     command: { runId: 'run-one', action: 'start', ownerEpoch: 'current-ui' },
-    status: { runId: 'run-one', phase: 'active', reconnectCount: 0, networkKind: 'wifi', servicePid: 123,
+    status: { runId: 'run-one', phase: 'active', updatedAt: 10000, reconnectCount: 0, networkKind: 'wifi', servicePid: 123,
       cleanupConfirmed: false, snapshot: snapshot(10000, 10000, 20000) } };
   const imports = {
     '@kit.AbilityKit': {}, '@kit.NetworkKit': { vpnExtension: { startVpnExtensionAbility() { throw new Error('Unexpected VPN start'); } }, http: {} },
@@ -210,6 +211,11 @@ function homeHarness() {
     '../model/NetworkPolicyStore': { readNetworkPolicy: () => ({}) },
     '../model/NetworkPolicy': { networkPolicyLabel: () => '全部代理' }, '../model/TransferRate': rates
   };
+  imports['../model/ConnectionLifecycle'] = execute(lifecycleCode, {
+    'libvpnbridge.so': imports['libvpnbridge.so'], './ProbeState': imports['../model/ProbeState'],
+    './ConnectionControl': imports['../model/ConnectionControl']
+  }, { Date: class extends Date { static now() { return state.now; } } });
+  imports['../model/ConnectionRecoveryStore'] = { recordConnectionRecovery() {} };
   const { Home } = execute(homeCode, imports, {
     Date: class extends Date { static now() { return state.now; } }, $r: name => name,
     AppStorage: { get: () => false },
@@ -218,7 +224,7 @@ function homeHarness() {
   });
   const home = new Home(); home.getUIContext = () => ({ getHostContext: () => ({ filesDir: 'synthetic-memory-only' }) });
   function tick(at, up = 12000, down = 24000) {
-    state.now = at; state.probe.updatedAt = at; state.status.snapshot = snapshot(at, up, down); home.refresh();
+    state.now = at; state.probe.updatedAt = at; state.status.updatedAt = at; state.status.snapshot = snapshot(at, up, down); home.refresh();
   }
   home.refresh(); tick(12000);
   assert.equal(home.uplinkRate, '1000 B/s'); assert.equal(home.downlinkRate, '2.0 KB/s');
@@ -252,13 +258,13 @@ for (const kind of ['node-latency', 'lifecycle']) test('Home diagnostic early re
   const { home, state } = homeHarness(); state.probe.kind = kind; home.refresh();
   assert.equal(home.phase, 'diagnostic'); assert.equal(home.rateAvailable, false);
 });
-test('Home old UI process early return cannot retain a rate', () => {
+test('Home unresolved old UI process cannot retain a rate or authorize reconnect', () => {
   const { home, state } = homeHarness(); state.command.ownerEpoch = 'previous-ui'; home.refresh();
-  assert.equal(home.phase, 'interrupted'); assert.equal(home.rateAvailable, false);
+  assert.equal(home.phase, 'unknown'); assert.equal(home.closed, false); assert.equal(home.rateAvailable, false);
 });
 test('Home startup timeout early return clears rate and uses its existing cancellation path', () => {
   const { home, state } = homeHarness(); state.probe.phase = 'starting'; state.probe.updatedAt = 1000;
-  state.now = 40000; state.status.runId = 'older-run'; home.refresh();
+  state.now = 40000; state.status.runId = 'older-run'; state.processAlive = false; home.refresh();
   assert.equal(home.phase, 'failed'); assert.equal(home.rateAvailable, false);
   assert.deepEqual(state.writes, ['command', 'probe']);
 });
