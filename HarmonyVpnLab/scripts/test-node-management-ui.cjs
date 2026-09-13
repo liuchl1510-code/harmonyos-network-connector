@@ -33,7 +33,7 @@ function compile(relative, page = false) {
     assert.equal(output.diagnostics.length, 0, 'SDK transpilation failed: ' + relative);
     compiledFiles.set(relative, output.outputText);
 }
-for (const file of ['model/NodeImport.ets', 'model/NodeBatchImport.ets', 'model/SubscriptionFetch.ets', 'model/NodeEditGuard.ets', 'model/BatchLatency.ets', 'model/NodeScanner.ets', 'model/AdaptiveLayout.ets', 'model/NodeListFilter.ets', 'model/NodeListNavigation.ets']) compile(file);
+for (const file of ['model/NodeImport.ets', 'model/NodeBatchImport.ets', 'model/SubscriptionFetch.ets', 'model/NodeEditGuard.ets', 'model/BatchLatency.ets', 'model/NodeScanner.ets', 'model/AdaptiveLayout.ets', 'model/NodeListFilter.ets', 'model/NodeListNavigation.ets', 'model/NodeLatencySort.ets']) compile(file);
 for (const file of ['pages/NodeConfig.ets', 'pages/Subscriptions.ets', 'pages/Nodes.ets']) compile(file, true);
 function execute(relative, imports, timers = {}) {
     const context = { VPN_CORE_AVAILABLE: true, exports: {}, Error, Date, Uint8Array, ArrayBuffer, Promise, URL, TextDecoder, $r: name => name,
@@ -62,6 +62,8 @@ const batchLatency = execute('model/BatchLatency.ets', {});
 const adaptiveLayout = execute('model/AdaptiveLayout.ets', {});
 const nodeListFilter = execute('model/NodeListFilter.ets', {});
 const nodeListNavigation = execute('model/NodeListNavigation.ets', {});
+const nodeLatencySort = execute('model/NodeLatencySort.ets', {});
+const SortMode = nodeLatencySort.NodeLatencySortMode;
 const firstNode = single.parseNode(FIRST);
 const secondNode = single.parseNode(SECOND);
 const savedNode = (node, id = 'node-first', sourceId = '') => ({ ...clone(node), id, sourceId, modifiedAt: 1, favorite: false });
@@ -185,6 +187,7 @@ function harness(options = {}) {
         '../model/AdaptiveLayout': adaptiveLayout,
         '../model/NodeListFilter': nodeListFilter,
         '../model/NodeListNavigation': nodeListNavigation,
+        '../model/NodeLatencySort': nodeLatencySort,
         '../model/BuildCapabilities': { VPN_CORE_AVAILABLE: true },
         '@kit.AbilityKit': {},
         '@kit.ArkUI': { router: { RouterMode: { Single: 1 } } },
@@ -1213,9 +1216,46 @@ function casesBatchLatency() {
         p.nodes = clone(h.state.catalog.nodes); const before = clone(h.state.catalog);
         p.latencies = [latencyRecord(p.nodes[0], { durationMs: 400 }), latencyRecord(p.nodes[1], { durationMs: 100 }),
             latencyRecord(p.nodes[2], { status: 'failed', durationMs: 0, reason: 'https' })];
-        p.sortByLatency = true; assert.deepEqual(clone(p.filtered()).map(n => n.id), ['node-second', 'node-old', 'node-third']);
-        p.sortByLatency = false; assert.deepEqual(clone(p.filtered()).map(n => n.id), before.nodes.map(n => n.id));
+        p.selectSortMode(SortMode.FirstHttps); assert.deepEqual(clone(p.filtered()).map(n => n.id), ['node-second', 'node-old', 'node-third']);
+        p.selectSortMode(SortMode.Original); assert.deepEqual(clone(p.filtered()).map(n => n.id), before.nodes.map(n => n.id));
         assert.deepEqual(h.state.catalog, before); assert.equal(p.activeId, before.activeNodeId); assert.equal(h.state.writes.length, 0);
+    });
+    add('reuse mode keeps only confirmed reuse ahead of all other outcomes without changing selection', () => {
+        const { h, p } = setup();
+        h.state.catalog.nodes = Array.from({ length: 8 }, (_, i) => savedNode(firstNode, 'sort-' + i));
+        h.state.catalog.activeNodeId = 'sort-2'; p.nodes = clone(h.state.catalog.nodes); p.activeId = 'sort-2';
+        const before = clone(h.state.catalog);
+        p.latencies = p.nodes.slice(0, 7).map((node, i) => latencyRecord(node, {
+            durationMs: 800 - i, measurementVersion: 2, secondStatus: 'passed', secondDurationMs: 200,
+            secondReason: '', secondConnection: 'reused'
+        }));
+        p.latencies[0].measurementVersion = 1;
+        p.latencies[2].secondConnection = 'new';
+        p.latencies[3].secondConnection = 'unknown';
+        p.latencies[4].secondStatus = 'failed'; p.latencies[4].secondReason = 'timeout';
+        p.latencies[6].secondDurationMs = 100;
+        p.limit = 100; p.selectSortMode(SortMode.Reused);
+        assert.equal(p.limit, 50); assert.equal(p.sortModeLabel(), '复用延迟');
+        assert.deepEqual(clone(p.filtered()).map(n => n.id), ['sort-6', 'sort-1', 'sort-5', 'sort-0', 'sort-2', 'sort-3', 'sort-4', 'sort-7']);
+        p.selectSortMode(SortMode.Original); assert.equal(p.sortModeLabel(), '原始顺序');
+        assert.deepEqual(clone(p.filtered()), before.nodes); assert.deepEqual(h.state.catalog, before);
+        assert.equal(p.activeId, before.activeNodeId); assert.equal(h.state.writes.length, 0);
+    });
+    add('all three sort modes compose with favorites, source, search and imported filters', () => {
+        const { h, p } = setup();
+        h.state.catalog.nodes = Array.from({ length: 9 }, (_, i) => ({
+            ...savedNode(firstNode, 'filter-' + i, i % 2 ? 'source-a' : ''), name: 'Match ' + i, favorite: i !== 5
+        }));
+        p.nodes = clone(h.state.catalog.nodes); const before = clone(h.state.catalog);
+        p.latencies = p.nodes.map((node, i) => latencyRecord(node, { durationMs: 100 - i,
+            measurementVersion: 2, secondStatus: 'passed', secondDurationMs: 50 + i, secondReason: '', secondConnection: 'reused' }));
+        p.favoritesOnly = true; p.sourceFilterId = 'source-a'; p.search = 'Match';
+        p.importedOnly = true; p.importedNodeIds = ['filter-1', 'filter-3', 'filter-5'];
+        for (const mode of [SortMode.Original, SortMode.FirstHttps, SortMode.Reused]) {
+            p.selectSortMode(mode);
+            assert.deepEqual(clone(p.filtered()).map(n => n.id), mode === SortMode.FirstHttps ? ['filter-3', 'filter-1'] : ['filter-1', 'filter-3']);
+        }
+        assert.deepEqual(h.state.catalog, before); assert.equal(h.state.writes.length, 0);
     });
     return cases;
 }
@@ -1235,7 +1275,7 @@ function casesNodePerformance() {
     }
     add('500-node latency ordering matches the prior stable semantics using one result index', () => {
         const h = harness(), p = h.page('Nodes'); largeCatalog(h);
-        p.nodes = clone(h.state.catalog.nodes); p.activeId = h.state.catalog.activeNodeId; p.sortByLatency = true;
+        p.nodes = clone(h.state.catalog.nodes); p.activeId = h.state.catalog.activeNodeId; p.selectSortMode(SortMode.FirstHttps);
         const plainRecords = clone(h.state.latencyRecords);
         let referenceVisits = 0, indexedIdReads = 0;
         const expected = [...p.nodes].sort((left, right) => {
@@ -1257,7 +1297,7 @@ function casesNodePerformance() {
     });
     add('indexed ordering preserves ties, failed/missing placement and search semantics', () => {
         const h = harness(), p = h.page('Nodes'); largeCatalog(h);
-        p.nodes = clone(h.state.catalog.nodes); p.sortByLatency = true;
+        p.nodes = clone(h.state.catalog.nodes); p.selectSortMode(SortMode.FirstHttps);
         p.latencies = h.state.latencyRecords.filter((_, i) => i % 5 !== 0).map((result, i) => ({
             ...result, status: i % 4 === 0 ? 'failed' : 'passed', reason: i % 4 === 0 ? 'timeout' : '', durationMs: i % 3 === 0 ? 10 : 20
         }));
@@ -1270,7 +1310,7 @@ function casesNodePerformance() {
             });
             assert.deepEqual(clone(p.filtered()).map(node => node.id), expected.map(node => node.id));
         }
-        p.sortByLatency = false; p.search = ''; assert.deepEqual(clone(p.filtered()), clone(p.nodes));
+        p.selectSortMode(SortMode.Original); p.search = ''; assert.deepEqual(clone(p.filtered()), clone(p.nodes));
     });
     add('first appearance/show reads once and unchanged return reuses all 500 fingerprints', async () => {
         const h = harness(), p = h.page('Nodes'); largeCatalog(h);

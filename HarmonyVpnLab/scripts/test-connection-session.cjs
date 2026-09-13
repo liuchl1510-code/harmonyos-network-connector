@@ -9,7 +9,7 @@ const crypto = require('node:crypto');
 const root = path.resolve(__dirname, '..');
 const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio';
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
-const names = ['model/ConnectionControl.ets', 'model/ConnectionSnapshot.ets', 'model/ConnectionNotification.ets',
+const names = ['model/ConnectionControl.ets', 'model/ConnectionSnapshot.ets', 'model/ConnectionNotification.ets', 'model/TransferRate.ets',
   'model/ProbeState.ets', 'model/NodeBootstrap.ets', 'model/NetworkPolicy.ets', 'model/VpnAuthorization.ets', 'vpn/VpnProbeAbility.ets', 'pages/Home.ets', 'pages/Index.ets'];
 const sources = new Map(names.map(name => [name, fs.readFileSync(path.join(root, 'entry/src/main/ets', name), 'utf8')]));
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
@@ -105,6 +105,7 @@ function scenario(options = {}) {
     return exported;
   }
   Object.assign(shared, load('model/ConnectionSnapshot.ets'));
+  Object.assign(shared, load('model/TransferRate.ets'));
   Object.assign(shared, load('model/ConnectionControl.ets'));
   const writeConnectionCommand = shared.writeConnectionCommand;
   shared.writeConnectionCommand = (filesDir, command) => {

@@ -23,6 +23,13 @@ function layoutFixture(extraSide = []) {
 let passed = 0;
 function test(name, run) { run(); passed++; console.log('PASS ' + name); }
 for (const [name, api] of [['product', product], ['network', network]]) {
+  test(name + ': an unrelated offline device does not reject the selected connected phone', () => {
+    api.assertCommandOutput(['list', 'targets', '-v'], listing);
+    assert.equal(api.selectUsbTarget(listing, phone), phone);
+    assert.throws(() => api.selectUsbTarget(listing, 'OFFLINE_USB'));
+    assert.throws(() => api.assertCommandOutput(['-t', phone, 'shell', 'uitest'], 'device is Offline'));
+    assert.throws(() => api.assertCommandOutput(['list', 'targets', '-v'], '[Fail]listing failed'));
+  });
   test(name + ': legacy CLI and explicit target in either order', () => {
     assert.deepEqual(api.parseCommandLine([]), { mode: 'Inspect', target: '' });
     assert.deepEqual(api.parseCommandLine(['Settings']), { mode: 'Settings', target: '' });

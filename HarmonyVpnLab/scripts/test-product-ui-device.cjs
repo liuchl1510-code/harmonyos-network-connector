@@ -152,6 +152,14 @@ function rect(node) {
   return values;
 }
 
+function assertCommandOutput(args, value) {
+  const targetListing = args[0] === 'list' && args[1] === 'targets';
+  // A disconnected emulator or other USB device must not invalidate a healthy
+  // explicitly selected phone. selectUsbTarget checks the selected row next.
+  ensure(!/\[Fail\]|device.*not found|no connected device/i.test(value) &&
+    (targetListing || !/\boffline\b/i.test(value)), 'DEVICE_COMMAND_FAILED');
+}
+
 function createDriver(mode, targetDevice = '') {
   ensure(MODES.includes(mode), 'INVALID_MODE');
   let device;
@@ -167,7 +175,7 @@ function createDriver(mode, targetDevice = '') {
     try {
       const value = cp.execFileSync(HDC, args, { encoding: 'utf8', windowsHide: true,
         timeout: remaining, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
-      ensure(!/\[Fail\]|device.*not found|no connected device|\boffline\b/i.test(value), 'DEVICE_COMMAND_FAILED');
+      assertCommandOutput(args, value);
       return value;
     } catch (error) { if (error instanceof DriverError) throw error; throw new DriverError('DEVICE_COMMAND_FAILED'); }
   }
@@ -336,7 +344,7 @@ function createDriver(mode, targetDevice = '') {
   return { run };
 }
 
-module.exports = { DriverError, MODES, PAGE_IDS, CLICK_IDS, projectLayout, pageOf, safeState, rect, parseCommandLine, selectUsbTarget };
+module.exports = { DriverError, MODES, PAGE_IDS, CLICK_IDS, projectLayout, pageOf, safeState, rect, parseCommandLine, selectUsbTarget, assertCommandOutput };
 if (require.main === module) {
   let options;
   try { options = parseCommandLine(process.argv.slice(2)); }

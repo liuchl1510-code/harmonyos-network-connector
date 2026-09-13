@@ -10,9 +10,10 @@ import { isNodeManagementAllowed } from '../model/NodeEditGuard';
 import { ConnectionCommand, ConnectionStatus, readConnectionCommand, readConnectionStatus, writeConnectionCommand } from '../model/ConnectionControl';
 import { ProbeState, readProbeState, writeProbeState } from '../model/ProbeState';
 import { NodeLatencyResult, fingerprintOutbound, latencyLabel, latencySecondaryLabel, readNodeLatencies } from '../model/NodeLatency';
+import { NodeLatencySortMode, nodeLatencySortLabel, sortCatalogNodes } from '../model/NodeLatencySort';
 import { LatencyRequest, writeLatencyRequest, writeLatencyProof } from '../model/LatencyProtocol';
 import { measureNodeLatency } from '../model/LatencyProbe';
-import { BatchLatencyTarget, BatchLatencyObservation, BatchLatencyQueue, latencySortRank } from '../model/BatchLatency';
+import { BatchLatencyTarget, BatchLatencyObservation, BatchLatencyQueue } from '../model/BatchLatency';
 import { AppTabBar } from '../components/AppTabBar';
 import { AppSideNav } from '../components/AppSideNav';
 import { NodeDetailsCard } from '../components/NodeDetailsCard';
@@ -46,7 +47,7 @@ struct Nodes {
   @State preparing: boolean = false;
   @State batchActive: boolean = false;
   @State batchProgress: string = '';
-  @State sortByLatency: boolean = false;
+  @State sortMode: NodeLatencySortMode = NodeLatencySortMode.Original;
   @State favoritesOnly: boolean = false;
   @State sourceFilterId: string = '$all';
   @State importedOnly: boolean = false;
@@ -404,23 +405,10 @@ struct Nodes {
     const filter = new NodeListFilter();
     filter.query = this.search; filter.sourceId = this.sourceFilterId; filter.favoritesOnly = this.favoritesOnly;
     filter.importedOnly = this.importedOnly; filter.importedNodeIds = this.importedNodeIds;
-    const nodes = filterCatalogNodes(this.nodes, filter);
-    if (this.sortByLatency) {
-      const resultsById: Map<string, NodeLatencyResult> = new Map<string, NodeLatencyResult>();
-      for (const result of this.latencies) {
-        const id = result.nodeId;
-        if (!resultsById.has(id)) { resultsById.set(id, result); }
-      }
-      nodes.sort((left: SavedNode, right: SavedNode): number => {
-        const leftResult = resultsById.get(left.id);
-        const rightResult = resultsById.get(right.id);
-        const leftRank = latencySortRank(leftResult?.status ?? '', leftResult?.durationMs ?? 0);
-        const rightRank = latencySortRank(rightResult?.status ?? '', rightResult?.durationMs ?? 0);
-        return leftRank === rightRank ? 0 : leftRank < rightRank ? -1 : 1;
-      });
-    }
-    return nodes;
+    return sortCatalogNodes(filterCatalogNodes(this.nodes, filter), this.latencies, this.sortMode);
   }
+  private selectSortMode(mode: NodeLatencySortMode): void { this.sortMode = mode; this.limit = 50; }
+  private sortModeLabel(): string { return nodeLatencySortLabel(this.sortMode); }
   private visibleNodes(): SavedNode[] { return this.filtered().slice(0, this.limit); }
   private sourceName(id: string): string { return id ? (this.sources.find((item: SubscriptionSource) => item.id === id)?.name ?? '订阅') : '手动导入'; }
 
@@ -615,12 +603,16 @@ struct Nodes {
               .padding({ left: 10, right: 10, top: 10, bottom: 10 }).backgroundColor($r('app.color.accent_soft'))
               .enabled(VPN_CORE_AVAILABLE && this.editable && this.filtered().length > 0).onClick(() => { this.startBatch(); });
             Button({ type: ButtonType.Normal }) {
-              Text(this.sortByLatency ? '恢复原顺序' : '按首次耗时排序').fontSize(13).fontColor($r('app.color.text_secondary'))
-                .width('100%').textAlign(TextAlign.Center);
+              Text('排序：' + this.sortModeLabel() + ' ▾').fontSize(13).lineHeight('19fp').maxLines(2)
+                .fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.Center);
             }.id('sortNodeLatency').constraintSize({ minHeight: 44 }).borderRadius(14).layoutWeight(1)
               .padding({ left: 10, right: 10, top: 10, bottom: 10 }).backgroundColor($r('app.color.surface_secondary'))
-              .onClick(() => { this.sortByLatency = !this.sortByLatency; });
+              .accessibilityText('节点排序，当前为' + this.sortModeLabel()).bindMenu(this.sortNodeMenu);
           }.width(this.wideNodeRows() ? 448 : '100%');
+          if (this.sortMode === NodeLatencySortMode.Reused) {
+            Text('按已确认复用的成功结果排序，其余节点按原顺序排在后面。').id('nodeReuseSortNotice')
+              .fontSize(12).lineHeight('19fp').fontColor($r('app.color.text_secondary')).width('100%');
+          }
           Row({ space: 8 }) {
             Text('检测仅临时接管本应用，结束后自动断开。').id('nodeLatencyScopeNotice')
               .fontSize(12).fontColor($r('app.color.text_secondary')).layoutWeight(1);
@@ -636,7 +628,7 @@ struct Nodes {
                 .fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
               Text('首次 HTTPS 包含本次域名解析、连接与响应耗时，不含 VPN 启动时间。随后向同一地址再次请求；系统确认连接复用时，单独显示复用延迟，否则注明新建连接或复用未确认。旧记录只保留原首次耗时。')
                 .fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
-              Text('每次请求最多 8 秒，两个请求最多 16 秒。第二次失败会单独提示；取消或网络变化会中止整次检测。排序始终使用首次耗时，结果不代表带宽或 TCP 往返延迟，检测不会切换当前选中节点。')
+              Text('每次请求最多 8 秒，两个请求最多 16 秒。第二次失败会单独提示；取消或网络变化会中止整次检测。可按首次耗时或已确认的复用延迟排序；没有对应成功指标的节点排在后面，同值保持原顺序。结果不代表带宽或 TCP 往返延迟，检测和排序不会切换当前选中节点。')
                 .fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
             }.id('nodeLatencyHelp').padding(14).width('100%').alignItems(HorizontalAlign.Start)
               .backgroundColor($r('app.color.surface_secondary')).borderRadius(12);
@@ -795,6 +787,21 @@ struct Nodes {
       if (!useSideNavigation(this.windowWidthVp)) { AppTabBar({ current: 'nodes' }); }
     }.layoutWeight(1).height('100%').alignItems(HorizontalAlign.Center);
     }.width('100%').height('100%').backgroundColor($r('app.color.page_bg'));
+  }
+
+  @Builder
+  private sortNodeMenu() {
+    Menu() {
+      MenuItem({ content: '原始顺序' }).id('sortNodesOriginal').contentFontColor($r('app.color.text_primary'))
+        .selected(this.sortMode === NodeLatencySortMode.Original).selectIcon(true)
+        .onClick(() => { this.selectSortMode(NodeLatencySortMode.Original); });
+      MenuItem({ content: '首次 HTTPS 耗时' }).id('sortNodesFirstHttps').contentFontColor($r('app.color.text_primary'))
+        .selected(this.sortMode === NodeLatencySortMode.FirstHttps).selectIcon(true)
+        .onClick(() => { this.selectSortMode(NodeLatencySortMode.FirstHttps); });
+      MenuItem({ content: '复用延迟' }).id('sortNodesReused').contentFontColor($r('app.color.text_primary'))
+        .selected(this.sortMode === NodeLatencySortMode.Reused).selectIcon(true)
+        .onClick(() => { this.selectSortMode(NodeLatencySortMode.Reused); });
+    }.backgroundColor($r('app.color.surface'));
   }
 
   @Builder

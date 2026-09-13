@@ -182,6 +182,11 @@ async function runBenchmark(options, adapters = {}) {
       sameCandidate(expected);
       const before = stat(pid), start = now();
       click(controls.find(item => item.id === 'sortNodeLatency'));
+      const optionId = i % 2 === 0 ? 'sortNodesFirstHttps' : 'sortNodesOriginal';
+      controls = await until(items => ['sortNodesOriginal', 'sortNodesFirstHttps', 'sortNodesReused']
+        .every(id => items.some(item => item.id === id)));
+      sameCandidate(expected);
+      click(controls.find(item => item.id === optionId));
       const expectedFirstNode = i % 2 === 0 ? 'nodeName-qa-load-500' : 'nodeName-qa-load-001';
       controls = await until(items => items.find(item => item.id?.startsWith('nodeName-qa-load-'))?.id === expectedFirstNode);
       const after = stat(pid);
@@ -198,7 +203,7 @@ async function runBenchmark(options, adapters = {}) {
       nodes: 500, historySynthetic: true, fixtureValidation: 'UI count and sentinel rows; complete fixture validation belongs to the fixture workflow',
       initiatedNetworkActions: 0, networkRequestsObserved: null, totalTimeoutMs: TOTAL_TIMEOUT_MS,
       stopMarker: path.relative(root, stopFile), results,
-      scope: 'Sort action to expected first row via UI inspector; includes HDC overhead. CPU units are OS clock ticks. No VPN/network measurement.' };
+      scope: 'Sort menu open and selection to expected first row via UI inspector; includes HDC overhead. CPU units are OS clock ticks. No VPN/network measurement.' };
     check(); io.writeFileSync(path.join(dir, 'result.json'), JSON.stringify(result, null, 2));
     return result;
   } catch (error) {

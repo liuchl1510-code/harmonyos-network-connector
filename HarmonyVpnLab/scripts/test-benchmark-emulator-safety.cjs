@@ -14,7 +14,7 @@ function fixture() {
   const projectionFile = path.join(qaDir, 'pc-' + LABEL + '.json');
   const files = new Map(), directories = new Set(), handles = new Map();
   const state = { clock: 0, commands: [], writes: [], nextFd: 1, closed: 0,
-    helperCalls: 0, snapshots: 0, cleanups: 0, clicks: 0, sorted: false, stop: false,
+    helperCalls: 0, snapshots: 0, cleanups: 0, clicks: 0, sorted: false, menuOpen: false, menuSelections: [], stop: false,
     guest: { 'const.product.model': 'emulator', 'const.product.name': 'emulator', 'const.product.cpu.abilist': 'x86_64' },
     info: { versionName: '0.14.0-ui-preview', versionCode: 35, applicationInfo: { cpuAbi: 'x86_64' } },
     record: { target: TARGET, versionName: '0.14.0-ui-preview', versionCode: 35, sha256: HASH },
@@ -51,6 +51,8 @@ function fixture() {
     if (state.deepTree) return { attributes: {}, children: Array.from({ length: 20001 }, () => item('synthetic')) };
     const children = [item('nodeCount', state.count), item('sortNodeLatency', '', { bounds: state.bounds }),
       item(state.sorted ? 'nodeName-qa-load-500' : 'nodeName-qa-load-001')];
+    if (state.menuOpen) children.push(item('sortNodesFirstHttps', '', { bounds: '[10,100][110,150]' }),
+      item('sortNodesOriginal', '', { bounds: '[10,160][110,210]' }), item('sortNodesReused', '', { bounds: '[10,220][110,270]' }));
     if (state.sentinel) children.push(item('nodeLatency-qa-load-001', '首次 HTTPS 500 ms\n复用延迟 未检测（旧记录）'));
     return { attributes: { bundleName: 'com.example.harmonyvpnlab', visible: 'true' }, children };
   }
@@ -84,7 +86,12 @@ function fixture() {
         totalTicks: Math.floor(state.clock / 10) });
     }
     if (shell[0] === 'uitest' && shell[1] === 'uiInput' && shell[2] === 'click') {
-      state.clicks++; state.sorted = !state.sorted;
+      state.clicks++;
+      if (shell[4] === '45') { assert.equal(state.menuOpen, false); state.menuOpen = true; }
+      else {
+        assert.equal(state.menuOpen, true); assert(['125', '185'].includes(shell[4]));
+        state.sorted = shell[4] === '125'; state.menuSelections.push(state.sorted ? 'first-https' : 'original'); state.menuOpen = false;
+      }
       if (state.stopAfterClick) state.stop = true;
       if (state.swapAfterClick) { state.record.sha256 = 'c'.repeat(64); updateRecord(); }
       return '';
@@ -121,6 +128,8 @@ async function main() {
     assert.equal(result.version, '0.14.0-ui-preview'); assert.equal(result.networkRequestsObserved, null);
     assert.equal(result.initiatedNetworkActions, 0); assert.equal(result.totalTimeoutMs, TOTAL_TIMEOUT_MS);
     assert.equal(f.state.helperCalls, 1); assert.equal(f.state.snapshots, f.state.cleanups); assert.equal(f.handles.size, 0);
+    assert.equal(f.state.clicks, 12); assert.deepEqual(f.state.menuSelections,
+      ['first-https', 'original', 'first-https', 'original', 'first-https', 'original']);
     assert(f.state.commands.slice(0, 3).every(c => c.args[3] === 'param'));
     assert(f.state.commands.every(c => c.file === process.execPath || c.args[1] === TARGET));
     assert(!f.state.commands.some(c => c.args.includes('file') || c.args.includes('send') || c.args.includes('install')));

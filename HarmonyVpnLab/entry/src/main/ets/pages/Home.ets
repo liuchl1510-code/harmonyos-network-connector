@@ -18,6 +18,7 @@ import { useSideNavigation, primaryContentWidth, formContentWidth, homeUsesColum
 import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
 import { readNetworkPolicy } from '../model/NetworkPolicyStore';
 import { networkPolicyLabel } from '../model/NetworkPolicy';
+import { TransferRateTracker, formatTransferRate } from '../model/TransferRate';
 
 @Entry
 @Component
@@ -33,6 +34,9 @@ struct Home {
   @State runId: string = '';
   @State uplink: number = 0;
   @State downlink: number = 0;
+  @State uplinkRate: string = '—';
+  @State downlinkRate: string = '—';
+  @State rateAvailable: boolean = false;
   @State startedAt: number = 0;
   @State now: number = Date.now();
   @State ipv6Blocked: number = 0;
@@ -50,6 +54,7 @@ struct Home {
   private authorizationSubscription: number = -1;
   private checkGeneration: number = 0;
   private startGeneration: number = 0;
+  private rateTracker: TransferRateTracker = new TransferRateTracker();
 
   private context(): common.UIAbilityContext {
     return this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -79,12 +84,14 @@ struct Home {
   }
 
   aboutToDisappear(): void {
+    this.resetTransferRate();
     if (this.poll >= 0) { clearInterval(this.poll); this.poll = -1; }
     unsubscribeVpnAuthorization(this.authorizationSubscription);
     this.authorizationSubscription = -1;
   }
 
   onPageShow(): void {
+    this.resetTransferRate();
     if (AppStorage.get<boolean>('openDeveloperTools') === true) {
       AppStorage.set('openDeveloperTools', false); this.developerTools = true;
     }
@@ -94,6 +101,7 @@ struct Home {
   }
 
   onPageHide(): void {
+    this.resetTransferRate();
     if (this.poll >= 0) { clearInterval(this.poll); this.poll = -1; }
   }
 
@@ -174,11 +182,13 @@ struct Home {
     }
     const active = ['starting', 'active', 'recovering', 'waiting-network', 'stopping', 'stop_requested'].includes(state.phase);
     if (state.kind === 'node-latency') {
+      this.resetTransferRate();
       this.phase = active ? 'diagnostic' : 'idle'; this.closed = !active;
       this.detail = active ? '节点延迟检测正在运行，请在节点列表中查看或取消。' : '';
       return;
     }
     if (!isConnectionKind(state.kind)) {
+      this.resetTransferRate();
       this.phase = active ? 'diagnostic' : 'idle';
       this.detail = active ? '开发验证正在运行，请等待它结束。' : '';
       this.closed = !active;
@@ -187,6 +197,7 @@ struct Home {
     this.runId = state.runId;
     const command = readConnectionCommand(filesDir);
     if (command?.ownerEpoch && command.ownerEpoch !== CONNECTION_UI_EPOCH) {
+      this.resetTransferRate();
       // The platform ties VPN lifetime to its starting UI process. A new UI
       // process must not display the old process's persisted connection as live.
       this.phase = 'interrupted';
@@ -208,6 +219,7 @@ struct Home {
       writeProbeState(filesDir, new ProbeState(this.phase, this.detail, state.runId, state.kind));
       this.startGeneration++; this.requesting = false;
       this.closed = true;
+      this.resetTransferRate();
       return;
     }
     if (status?.runId === state.runId && (status.reconnectCount ?? 0) !== this.reconnectCount) {
@@ -239,6 +251,19 @@ struct Home {
       this.detail = '连接状态更新中断，请先断开或恢复清理。';
     }
     if (!active && status?.runId !== state.runId) { this.closed = true; }
+    if (this.phase === 'active' && status?.runId === state.runId && status.phase === 'active' && !serviceGone) {
+      const rate = this.rateTracker.update(state.runId, status.reconnectCount ?? 0, status.snapshot, this.now);
+      this.rateAvailable = rate.available;
+      this.uplinkRate = formatTransferRate(rate.available, rate.uplinkPerSecond);
+      this.downlinkRate = formatTransferRate(rate.available, rate.downlinkPerSecond);
+    } else { this.resetTransferRate(); }
+  }
+
+  private resetTransferRate(): void {
+    this.rateTracker.reset();
+    this.rateAvailable = false;
+    this.uplinkRate = '—';
+    this.downlinkRate = '—';
   }
 
   private busy(): boolean { return ['starting', 'active', 'recovering', 'waiting-network', 'stopping', 'stop_requested', 'unknown', 'diagnostic'].includes(this.phase); }
@@ -280,6 +305,7 @@ struct Home {
       this.runId = runId;
       this.checking = false;
       this.uplink = 0; this.downlink = 0; this.startedAt = 0;
+      this.resetTransferRate();
       this.ipv6Blocked = 0; this.dnsRequests = 0; this.exitMarker = '';
       this.closed = false;
       this.checkResult = '连接后可检查域名 HTTPS。';
@@ -320,6 +346,7 @@ struct Home {
     try {
       writeConnectionCommand(this.context().filesDir, new ConnectionCommand(this.runId, 'reconnect', command.ownerEpoch));
       this.checkGeneration++; this.checking = false; this.phase = 'recovering';
+      this.resetTransferRate();
       this.checkResult = '正在请求重连。'; this.exitMarker = '';
     } catch (_) { this.detail = '重新连接请求未保存，请重试。'; }
   }
@@ -572,18 +599,25 @@ struct Home {
           Text(this.duration()).fontSize(12).fontColor($r('app.color.text_secondary'));
         }
       }.width('100%');
-      Row({ space: 20 }) {
+      Row({ space: 16 }) {
         Column({ space: 6 }) {
-          Text('↑  上传').fontSize(12).fontColor($r('app.color.text_secondary'));
-          Text(this.startedAt > 0 ? formatBytes(this.uplink) : '—').id('connectionUplink').fontSize(23).fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.text_primary'));
+          Text('↑  代理上传').fontSize(12).fontColor($r('app.color.text_secondary'));
+          Text(this.uplinkRate).id('connectionUplinkRate').fontSize(23).minFontSize(16).maxFontSize(23).maxLines(1)
+            .fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary')).width('100%');
+          Text(this.startedAt > 0 ? '累计 ' + formatBytes(this.uplink) : '累计 —').id('connectionUplink').fontSize(12)
+            .fontColor($r('app.color.text_secondary')).width('100%');
         }.layoutWeight(1).alignItems(HorizontalAlign.Start);
         Column({ space: 6 }) {
-          Text('↓  下载').fontSize(12).fontColor($r('app.color.text_secondary'));
-          Text(this.startedAt > 0 ? formatBytes(this.downlink) : '—').id('connectionDownlink').fontSize(23).fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.text_primary'));
+          Text('↓  代理下载').fontSize(12).fontColor($r('app.color.text_secondary'));
+          Text(this.downlinkRate).id('connectionDownlinkRate').fontSize(23).minFontSize(16).maxFontSize(23).maxLines(1)
+            .fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary')).width('100%');
+          Text(this.startedAt > 0 ? '累计 ' + formatBytes(this.downlink) : '累计 —').id('connectionDownlink').fontSize(12)
+            .fontColor($r('app.color.text_secondary')).width('100%');
         }.layoutWeight(1).alignItems(HorizontalAlign.Start);
       }.width('100%');
+      Text(this.rateAvailable ? '实时速率按最近两次采样计算，约每 2 秒更新。' :
+        this.phase === 'active' ? '等待新的流量采样；速率暂不可用时显示 —。' : '连接后显示实时速率，累计量仅统计代理流量。')
+        .id('connectionRateHint').fontSize(12).fontColor($r('app.color.text_secondary')).width('100%');
     }.width('100%').padding(20).backgroundColor($r('app.color.surface')).borderRadius(20);
   }
 

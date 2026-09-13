@@ -16,11 +16,13 @@ const DNS_FIXTURE = 'https://cloudflare-dns.com/dns-query';
 const MODES = ['Inspect', 'Nodes', 'Settings', 'NetworkSettings', 'NetworkBack', 'RoutingGlobal', 'RoutingRules',
   'BypassLanOn', 'BypassLanOff', 'BypassLanToggle', 'SaveNetwork', 'BlockCloudflareSave', 'DirectCloudflare', 'DnsHostname', 'RestoreNetworkDefaults',
   'Backup', 'BackupBack', 'BackupSavePicker', 'EditorFirst', 'EditorBack', 'BatchStart', 'BatchCancel',
-  'SortLatency', 'SortOriginal', 'SelfTest'];
+  'SortLatency', 'SortReused', 'SortOriginal', 'SelfTest'];
+const SORT_OPTIONS = { original: 'sortNodesOriginal', 'first-https': 'sortNodesFirstHttps', reused: 'sortNodesReused' };
+const SORT_LABELS = { original: '排序：原始顺序 ▾', 'first-https': '排序：首次 HTTPS ▾', reused: '排序：复用延迟 ▾' };
 const PAGES = {
   home: ['homePage', 'connectionState', 'toggleConnection'],
   settings: ['settingsTitle', 'openNetworkSettings', 'openNodeBackup', 'appearance-system'],
-  nodes: ['nodeCount', 'nodeSearch', 'backToConnection', 'testFilteredNodes', 'sortNodeLatency', 'batchLatencyProgress', 'cancelNodeLatency'],
+  nodes: ['nodeCount', 'nodeSearch', 'backToConnection', 'testFilteredNodes', 'sortNodeLatency', 'batchLatencyProgress', 'cancelNodeLatency', ...Object.values(SORT_OPTIONS)],
   network: ['backFromNetworkSettings', 'routingGlobal', 'routingRules', 'bypassLan', 'routingDirect', 'routingProxy',
     'routingBlock', 'dnsUrl', 'resetDns', 'saveNetworkSettings', 'networkSettingsResult'],
   backup: ['backFromNodeBackup', 'backupCurrentCount', 'exportNodeCatalog', 'exportSingleNode', 'previewNodeBackup', 'nodeBackupResult'],
@@ -30,7 +32,7 @@ const TABS = { home: 'navHome', nodes: 'navNodes', settings: 'navSettings' };
 const FIXED = new Set([...Object.values(PAGES).flat(), ...Object.values(TABS)]);
 const CLICK = new Set([...Object.values(TABS), 'openNetworkSettings', 'openNodeBackup', 'backFromNetworkSettings',
   'routingGlobal', 'routingRules', 'bypassLan', 'resetDns', 'saveNetworkSettings', 'backFromNodeBackup',
-  'exportNodeCatalog', 'exportSingleNode', 'backFromNodeEditor', 'testFilteredNodes', 'cancelNodeLatency', 'sortNodeLatency']);
+  'exportNodeCatalog', 'exportSingleNode', 'backFromNodeEditor', 'testFilteredNodes', 'cancelNodeLatency', 'sortNodeLatency', ...Object.values(SORT_OPTIONS)]);
 const RULE_INPUTS = new Set(['routingDirect', 'routingProxy', 'routingBlock']);
 const INPUTS = new Set([...RULE_INPUTS, 'dnsUrl']);
 const ROW = /^(nodeMore|editNode|exportNode|nodeName|testNodeLatency|selectNode)-([A-Za-z0-9_-]{1,96})$/;
@@ -134,8 +136,12 @@ function projectLayout(tree, appFocused = false, expectedMenuNodeId = '') {
             for (const child of n?.children || []) collectLabel(child);
           }
           collectLabel(node);
-          if (id === 'sortNodeLatency') control.sorted = labels.includes('恢复原顺序') ? true : labels.includes('按首次耗时排序') ? false : undefined;
-          else control.selected = labels.includes(id === 'routingGlobal' ? '✓ 全部代理' : '✓ 规则分流');
+          if (id === 'sortNodeLatency') {
+            const matches = Object.keys(SORT_LABELS).filter(mode => labels.includes(SORT_LABELS[mode]));
+            control.sortMode = matches.length === 1 ? matches[0] : undefined;
+            control.sorted = control.sortMode === 'first-https' || labels.includes('恢复原顺序') ? true :
+              control.sortMode === 'original' || labels.includes('按首次耗时排序') ? false : undefined;
+          } else control.selected = labels.includes(id === 'routingGlobal' ? '✓ 全部代理' : '✓ 规则分流');
         }
         if (id === 'bypassLan') {
           for (const key of ['checked', 'selected', 'isOn']) {
@@ -193,6 +199,7 @@ function safeState(layout) {
     ...(typeof item.selected === 'boolean' ? { selected: item.selected } : {}),
     ...(typeof item.checked === 'boolean' ? { checked: item.checked } : {}),
     ...(typeof item.sorted === 'boolean' ? { sorted: item.sorted } : {}),
+    ...(Object.hasOwn(SORT_OPTIONS, item.sortMode) ? { sortMode: item.sortMode } : {}),
     ...(typeof item.saved === 'boolean' ? { saved: item.saved } : {}),
     ...(item.progress ? { progress: item.progress } : {})
   })) };
@@ -210,6 +217,11 @@ function rect(item) {
   ensure(value?.length === 4 && value.every(Number.isSafeInteger) && value[0] >= 0 && value[1] >= 0 && value[2] > value[0] && value[3] > value[1], 'INVALID_BOUNDS');
   return value;
 }
+function assertCommandOutput(args, value) {
+  const targetListing = args[0] === 'list' && args[1] === 'targets';
+  ensure(!/\[Fail\]|no connected device|device.*not found/i.test(value) &&
+    (targetListing || !/\boffline\b/i.test(value)), 'DEVICE_COMMAND_FAILED');
+}
 function createDriver(mode, targetDevice = '') {
   ensure(MODES.includes(mode) && mode !== 'SelfTest', 'INVALID_MODE');
   const deadline = performance.now() + (mode === 'RestoreNetworkDefaults' ? 120000 : 60000);
@@ -221,7 +233,7 @@ function createDriver(mode, targetDevice = '') {
     try {
       const out = cp.execFileSync(HDC, args, { encoding: 'utf8', windowsHide: true, timeout, maxBuffer: 8 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'] });
-      ensure(!/\[Fail\]|no connected device|device.*not found|\boffline\b/i.test(out), 'DEVICE_COMMAND_FAILED'); return out;
+      assertCommandOutput(args, out); return out;
     } catch (error) { if (error instanceof DriverError) throw error; throw new DriverError('DEVICE_COMMAND_FAILED'); }
   }
   const shell = (...args) => command(['-t', device, 'shell', ...args]);
@@ -333,9 +345,21 @@ function createDriver(mode, targetDevice = '') {
   }
   async function sort(desired) {
     await mainTab('nodes'); const item = await find('sortNodeLatency', 'nodes');
-    ensure(typeof item.sorted === 'boolean', 'SORT_STATE_UNAVAILABLE');
-    if (item.sorted !== desired) await click('sortNodeLatency', 'nodes');
-    ensure((await find('sortNodeLatency', 'nodes')).sorted === desired, 'SORT_UNCONFIRMED');
+    ensure(Object.hasOwn(SORT_OPTIONS, desired), 'SORT_STATE_UNAVAILABLE');
+    if (item.sortMode) {
+      if (item.sortMode !== desired) {
+        await click('sortNodeLatency', 'nodes');
+        const menu = readLayout(); requirePage(menu, 'nodes');
+        ensure(Object.values(SORT_OPTIONS).every(id => !!match(menu, id)), 'SORT_MENU_UNCONFIRMED');
+        await click(SORT_OPTIONS[desired], 'nodes');
+      }
+      ensure((await find('sortNodeLatency', 'nodes')).sortMode === desired, 'SORT_UNCONFIRMED');
+    } else {
+      // Historical two-mode builds remain inspectable with their exact labels.
+      ensure(desired !== 'reused' && typeof item.sorted === 'boolean', 'SORT_STATE_UNAVAILABLE');
+      if (item.sorted !== (desired === 'first-https')) await click('sortNodeLatency', 'nodes');
+      ensure((await find('sortNodeLatency', 'nodes')).sorted === (desired === 'first-https'), 'SORT_UNCONFIRMED');
+    }
   }
   async function run() {
     const initial = readLayout();
@@ -376,7 +400,9 @@ function createDriver(mode, targetDevice = '') {
     } else if (mode === 'EditorBack') { await click('backFromNodeEditor', 'editor'); await awaitPage(['nodes']); }
     else if (mode === 'BatchStart') { await mainTab('nodes'); await click('testFilteredNodes', 'nodes'); await find('cancelNodeLatency', 'nodes'); }
     else if (mode === 'BatchCancel') { await mainTab('nodes'); await click('cancelNodeLatency', 'nodes'); }
-    else if (mode === 'SortLatency' || mode === 'SortOriginal') await sort(mode === 'SortLatency');
+    else if (mode === 'SortLatency' || mode === 'SortOriginal' || mode === 'SortReused') {
+      await sort(mode === 'SortLatency' ? 'first-https' : mode === 'SortReused' ? 'reused' : 'original');
+    }
     return { mode, stage: 'completed', state: safeState(readLayout()) };
   }
   return { run };
@@ -390,6 +416,19 @@ function selfTest() {
     item('nodeSearch', secret), item('batchLatencyProgress', '已完成 1/2 · 正在检测第 2 个')] };
   const output = JSON.stringify(safeState(projectLayout(tree)));
   assert(!output.includes(secret)); assert(!output.includes('private-id')); assert(output.includes('nodeCount'));
+  for (const [mode, label] of Object.entries(SORT_LABELS)) {
+    const button = item('sortNodeLatency', ''); button.children = [item('', label), item('', secret)];
+    const layout = projectLayout({ children: [item('nodeCount', '共 1 个节点'), button,
+      ...Object.values(SORT_OPTIONS).map(id => item(id, secret, { type: 'MenuItem' }))] });
+    assert.equal(pageOf(layout), 'nodes');
+    assert.equal(layout.controls.find(control => control.id === 'sortNodeLatency').sortMode, mode);
+    const projected = JSON.stringify(safeState(layout)); assert(!projected.includes(secret));
+    assert(projected.includes('"sortMode":"' + mode + '"'));
+    for (const id of Object.values(SORT_OPTIONS)) assert(CLICK.has(id));
+  }
+  const ambiguousSort = item('sortNodeLatency', SORT_LABELS.original);
+  ambiguousSort.children = [item('', SORT_LABELS.reused)];
+  assert.equal(projectLayout({ children: [ambiguousSort] }).controls[0].sortMode, undefined);
   const network = projectLayout({ children: [item('routingRules', '✓ 规则分流'), item('routingBlock', secret), item('dnsUrl', secret)] });
   assert.equal(network.controls.find(control => control.id === 'routingBlock').inputValue, secret);
   assert(!JSON.stringify(safeState(network)).includes(secret));
@@ -464,7 +503,7 @@ function selfTest() {
   assert.throws(() => rect({ bounds: 'invalid' }), error => error.code === 'INVALID_BOUNDS');
   return { mode: 'SelfTest', stage: 'completed', phoneContacted: false, projectionChecksPassed: true };
 }
-module.exports = { MODES, DriverError, appHasFocus, projectLayout, pageOf, safeState, rect, selfTest, parseCommandLine, selectUsbTarget };
+module.exports = { MODES, DriverError, appHasFocus, projectLayout, pageOf, safeState, rect, selfTest, parseCommandLine, selectUsbTarget, assertCommandOutput };
 if (require.main === module) {
   let options;
   try { options = parseCommandLine(process.argv.slice(2)); }

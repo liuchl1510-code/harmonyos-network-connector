@@ -2,9 +2,11 @@
 
 使用 ArkTS / ArkUI 构建的鸿蒙原生节点管理与 IPv4 代理客户端，集成 Xray 26.6.1、Hev SOCKS5 Tunnel 2.9.0 和本地适配的 Go 1.26.7 工具链。
 
-应用显示名称为 **Harmony VPN**，当前版本为 **0.16.0/code37**。这是独立的开发项目，参考 v2rayNG 的功能与分享链接格式，不是 v2rayNG 或华为的官方客户端。完整 Android 功能对等和商店发布尚未完成。
+应用显示名称为 **Harmony VPN**，当前开发版本为 **0.17.0/code38**。这是独立的开发项目，参考 v2rayNG 的功能与分享链接格式，不是 v2rayNG 或华为的官方客户端。完整 Android 功能对等和商店发布尚未完成。
 
-0.16.0 分别显示首次 HTTPS 与第二次请求耗时，只有系统确认复用连接时才标为“复用延迟”。旧记录保留首次值，排序使用首次耗时；第二次失败单独提示。此次改动用于明确测速口径，不代表转发核心性能提升。实现与验证范围见[双指标检测记录](HarmonyVpnLab/docs/phase18-latency-metrics.md)。
+0.17.0 增加首页实时代理网速及三种节点排序，保留累计流量、时长与原有检测指标。实现与当前验证状态见[阶段二十一记录](HarmonyVpnLab/docs/phase21-rates-and-sorting.md)。
+
+0.16.0 分别显示首次 HTTPS 与第二次请求耗时，只有系统确认复用连接时才标为“复用延迟”。旧记录保留首次值；第二次失败单独提示。此次改动用于明确测速口径，不代表转发核心性能提升。实现与验证范围见[双指标检测记录](HarmonyVpnLab/docs/phase18-latency-metrics.md)。
 
 9 月 12 日的同版本收尾修正增加实际版本读取并同步隐私说明，当前包及重新导入后的真机复验见[收尾记录](HarmonyVpnLab/docs/phase20-restoration-and-copy.md)。它与 9 月 11 日初版的产物哈希、验证记录分开保留。
 
@@ -23,7 +25,7 @@
 - 宽窗口的独立详情栏与窄窗口的行内详情；同一节点改名、收藏后，列表与详情同步刷新。
 - 单节点 JSON 导出、节点与订阅备份、预览确认后恢复。
 - 编辑、导入、订阅与网络设置的未保存返回确认；失败保留输入，提交后的读回异常单独提示。
-- 逐节点及批量依次 HTTPS 双指标检测，可取消并按首次耗时排序，结果与配置指纹绑定。
+- 逐节点及批量依次 HTTPS 双指标检测，可取消，支持原始顺序、首次耗时及已确认复用延迟排序，结果与配置指纹绑定。
 - 全部代理或自定义域名/IPv4 分流、绕过局域网、可配置的代理内 HTTPS DNS。
 - 网络变化后的恢复、等待网络时正常断开。
 - 有界诊断记录与连接状态显示。
@@ -40,7 +42,7 @@ IPv6 当前进入 VPN 后被阻断，尚未提供 IPv6 代理。节点凭据保�
 | --- | --- |
 | <img src="docs/images/0.15-phone-font2-detail.jpeg" alt="手机模拟器两倍字号下的节点行内详情" width="220" /> | <img src="docs/images/0.15-tablet-collection.jpeg" alt="平板模拟器中按来源与收藏筛选节点，并独立查看详情" width="560" /> |
 
-上述 0.15 截图的包参数与验证记录见[阶段十六记录](HarmonyVpnLab/docs/phase16-node-collection.md)。当前 0.16 双指标见[阶段十八记录](HarmonyVpnLab/docs/phase18-latency-metrics.md)；原始构建目录不随源码发布。
+上述 0.15 截图的包参数与验证记录见[阶段十六记录](HarmonyVpnLab/docs/phase16-node-collection.md)。0.16 双指标见[阶段十八记录](HarmonyVpnLab/docs/phase18-latency-metrics.md)；原始构建目录不随源码发布。
 
 ## 工程与构建
 
