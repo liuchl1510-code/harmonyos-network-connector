@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const Module = require('module');
 
-function loadNodeParser(typescriptDir) {
+function loadNodeImporter(typescriptDir) {
     const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio';
     const ts = require(typescriptDir || path.join(devEco,
         'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
@@ -26,8 +26,21 @@ const util = {
     });
     if (output.diagnostics.length !== 0) throw new Error('PARSER_TRANSPILE_FAILED');
     const loaded = new Module(file);
+    const issueFile = path.resolve(__dirname, '../entry/src/main/ets/model/NodeIssue.ets');
+    const issueCode = ts.transpileModule(fs.readFileSync(issueFile, 'utf8'), {
+        compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true
+    });
+    if (issueCode.diagnostics.length !== 0) throw new Error('NODE_ISSUE_TRANSPILE_FAILED');
+    const issues = new Module(issueFile);
+    issues.require = name => { throw new Error('UNEXPECTED_NODE_ISSUE_DEPENDENCY'); };
+    issues._compile(issueCode.outputText, issueFile);
+    loaded.require = name => {
+        if (name === './NodeIssue') return issues.exports;
+        throw new Error('UNEXPECTED_NODE_IMPORT_DEPENDENCY');
+    };
     loaded._compile(output.outputText, file);
-    return loaded.exports.parseNode;
+    return { parser: loaded.exports, issues: issues.exports };
 }
 
-module.exports = { loadNodeParser };
+function loadNodeParser(typescriptDir) { return loadNodeImporter(typescriptDir).parser.parseNode; }
+module.exports = { loadNodeParser, loadNodeImporter };

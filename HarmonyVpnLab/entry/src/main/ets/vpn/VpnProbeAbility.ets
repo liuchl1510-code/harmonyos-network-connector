@@ -21,6 +21,8 @@ import { LatencyProof, readLatencyRequest, readLatencyProof } from '../model/Lat
 import { appendDiagnosticEvent } from '../model/DiagnosticJournal';
 import { readNetworkPolicy } from '../model/NetworkPolicyStore';
 import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
+import { ConnectionFailure, ConnectionFailureError, makeConnectionFailure, connectionFailureFromError,
+  failureDiagnosticCode, failureDiagnosticValue } from '../model/ConnectionFailure';
 
 const TAG: string = 'HarmonyVpnLab';
 const DOMAIN: number = 0x0000;
@@ -43,6 +45,9 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
   private runId: string = '';
   private nativeDetail: string = '';
   private failure: string = '';
+  private connectionFailure?: ConnectionFailure;
+  private cleanupFailure?: ConnectionFailure;
+  private currentIssue?: ConnectionFailure;
   private testKind: string = 'lifecycle';
   private coreProbe: CoreProbe | undefined = undefined;
   private transferVerified: boolean = false;
@@ -193,6 +198,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
   }
 
   private async initializeProbe(): Promise<void> {
+    let stage = 'vpn-init';
     try {
       if (!VPN_CORE_AVAILABLE) { throw new Error('模拟器界面预览不包含 VPN 核心，未创建虚拟网卡。'); }
       if (this.checkPersistentCancellation() || this.stopRequested) {
@@ -211,6 +217,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
       }
 
       if (isConnectionKind(this.testKind)) {
+        stage = 'configuration';
         if (this.testKind === 'node-latency') {
           const request = readLatencyRequest(this.context.filesDir);
           if (!request || request.runId !== this.runId) { throw new Error('节点检测请求无效'); }
@@ -223,6 +230,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
         } else { this.connectionNode = readNodeProfile(this.context.filesDir); }
         if (!this.connectionNode) { throw new Error('请先导入节点'); }
         normalizeBootstrapHost(nodeServerAddress(this.connectionNode));
+        stage = 'network';
         this.networkWatcher = new PhysicalNetworkWatcher();
         await this.networkWatcher.start(() => this.queueNetworkRead());
         await this.refreshDesiredNetwork();
@@ -231,11 +239,19 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
           try {
             this.preparedBootstrap = await this.resolveBootstrap(this.desiredNetwork, epoch);
             this.preparedEpoch = epoch;
-          } catch (_) { /* The retained TUN can wait for a later physical network. */ }
+          } catch (error) {
+            if (!this.stopRequested && epoch === this.networkEpoch) {
+              const issue = connectionFailureFromError(error, 'endpoint-dns');
+              if (issue.stage === 'configuration') { throw error as Error; }
+              this.currentIssue = issue;
+              try { this.persistConnectionStatus('starting'); } catch (_) { /* Diagnostics cannot block resource ownership. */ }
+            }
+          }
         }
         if (this.checkPersistentCancellation() || this.stopRequested) { return; }
       }
 
+      stage = 'vpn-create';
       const config: vpnExtension.VpnConfig = {
         addresses: [{ address: { address: '198.18.0.2', family: 1 }, prefixLength: 30 }],
         routes: [{
@@ -299,6 +315,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
         } catch (_) { hilog.warn(DOMAIN, TAG, 'CONNECTION_TUN_ADDRESSES_UNAVAILABLE'); }
       }
       if (this.testKind !== 'lifecycle') {
+        stage = 'core-init';
         if (isConnectionKind(this.testKind)) {
           await this.runNetworkTransition();
         } else {
@@ -339,7 +356,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
         }
       }, this.testKind === 'lifecycle' ? PROBE_DURATION_MS : (this.testKind === 'node' ? 25000 : 15000));
     } catch (error) {
-      this.recordFailure('探针初始化失败', error);
+      this.recordFailure('探针初始化失败', error, stage);
     }
   }
 
@@ -368,7 +385,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
       }
     } catch (error) {
       if (!this.stopRequested && epoch === this.networkEpoch && this.connectionPhase === 'active' && this.networkTask === undefined) {
-        this.recordFailure('连接状态检查失败', error);
+        this.recordFailure('连接状态检查失败', error, 'status');
         // Do not await cleanup from the task that cleanup itself must settle.
         setTimeout(() => { void this.requestStop(false); }, 0);
       }
@@ -408,17 +425,29 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
   }
 
   private async resolveBootstrap(network: PhysicalNetwork, epoch: number): Promise<NodeBootstrap> {
-    if (!this.connectionNode) { throw new Error('本次连接没有节点'); }
-    const host = normalizeBootstrapHost(nodeServerAddress(this.connectionNode));
-    const current = (): boolean => !this.stopRequested && !this.destroyed && epoch === this.networkEpoch;
-    const ipv4 = isBootstrapIpv4Address(host) ? host : await resolvePhysicalIpv4(host, network, current);
-    if (!current()) { throw new Error('节点解析已取消'); }
-    return createNodeBootstrap(this.connectionNode.outboundJson, ipv4);
+    let stage = 'configuration';
+    try {
+      if (!this.connectionNode) { throw new Error('本次连接没有节点'); }
+      const host = normalizeBootstrapHost(nodeServerAddress(this.connectionNode));
+      const current = (): boolean => !this.stopRequested && !this.destroyed && epoch === this.networkEpoch;
+      let ipv4 = host;
+      if (!isBootstrapIpv4Address(host)) {
+        stage = 'endpoint-dns';
+        ipv4 = await resolvePhysicalIpv4(host, network, current);
+      }
+      if (!current()) { throw new Error('节点解析已取消'); }
+      stage = 'configuration';
+      return createNodeBootstrap(this.connectionNode.outboundJson, ipv4);
+    } catch (error) {
+      const failure = connectionFailureFromError(error, stage);
+      throw new ConnectionFailureError(failure.stage, failure.reason);
+    }
   }
 
   private setConnectionPhase(phase: string, detail: string): void {
     if (this.stopRequested || this.destroyed) { return; }
     this.connectionPhase = phase; this.connectionMessage = detail;
+    if (phase === 'active') { this.currentIssue = undefined; }
     this.lastStatusAt = 0; this.lastNotificationAt = 0;
     this.publishSafely(phase, detail); this.persistConnectionStatus(phase);
     if (phase === 'waiting-network') { this.journal('waiting-network'); }
@@ -436,6 +465,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
   private async reconcileNetwork(): Promise<void> {
     const epoch = this.networkEpoch;
     const hadCore = this.coreProbe !== undefined;
+    let stage = 'core-init';
     try {
       const target = this.desiredNetwork;
       if (target && this.appliedNetworkKey === target.key) { return; }
@@ -448,22 +478,29 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
       try {
         bootstrap = this.preparedBootstrap && this.preparedEpoch === epoch
           ? this.preparedBootstrap : await this.resolveBootstrap(target, epoch);
-      } catch (_) {
+      } catch (error) {
         if (this.stopRequested || epoch !== this.networkEpoch) { return; }
+        const issue = connectionFailureFromError(error, 'endpoint-dns');
+        if (issue.stage === 'configuration') { throw error as Error; }
+        this.currentIssue = issue;
         this.retryCount++;
         this.retryAt = this.controlClock() + Math.min(30000, 2000 * Math.pow(2, Math.min(this.retryCount - 1, 4)));
         this.setConnectionPhase(this.coreProbe ? 'recovering' : 'starting', '节点域名暂未解析成功，将在当前网络重试；可随时断开。');
         return;
       }
       this.preparedBootstrap = undefined;
+      this.currentIssue = undefined;
       if (this.stopRequested || epoch !== this.networkEpoch) { return; }
       this.dialEpoch = epoch;
       const resumed = this.coreProbe !== undefined;
       if (this.coreProbe) { await this.coreProbe.resumeConnection(this.context, bootstrap); }
       else {
         this.coreProbe = new CoreProbe();
+        stage = 'configuration';
+        const policy = this.testKind === 'connection' ? readNetworkPolicy(this.context.filesDir) : undefined;
+        stage = 'core-init';
         await this.coreProbe.startConnection(this.tunFd, this.context, (fd: number) => this.protectSocket(fd), bootstrap,
-          this.connectionNode?.outboundJson, this.testKind === 'connection' ? readNetworkPolicy(this.context.filesDir) : undefined);
+          this.connectionNode?.outboundJson, policy);
       }
       if (this.stopRequested || epoch !== this.networkEpoch) { return; }
       this.appliedNetworkKey = target.key; this.retryAt = 0; this.retryCount = 0;
@@ -476,8 +513,8 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
     } catch (error) {
       if (!this.stopRequested) {
         if (epoch !== this.networkEpoch && hadCore) { this.appliedNetworkKey = ''; return; }
-        this.journal('recovery-failed', this.desiredNetwork?.kind ?? 'unavailable');
-        this.recordFailure('代理恢复失败', error);
+        if (hadCore) { this.journal('recovery-failed', this.desiredNetwork?.kind ?? 'unavailable'); }
+        this.recordFailure(hadCore ? '代理恢复失败' : '代理启动失败', error, stage);
         setTimeout(() => { void this.requestStop(false); }, 0);
       }
     }
@@ -512,6 +549,9 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
 
   private async requestStop(completed: boolean): Promise<void> {
     this.stopControlPolling();
+    // A retryable issue describes work still being attempted, not a historical
+    // fatal failure. Once stopping starts it must not survive the final receipt.
+    this.currentIssue = undefined;
     if (this.cleanup !== undefined) {
       await this.cleanup;
       return;
@@ -540,7 +580,9 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
     }
     if (this.statusTask !== undefined) { await this.statusTask; }
     if (this.testKind === 'node-latency' && !this.latencyFinished) {
-      this.finishLatency(this.failure ? 'failed' : 'cancelled', 0, this.failure ? 'configuration' : 'stopped');
+      const reason = this.connectionFailure?.stage === 'configuration' ? 'configuration' :
+        this.connectionFailure?.reason === 'timeout' ? 'timeout' : 'internal';
+      this.finishLatency(this.failure ? 'failed' : 'cancelled', 0, this.failure ? reason : 'stopped');
     }
     this.checkPersistentCancellation();
     const hadNetwork = this.networkCreated;
@@ -576,7 +618,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
         }
       } catch (error) {
         resourceCleanupSucceeded = false;
-        this.recordFailure('清理转发核心失败', error);
+        this.recordFailure('清理转发核心失败', error, 'cleanup', true);
       }
     }
 
@@ -590,7 +632,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
         hilog.info(DOMAIN, TAG, 'TUN FD closed');
       } catch (error) {
         resourceCleanupSucceeded = false;
-        this.recordFailure('关闭 TUN FD 失败', error);
+        this.recordFailure('关闭 TUN FD 失败', error, 'cleanup', true);
       }
     }
     if (this.networkCreated && this.connection !== undefined) {
@@ -600,10 +642,11 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
         hilog.info(DOMAIN, TAG, 'VPN network destroy succeeded');
       } catch (error) {
         resourceCleanupSucceeded = false;
-        this.recordFailure('销毁 VPN 网卡失败', error);
+        this.recordFailure('销毁 VPN 网卡失败', error, 'cleanup', true);
       }
     }
     this.resourceCleanupConfirmed = resourceCleanupSucceeded && this.tunFd < 0 && !this.networkCreated;
+    this.currentIssue = undefined;
 
     // A timeout/cancellation can arrive while destroy() is pending. Preserve
     // that result instead of replacing it with a successful observation.
@@ -654,7 +697,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
       try {
         await vpnExtension.stopVpnExtensionAbility(want);
       } catch (error) {
-        this.recordFailure('请求停止 VPN 扩展失败', error);
+        this.recordFailure('请求停止 VPN 扩展失败', error, 'cleanup', true);
         this.publishSafely('failed', this.failure);
       }
     }
@@ -692,9 +735,12 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
     if ((command && command.runId !== this.runId) || (state.runId.length > 0 && state.runId !== this.runId)) { return; }
     const previous = readConnectionStatus(this.context.filesDir);
     if (previous?.runId === this.runId && previous.phase === 'destroyed' && phase !== 'destroyed') { return; }
-    writeConnectionStatus(this.context.filesDir,
-      new ConnectionStatus(this.runId, phase, this.lastSnapshot, this.resourceCleanupConfirmed, native.currentProcessId(),
-        this.desiredNetwork?.kind ?? '', this.reconnectCount));
+    const value = new ConnectionStatus(this.runId, phase, this.lastSnapshot, this.resourceCleanupConfirmed, native.currentProcessId(),
+      this.desiredNetwork?.kind ?? '', this.reconnectCount);
+    value.failure = this.connectionFailure;
+    value.cleanupFailure = this.cleanupFailure;
+    value.currentIssue = this.currentIssue;
+    writeConnectionStatus(this.context.filesDir, value);
   }
 
   private connectionDetail(): string {
@@ -783,10 +829,30 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
     }
   }
 
-  private recordFailure(message: string, error: Object): void {
+  private recordFailure(message: string, error: Object, stage: string = 'status', cleanup: boolean = false): void {
     const detail = `${message}: ${describeError(error)}`;
     this.failure = this.failure.length > 0 ? `${this.failure}; ${detail}` : detail;
+    if (isConnectionKind(this.testKind)) {
+      let recorded: ConnectionFailure | undefined = undefined;
+      if (cleanup) {
+        if (!this.cleanupFailure) { this.cleanupFailure = makeConnectionFailure('cleanup'); recorded = this.cleanupFailure; }
+      } else if (!this.connectionFailure) { this.connectionFailure = connectionFailureFromError(error, stage); recorded = this.connectionFailure; }
+      // Preserve the first fatal stage before asynchronous cleanup can be cut
+      // short. Status remains service-owned and existing run guards still apply.
+      try {
+        const previous = readConnectionStatus(this.context.filesDir);
+        const phase = previous?.runId === this.runId && ['stopped', 'destroyed', 'destroying'].includes(previous.phase) ?
+          previous.phase : this.destroyed ? 'destroying' : this.connectionPhase;
+        this.persistConnectionStatus(phase);
+      } catch (_) {}
+      if (recorded) {
+        const state = readProbeState(this.context.filesDir);
+        const command = readConnectionCommand(this.context.filesDir);
+        if ((!state.runId || state.runId === this.runId) && (!command || command.runId === this.runId)) {
+          this.journal(failureDiagnosticCode(recorded), '', failureDiagnosticValue(recorded));
+        }
+      }
+    }
     hilog.error(DOMAIN, TAG, '%{public}s', detail);
   }
 }
-

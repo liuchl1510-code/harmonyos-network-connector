@@ -1,5 +1,22 @@
 import { util } from '@kit.ArkTS';
 import { ImportedNode, parseNode } from './NodeImport';
+import { NodeIssueError, nodeIssueFromError } from './NodeIssue';
+
+export class BatchNodeIssue {
+  entryIndex: number;
+  code: string;
+  constructor(entryIndex: number, code: string) { this.entryIndex = entryIndex; this.code = code; }
+}
+
+export class BatchImportFailure extends Error {
+  issues: BatchNodeIssue[];
+  rejected: number;
+  total: number;
+  constructor(issues: BatchNodeIssue[], rejected: number, total: number) {
+    super('未找到可导入的受支持节点。请使用分享链接列表或单个 Xray outbound JSON。');
+    this.issues = issues; this.rejected = rejected; this.total = total;
+  }
+}
 
 // Parsing only: callers must review rejected entries before committing a batch.
 // No exception includes input, decoded subscription contents, or node credentials.
@@ -8,12 +25,14 @@ export class BatchImportResult {
   rejected: number;
   duplicates: number;
   total: number;
+  issues: BatchNodeIssue[];
 
-  constructor(nodes: ImportedNode[], rejected: number, duplicates: number, total: number) {
+  constructor(nodes: ImportedNode[], rejected: number, duplicates: number, total: number, issues: BatchNodeIssue[] = []) {
     this.nodes = nodes;
     this.rejected = rejected;
     this.duplicates = duplicates;
     this.total = total;
+    this.issues = issues;
   }
 }
 
@@ -26,7 +45,17 @@ const INVALID_BASE64: string = '订阅内容的 Base64 编码或 UTF-8 文本无
 const INVALID_TEXT: string = '订阅内容包含二进制或不受支持的控制字符，无法导入。';
 
 function fail(message: string): never {
-  throw new Error(message);
+  let code = 'configuration-invalid';
+  if (message === NO_NODES) { code = 'input-empty'; }
+  else if (message === INVALID_BASE64) { code = 'base64-format'; }
+  else if (message === INVALID_TEXT) { code = 'input-control'; }
+  else if (message.startsWith('收到 HTML')) { code = 'input-html'; }
+  else if (message.startsWith('暂不支持 YAML')) { code = 'input-yaml'; }
+  else if (message.startsWith('一次最多')) { code = 'batch-lines'; }
+  else if (message.startsWith('一次导入')) { code = 'input-size'; }
+  else if (message.startsWith('单个节点 JSON')) { code = 'entry-size'; }
+  else if (message.startsWith('Base64 订阅需要')) { code = 'batch-base64-json'; }
+  throw new NodeIssueError(code);
 }
 
 // Count real UTF-8 bytes without allocating a second copy of a large document.
@@ -107,6 +136,7 @@ function parseLines(text: string): BatchImportResult {
   let rejected = 0;
   let duplicates = 0;
   let total = 0;
+  const issues: BatchNodeIssue[] = [];
   for (const line of lines) {
     const candidate = line.trim();
     if (candidate.length === 0) {
@@ -115,6 +145,10 @@ function parseLines(text: string): BatchImportResult {
     total++;
     if (!SHARE_START.test(candidate) || utf8Bytes(candidate) > MAX_NODE_BYTES) {
       rejected++;
+      if (issues.length < 10) {
+        issues.push(new BatchNodeIssue(total, SHARE_START.test(candidate) ? 'entry-size' :
+          /^[A-Za-z0-9]+:\/\//.test(candidate) ? 'protocol-unsupported' : 'input-format'));
+      }
       continue;
     }
     try {
@@ -127,12 +161,13 @@ function parseLines(text: string): BatchImportResult {
       }
     } catch (err) {
       rejected++;
+      if (issues.length < 10) { issues.push(new BatchNodeIssue(total, nodeIssueFromError(err as Object)?.code ?? 'configuration-invalid')); }
     }
   }
   if (nodes.length === 0) {
-    return fail(NO_NODES);
+    throw new BatchImportFailure(issues, rejected, total);
   }
-  return new BatchImportResult(nodes, rejected, duplicates, total);
+  return new BatchImportResult(nodes, rejected, duplicates, total, issues);
 }
 
 export function parseNodeBatch(input: string): BatchImportResult {
@@ -150,11 +185,13 @@ export function parseNodeBatch(input: string): BatchImportResult {
     if (utf8Bytes(text) > MAX_NODE_BYTES) {
       return fail('单个节点 JSON 不能超过 64 KiB。');
     }
+    if (text.startsWith('[')) { throw new NodeIssueError('json-document'); }
     try {
       const node = parseNode(text);
       return new BatchImportResult([node], 0, 0, 1);
     } catch (err) {
-      return fail('JSON 不能作为受支持的单个 Xray outbound 节点导入。');
+      if (nodeIssueFromError(err as Object)) { throw err as Error; }
+      throw new NodeIssueError('json-syntax');
     }
   }
   if (!/(^|[\r\n])[ \t]*(vless|vmess|trojan|ss):\/\//.test(text)) {

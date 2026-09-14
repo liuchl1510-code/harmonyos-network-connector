@@ -11,6 +11,11 @@ const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
 const sourceName = 'entry/src/main/ets/model/DiagnosticJournal.ets';
 const source = fs.readFileSync(path.join(root, sourceName), 'utf8');
+const failureSourceName = 'entry/src/main/ets/model/ConnectionFailure.ets';
+const failureSource = fs.readFileSync(path.join(root, failureSourceName), 'utf8');
+const failureCompiled = ts.transpileModule(failureSource, { compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true });
+assert.equal(failureCompiled.diagnostics.length, 0);
+const failureExports = {}; vm.runInNewContext(failureCompiled.outputText, { exports: failureExports });
 const result = ts.transpileModule(source.replace(/^import[^\n]*\n/gm, ''), {
   compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true
 });
@@ -62,7 +67,7 @@ function scenario(options = {}) {
   };
   class FakeDate extends Date { static now() { return clock.now; } }
   const exported = {};
-  vm.runInNewContext(result.outputText, { exports: exported, module: { exports: exported }, fs: fakeFs, Date: FakeDate,
+  vm.runInNewContext(result.outputText, { ...failureExports, exports: exported, module: { exports: exported }, fs: fakeFs, Date: FakeDate,
     util: { generateRandomUUID: () => { failure('uuid'); return 'synthetic-' + uuid++; },
       TextEncoder: class { encodeInto(text) { return new TextEncoder().encode(text); } } }
   }, { filename: sourceName });
@@ -78,6 +83,24 @@ function test(name, body) { tests.push({ name, body }); }
 function exactError(fn, expected) {
   assert.throws(fn, error => error.message === expected && !String(error).includes('secret'));
 }
+test('fixed operation failures round-trip across later runs without changing five-field schema', () => {
+  const s = scenario();
+  const primary = failureExports.makeConnectionFailure('core-init'), cleanup = failureExports.makeConnectionFailure('cleanup');
+  s.append(runId, failureExports.failureDiagnosticCode(primary), '', failureExports.failureDiagnosticValue(primary));
+  s.append(runId, failureExports.failureDiagnosticCode(cleanup), '', failureExports.failureDiagnosticValue(cleanup));
+  s.append('1789000000001', 'session-start'); const values = s.read();
+  assert.equal(values.length, 3); assert.equal(values[0].runId, runId);
+  assert.equal(failureExports.failureFromDiagnosticEvent(values[0].code, values[0].value, values[0].at).stage, 'core-init');
+  assert.equal(failureExports.failureFromDiagnosticEvent(values[1].code, values[1].value, values[1].at).stage, 'cleanup');
+  assert.deepEqual(Object.keys(values[0]).sort(), ['at','code','kind','runId','value']);
+});
+test('unknown operation stages reason indices or nonempty kind cannot enter journal', () => {
+  for (const [code, value, kind] of [['operation-failed-secret',0,''], ['operation-failed-https',6,''],
+    ['operation-failed-https',-1,''], ['operation-failed-https',1.5,''], ['operation-failed-core-init',0,'wifi']]) {
+    const s = scenario(); exactError(() => s.append(runId, code, kind, value), 'DIAGNOSTIC_JOURNAL_INVALID_EVENT');
+    assert.equal(s.files.size, 0);
+  }
+});
 test('missing journal is empty and does not create files', () => {
   const s = scenario(); assert.deepEqual(s.read(), []); assert.equal(s.files.size, 0);
 });
@@ -196,7 +219,8 @@ const report = { checkedAt: new Date().toISOString(), passed, failed: results.le
   scope: 'Actual DiagnosticJournal ArkTS module transpiled by DevEco SDK; synthetic in-memory filesystem, UUID and clock. No phone/network/private files.',
   limitations: ['Single synchronous VPN service writer is a required contract; atomic rename does not coordinate competing writers.',
     'Mock filesystem verifies API ordering and error handling, not device crash durability or SDK filesystem implementation.'],
-  sourceSHA256: { [sourceName]: crypto.createHash('sha256').update(source).digest('hex') }, results };
+  sourceSHA256: { [sourceName]: crypto.createHash('sha256').update(source).digest('hex'),
+    [failureSourceName]: crypto.createHash('sha256').update(failureSource).digest('hex') }, results };
 fs.mkdirSync(path.join(root, 'build'), { recursive: true });
 fs.writeFileSync(path.join(root, 'build/diagnostic-journal-verification.json'), JSON.stringify(report, null, 2) + '\n');
 console.log(JSON.stringify({ passed, failed: report.failed, total: results.length,

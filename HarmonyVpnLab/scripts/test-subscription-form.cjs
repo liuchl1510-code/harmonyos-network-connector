@@ -16,6 +16,7 @@ const ts = require(path.join(process.env.DEVECO_STUDIO_HOME || 'C:/Program Files
 const compiled = ts.transpileModule(methods, { compilerOptions: {
   target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true });
 assert.equal(compiled.diagnostics.length, 0, 'SDK transpilation');
+const nodeIssues = require('./node-import-loader.cjs').loadNodeImporter().issues;
 const URL_FIXTURE = 'https://subscription.invalid/list?token=synthetic-only';
 const RAW_ERROR = Error('synthetic-private-uri-and-credential');
 const FIXED_FETCH_ERROR = '订阅请求失败，请检查网络或订阅服务';
@@ -59,6 +60,7 @@ function fixture() {
     }
   };
   const imports = {
+    '../model/NodeIssue': nodeIssues,
     '../model/NodeCatalog': catalog,
     '../model/NodeEditGuard': { assertNodeManagementAllowed: allowed, isNodeManagementAllowed: () => state.allowed },
     '../model/NodeBatchImport': { parseNodeBatch() {

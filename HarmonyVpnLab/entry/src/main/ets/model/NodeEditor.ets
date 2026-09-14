@@ -1,5 +1,6 @@
 import { util } from '@kit.ArkTS';
 import { ImportedNode, parseNode } from './NodeImport';
+import { NodeIssueError, nodeIssueFromError } from './NodeIssue';
 
 interface EditorUser { id: string; flow?: string; }
 interface EditorServer { address: string; port: number; users?: EditorUser[]; password?: string; method?: string; }
@@ -98,7 +99,10 @@ export function nodeEditorDraft(node: ImportedNode): NodeEditorDraft {
     draft.transportPath = stream?.wsSettings?.path ?? ''; draft.transportHost = editorWebSocketHost(stream?.wsSettings);
     draft.serviceName = stream?.grpcSettings?.serviceName ?? ''; draft.authority = stream?.grpcSettings?.authority ?? '';
     return draft;
-  } catch (_) { throw new Error('无法打开这个节点，请检查其配置是否受支持。'); }
+  } catch (error) {
+    if (nodeIssueFromError(error as Object)) { throw error as Error; }
+    throw new NodeIssueError('configuration-invalid');
+  }
 }
 
 // Work on a fresh parse of the complete original object. Only fields displayed
@@ -108,10 +112,10 @@ export function nodeFromEditorDraft(original: ImportedNode, draft: NodeEditorDra
   try {
     const before = nodeEditorDraft(original);
     if (draft.protocol !== before.protocol || draft.network !== before.network || draft.security !== before.security) {
-      throw new Error('unsupported transition');
+      throw new NodeIssueError('editor-transition');
     }
     if (!/^[0-9]{1,5}$/.test(draft.port) || Number(draft.port) < 1 || Number(draft.port) > 65535) {
-      throw new Error('invalid port');
+      throw new NodeIssueError('port-format');
     }
     const outbound = parsedOutbound(original);
     const server = serverOf(outbound);
@@ -155,17 +159,24 @@ export function nodeFromEditorDraft(original: ImportedNode, draft: NodeEditorDra
       if (draft.authority !== before.authority) { stream.grpcSettings.authority = draft.authority.trim() || undefined; }
     }
     return nodeFromEditorJson(draft.name, JSON.stringify(outbound));
-  } catch (_) { throw new Error('节点参数未通过校验，请检查地址、端口、认证和传输参数。'); }
+  } catch (error) {
+    if (nodeIssueFromError(error as Object)) { throw error as Error; }
+    throw new NodeIssueError('configuration-invalid');
+  }
 }
 
 export function nodeFromEditorJson(name: string, text: string): ImportedNode {
   try {
     if (typeof name !== 'string' || typeof text !== 'string' || text.length > 65536 ||
       new util.TextEncoder().encodeInto(text).byteLength > 65536 || !text.trim().startsWith('{')) {
-      throw new Error('invalid');
+      throw new NodeIssueError(typeof text === 'string' && (text.length > 65536 ||
+        new util.TextEncoder().encodeInto(text).byteLength > 65536) ? 'entry-size' : 'json-document');
     }
     const node = parseNode(text);
     node.name = name;
     return node;
-  } catch (_) { throw new Error('JSON 未通过校验，请使用不超过 64 KiB 的受支持单个 outbound。'); }
+  } catch (error) {
+    if (nodeIssueFromError(error as Object)) { throw error as Error; }
+    throw new NodeIssueError('configuration-invalid');
+  }
 }

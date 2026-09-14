@@ -3,6 +3,8 @@ import { DiagnosticEvent, readDiagnosticEvents } from '../model/DiagnosticJourna
 import { readConnectionRecoveries } from '../model/ConnectionRecoveryStore';
 import { readConnectionLifecycle } from '../model/ConnectionLifecycle';
 import { formContentWidth } from '../model/AdaptiveLayout';
+import { ConnectionFailure, failureFromDiagnosticEvent, failureStageLabel, failureProblem, failureSuggestion } from '../model/ConnectionFailure';
+import { FailureNotice } from '../components/FailureNotice';
 
 @Entry
 @Component
@@ -12,6 +14,9 @@ struct Diagnostics {
   @State message: string = '';
   @State connectionLabel: string = '状态待刷新';
   @State connectionHint: string = '';
+  @State serviceFailure: ConnectionFailure | undefined = undefined;
+  @State cleanupFailure: ConnectionFailure | undefined = undefined;
+  @State currentIssue: ConnectionFailure | undefined = undefined;
 
   private context(): common.UIAbilityContext { return this.getUIContext().getHostContext() as common.UIAbilityContext; }
   onPageShow(): void { this.reload(); }
@@ -32,6 +37,9 @@ struct Diagnostics {
     this.message = messages.join(' ');
     try {
       const assessment = readConnectionLifecycle(filesDir);
+      const status = assessment.status?.runId === assessment.state.runId ? assessment.status : undefined;
+      this.serviceFailure = status?.failure; this.cleanupFailure = status?.cleanupFailure;
+      this.currentIssue = assessment.closed ? undefined : status?.currentIssue;
       const diagnostic = !['connection', 'connection-test', 'connection-app-test'].includes(assessment.state.kind);
       this.connectionLabel = diagnostic && !assessment.closed &&
         ['starting', 'active', 'recovering', 'waiting-network', 'stopping', 'stop_requested'].includes(assessment.phase) ?
@@ -40,7 +48,10 @@ struct Diagnostics {
         assessment.serviceExited ? '记录的服务进程已结束，尚未收到清理完成回执。' :
         assessment.phase === 'unknown' ? '当前服务状态尚未确认，可返回首页恢复清理。' :
         assessment.closed ? '当前没有进行中的连接。' : '点击刷新可同步当前状态和记录。';
-    } catch (_) { this.connectionLabel = '状态暂不可用'; this.connectionHint = '请稍后刷新，或返回首页查看。'; }
+    } catch (_) {
+      this.connectionLabel = '状态暂不可用'; this.connectionHint = '请稍后刷新，或返回首页查看。';
+      this.serviceFailure = undefined; this.cleanupFailure = undefined; this.currentIssue = undefined;
+    }
   }
 
   private phaseLabel(phase: string): string {
@@ -67,6 +78,8 @@ struct Diagnostics {
   }
 
   private categoryLabel(code: string): string {
+    const failure = failureFromDiagnosticEvent(code, 0, 0);
+    if (failure) { return '未完成：' + failureStageLabel(failure.stage); }
     switch (code) {
       case 'session-start': return '开始连接';
       case 'network-change': return '网络变化';
@@ -99,6 +112,8 @@ struct Diagnostics {
   }
 
   private countLabel(event: DiagnosticEvent): string {
+    const failure = failureFromDiagnosticEvent(event.code, event.value, event.at);
+    if (failure) { return failureProblem(failure); }
     switch (event.code) {
       case 'network-change': return `本次连接网络版本：${event.value}`;
       case 'recovery-ok': return `本次连接累计恢复：${event.value} 次`;
@@ -110,6 +125,11 @@ struct Diagnostics {
       case 'latency-ok': return `HTTPS 耗时：${event.value} ms`;
       default: return '';
     }
+  }
+
+  private eventSuggestion(event: DiagnosticEvent): string {
+    const failure = failureFromDiagnosticEvent(event.code, event.value, event.at);
+    return failure ? failureSuggestion(failure) : '';
   }
 
   build() {
@@ -147,6 +167,17 @@ struct Diagnostics {
             Text(this.message).id('diagnosticJournalMessage').fontSize(14).width('100%')
               .fontColor($r('app.color.warning'));
           }
+          if (this.serviceFailure) {
+            FailureNotice({ title: '最近会话的失败阶段', stage: this.serviceFailure.stage,
+              reason: this.serviceFailure.reason, idPrefix: 'diagnosticServiceFailure' });
+          } else if (this.currentIssue) {
+            FailureNotice({ title: '当前步骤尚未完成', stage: this.currentIssue.stage,
+              reason: this.currentIssue.reason, idPrefix: 'diagnosticCurrentIssue' });
+          }
+          if (this.cleanupFailure) {
+            FailureNotice({ title: '清理阶段的独立问题', stage: this.cleanupFailure.stage,
+              reason: this.cleanupFailure.reason, idPrefix: 'diagnosticCleanupFailure' });
+          }
           if (this.events.length === 0) {
             Column({ space: 10 }) {
               Text('还没有可展示的事件').fontSize(18).fontWeight(FontWeight.Medium)
@@ -168,6 +199,9 @@ struct Diagnostics {
                   .fontSize(13).fontColor($r('app.color.text_secondary'));
                 if (this.countLabel(event).length > 0) {
                   Text(this.countLabel(event)).fontSize(13).fontColor($r('app.color.text_primary'));
+                }
+                if (this.eventSuggestion(event).length > 0) {
+                  Text('建议：' + this.eventSuggestion(event)).fontSize(13).fontColor($r('app.color.text_secondary'));
                 }
               }.width('100%').padding(12).alignItems(HorizontalAlign.Start)
                 .backgroundColor($r('app.color.surface_secondary')).borderRadius(12);

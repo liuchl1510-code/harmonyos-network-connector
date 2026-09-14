@@ -9,11 +9,11 @@ const crypto = require('node:crypto');
 const root = path.resolve(__dirname, '..');
 const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio';
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
-const names = ['model/ConnectionSnapshot.ets', 'model/ConnectionControl.ets', 'model/ProbeState.ets',
+const names = ['model/ConnectionFailure.ets', 'model/ConnectionSnapshot.ets', 'model/ConnectionControl.ets', 'model/ProbeState.ets',
   'model/NodeBootstrap.ets', 'model/LatencyProtocol.ets', 'model/NodeLatency.ets', 'model/DiagnosticJournal.ets', 'vpn/VpnProbeAbility.ets'];
 const sources = new Map(names.map(name => [name, fs.readFileSync(path.join(root, 'entry/src/main/ets', name), 'utf8')]));
 const compiled = new Map([...sources].map(([name, source]) => {
-  const result = ts.transpileModule(source.replace(/^import[^\n]*\n/gm, ''), {
+  const result = ts.transpileModule(source.replace(/^import[\s\S]*?;\r?\n/gm, ''), {
     compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true });
   assert.equal(result.diagnostics.length, 0, 'SDK transpilation ' + name); return [name, result.outputText];
 }));
@@ -148,6 +148,15 @@ function cleanedOnce(s) {
 }
 const tests = [];
 function test(name, body) { tests.push({ name, body }); }
+
+for (const [stage, reason, expected] of [['forwarding','failed','internal'], ['core-init','timeout','timeout'], ['configuration','failed','configuration']]) {
+  test('latency startup retains only truthful coarse reason from typed stage: ' + stage + '/' + reason, async () => {
+    const s = scenario({ coreStart: async () => { throw new s.shared.ConnectionFailureError(stage, reason); } });
+    await s.launch(); await s.settleCleanup();
+    assert.equal(s.results()[0].reason, expected); assert.equal(s.results()[0].status, 'failed');
+    assert.equal(s.status().failure.stage, stage); assert.equal(s.results()[0].secondStatus, 'not-tested');
+  });
+}
 
 test('node-latency is a persistent-control kind but routes only its own application', async () => {
   const s = scenario(); await s.launch(); assert.equal(s.service.connectionPhase, 'active');

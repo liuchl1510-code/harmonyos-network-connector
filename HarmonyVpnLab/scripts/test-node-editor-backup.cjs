@@ -9,7 +9,7 @@ const crypto = require('node:crypto');
 const root = path.resolve(__dirname, '..');
 const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio';
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
-const names = ['NodeImport', 'NodeCatalog', 'NodeEditor'];
+const names = ['NodeIssue', 'NodeImport', 'NodeCatalog', 'NodeEditor'];
 const sources = new Map(names.map(name => [name, fs.readFileSync(path.join(root, `entry/src/main/ets/model/${name}.ets`), 'utf8')]));
 const pageSource = fs.readFileSync(path.join(root, 'entry/src/main/ets/pages/NodeEditor.ets'), 'utf8');
 let fieldValueBinding, fieldInputHandler;
@@ -355,8 +355,34 @@ test('Invalid ports show fixed field feedback and retain the draft without writi
     const f = fixture(), catalog = store(f), page = f.page(catalog.activeNodeId); page.aboutToAppear();
     const before = f.bytes(); page.draft.port = port; page.draftChanged(); page.save();
     assert.equal(page.dirty, true); assert.equal(page.draft.port, port); assert.match(page.portError, /1–65535/);
-    assert.equal(page.message, page.portError); assert.equal(f.bytes(), before);
+    assert.equal(page.message, page.portError); assert.equal(page.issueCode, 'port-format'); assert.equal(f.bytes(), before);
   }
+});
+
+test('UUID field errors preserve the original catalog and draft then clear after correction', () => {
+  const f = fixture(), catalog = store(f), page = f.page(catalog.activeNodeId); page.aboutToAppear();
+  const before = f.bytes(), revision = page.revision, credential = page.draft.credential;
+  page.changeField('editNodeCredential', 'synthetic-invalid-private-value'); page.save();
+  assert.equal(page.issueCode, 'uuid-format'); assert.equal(page.draft.credential, 'synthetic-invalid-private-value');
+  assert.equal(page.dirty, true); assert.equal(page.revision, revision); assert.equal(f.bytes(), before);
+  assert(!page.message.includes('synthetic-invalid-private-value'));
+  page.changeField('editNodeCredential', credential); assert.equal(page.issueCode, ''); assert.equal(page.dirty, false);
+});
+
+test('JSON field errors survive save and editor-switch attempts without losing the draft', () => {
+  const f = fixture(), catalog = store(f), page = f.page(catalog.activeNodeId); page.aboutToAppear(); page.switchEditor();
+  const before = f.bytes(), revision = page.revision; page.changeJson('{"synthetic-private-value":'); page.save();
+  assert.equal(page.issueCode, 'json-syntax'); assert.equal(page.jsonText, '{"synthetic-private-value":');
+  assert.equal(page.revision, revision); assert.equal(f.bytes(), before); assert.equal(page.jsonMode, true);
+  page.switchEditor(); assert.equal(page.issueCode, 'json-syntax'); assert.equal(page.jsonMode, true);
+  assert.equal(page.jsonText, '{"synthetic-private-value":'); assert(!page.message.includes('synthetic-private-value'));
+});
+
+test('concurrent catalog changes are not mislabeled as a node field error', () => {
+  const f = fixture(), catalog = store(f), page = f.page(catalog.activeNodeId); page.aboutToAppear();
+  page.changeField('editNodeAddress', 'changed.invalid'); f.catalog.renameCatalogNode(dir, catalog.activeNodeId, 'Other revision');
+  const before = f.bytes(); page.save(); assert.equal(page.issueCode, ''); assert.match(page.message, /节点库已发生变化/);
+  assert.equal(f.bytes(), before); assert.equal(page.draft.address, 'changed.invalid');
 });
 
 test('Failed save keeps credentials and dirty draft; successful retry establishes a fresh baseline', () => {

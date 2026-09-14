@@ -33,6 +33,10 @@ function execute(source, imports, extra = {}) {
   vm.runInNewContext(source, scope); return scope.exports;
 }
 const navigation = execute(compile('model/NodeListNavigation.ets'), {});
+const nodeIssues = execute(compile('model/NodeIssue.ets'), {});
+const batchClasses = execute(compile('model/NodeBatchImport.ets'), {
+  '@kit.ArkTS': { util: {} }, './NodeIssue': nodeIssues, './NodeImport': {}
+});
 const pageCode = compile('pages/NodeConfig.ets', true);
 const UUID = '00000000-0000-4000-8000-000000000001';
 const makeParams = (ids = ['node-old'], requestId = UUID) => new navigation.ImportedNodesNavigation(ids, requestId);
@@ -44,10 +48,10 @@ function fixture(options = {}) {
   const state = { nodes: [{ ...first, id: 'node-old' }], activeNodeId: 'node-old', writes: 0, reads: 0,
     profileReads: 0, receipts: 0, calls: [], dialogs: [], backs: 0, scans: [], mode: '', allowed: true, scannerSupported: true };
   function parseNodeBatch(input) {
-    if (input === 'first') return { nodes: [first], rejected: 0, duplicates: 0 };
-    if (input === 'second') return { nodes: [second], rejected: 0, duplicates: 0 };
-    if (input === 'mixed') return { nodes: [first, second], rejected: 0, duplicates: 0 };
-    if (input === 'partial') return { nodes: [second], rejected: 1, duplicates: 0 };
+    if (input === 'first') return { nodes: [first], rejected: 0, duplicates: 0, issues: [] };
+    if (input === 'second') return { nodes: [second], rejected: 0, duplicates: 0, issues: [] };
+    if (input === 'mixed') return { nodes: [first, second], rejected: 0, duplicates: 0, issues: [] };
+    if (input === 'partial') return { nodes: [second], rejected: 1, duplicates: 0, issues: [new batchClasses.BatchNodeIssue(2, 'input-format')] };
     throw new Error(secret);
   }
   const modules = {
@@ -59,7 +63,7 @@ function fixture(options = {}) {
       return '00000000-0000-4000-8000-' + String(++state.receipts).padStart(12, '0');
     } } },
     '../model/AdaptiveLayout': {}, '../model/NodeListNavigation': navigation,
-    '../model/NodeBatchImport': { parseNodeBatch },
+    '../model/NodeBatchImport': { ...batchClasses, parseNodeBatch }, '../model/NodeIssue': nodeIssues,
     '../model/NodeEditGuard': { isNodeManagementAllowed: () => state.allowed, assertNodeManagementAllowed() {
       if (!state.allowed) throw new Error(secret);
     } },

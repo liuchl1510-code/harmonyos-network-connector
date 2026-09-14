@@ -13,6 +13,7 @@ import { ConnectionSnapshot } from '../model/ConnectionSnapshot';
 import { NodeBootstrap } from '../model/NodeBootstrap';
 import { NetworkPolicy, validateNetworkPolicy } from '../model/NetworkPolicy';
 import { systemDateTime } from '@kit.BasicServicesKit';
+import { ConnectionFailureError, connectionFailureFromError } from '../model/ConnectionFailure';
 
 interface RealityDiagnostics { show?: boolean; }
 interface OutboundStream { realitySettings?: RealityDiagnostics; }
@@ -95,20 +96,22 @@ export class CoreProbe {
   }
 
   private async checkRuntimeClock(): Promise<void> {
-    const before = Date.now();
-    const reply = this.decodeReply(await native.xrayCall('runtime', ''));
-    const after = Date.now();
-    const info = reply.data as RuntimeInfo;
-    if (typeof info.unixMillis !== 'number' || !Number.isFinite(info.unixMillis)) {
-      throw new Error('Go 运行时未返回有效时间');
-    }
-    const delta = info.unixMillis - Math.round((before + after) / 2);
-    hilog.info(0x0000, 'HarmonyVpnLab',
-      'GO_RUNTIME go=%{public}s os=%{public}s arch=%{public}s clockDeltaMs=%{public}d windowMs=%{public}d',
-      info.goVersion, info.goos, info.goarch, delta, after - before);
-    if (info.unixMillis < before - 10000 || info.unixMillis > after + 10000) {
-      throw new Error('Go 时间与系统时间差异超过 10 秒，暂不开始节点握手');
-    }
+    try {
+      const before = Date.now();
+      const reply = this.decodeReply(await native.xrayCall('runtime', ''));
+      const after = Date.now();
+      const info = reply.data as RuntimeInfo;
+      if (typeof info.unixMillis !== 'number' || !Number.isFinite(info.unixMillis)) {
+        throw new Error('Go 运行时未返回有效时间');
+      }
+      const delta = info.unixMillis - Math.round((before + after) / 2);
+      hilog.info(0x0000, 'HarmonyVpnLab',
+        'GO_RUNTIME go=%{public}s os=%{public}s arch=%{public}s clockDeltaMs=%{public}d windowMs=%{public}d',
+        info.goVersion, info.goos, info.goarch, delta, after - before);
+      if (info.unixMillis < before - 10000 || info.unixMillis > after + 10000) {
+        throw new Error('Go 时间与系统时间差异超过 10 秒，暂不开始节点握手');
+      }
+    } catch (_) { throw new ConnectionFailureError('runtime-clock'); }
   }
 
   async start(fd: number, token: string, context: common.Context, useXray: boolean,
@@ -225,76 +228,97 @@ export class CoreProbe {
   private async startConnectionInternal(fd: number, context: common.Context,
     protectSocket: (fd: number) => Promise<void>, bootstrap?: NodeBootstrap,
     sessionOutboundJson?: string, policy?: NetworkPolicy): Promise<void> {
-    if (this.connectionFinalStop || this.xrayAttempted || this.hevAttempted || this.fixtureAttempted || this.protectorInstalled) {
-      throw new Error('请在上一 VPN 扩展进程退出后创建新的连接');
+    let stage = 'core-init';
+    try {
+      if (this.connectionFinalStop || this.xrayAttempted || this.hevAttempted || this.fixtureAttempted || this.protectorInstalled) {
+        throw new Error('请在上一 VPN 扩展进程退出后创建新的连接');
+      }
+      stage = 'configuration';
+      let outboundJson = sessionOutboundJson;
+      if (outboundJson === undefined) {
+        const saved = readNodeProfile(context.filesDir);
+        if (!saved) { throw new Error('请先在应用中导入节点'); }
+        outboundJson = saved.outboundJson;
+      }
+      this.connectionOutboundJson = parseNode(outboundJson).outboundJson;
+      this.connectionPolicy = policy === undefined ? undefined : validateNetworkPolicy(policy);
+      this.connectionMode = true;
+      this.connectionActive = false;
+      const epoch = ++this.connectionEpoch;
+      stage = 'core-init';
+      const ports = JSON.parse(native.getFreePorts()) as PortPair;
+      this.connectionSocksPort = ports.socksPort;
+      this.metricsPort = ports.metricsPort;
+      this.errorPath = `${context.filesDir}/xray-connection-diagnostic.log`;
+      // Validate the frozen node/bootstrap before loading any process-lived code.
+      stage = 'configuration';
+      buildConnectionConfig(this.connectionOutboundJson, ports.socksPort, ports.metricsPort, this.errorPath, bootstrap, this.connectionPolicy);
+      stage = 'core-init';
+      const logFile = fs.openSync(this.errorPath, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
+      fs.closeSync(logFile);
+      this.connectionLogOffset = 0;
+      this.connectionLogCarry = '';
+      this.ipv6BlockedRequests = 0;
+      this.dnsRequests = 0;
+      await native.configureXrayCa(await prepareCaBundle(context));
+      this.requireConnectionEpoch(epoch);
+      const versionReply = this.decodeReply(await native.xrayCall('version', ''));
+      this.requireConnectionEpoch(epoch);
+      this.version = String(versionReply.data);
+      await this.checkRuntimeClock();
+      this.requireConnectionEpoch(epoch);
+      native.installSocketProtector(protectSocket);
+      this.protectorInstalled = true;
+      this.connectionPrepared = true;
+      await this.startConnectionCore(context, bootstrap, epoch);
+      stage = 'forwarding';
+      this.hevAttempted = true;
+      await native.startHev(fd, ports.socksPort, true);
+      this.requireConnectionEpoch(epoch);
+      this.connectionStartedAt = Date.now();
+      this.connectionActive = true;
+      hilog.info(0x0000, 'HarmonyVpnLab',
+        'CONNECTION_CORE_READY version=%{public}s dns=proxied-doh ipv6=blocked', this.version);
+    } catch (error) {
+      const failure = connectionFailureFromError(error, stage);
+      throw new ConnectionFailureError(failure.stage, failure.reason);
     }
-    let outboundJson = sessionOutboundJson;
-    if (outboundJson === undefined) {
-      const saved = readNodeProfile(context.filesDir);
-      if (!saved) { throw new Error('请先在应用中导入节点'); }
-      outboundJson = saved.outboundJson;
-    }
-    this.connectionOutboundJson = parseNode(outboundJson).outboundJson;
-    this.connectionPolicy = policy === undefined ? undefined : validateNetworkPolicy(policy);
-    this.connectionMode = true;
-    this.connectionActive = false;
-    const epoch = ++this.connectionEpoch;
-    const ports = JSON.parse(native.getFreePorts()) as PortPair;
-    this.connectionSocksPort = ports.socksPort;
-    this.metricsPort = ports.metricsPort;
-    this.errorPath = `${context.filesDir}/xray-connection-diagnostic.log`;
-    // Validate the frozen node/bootstrap before loading any process-lived code.
-    buildConnectionConfig(this.connectionOutboundJson, ports.socksPort, ports.metricsPort, this.errorPath, bootstrap, this.connectionPolicy);
-    const logFile = fs.openSync(this.errorPath, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
-    fs.closeSync(logFile);
-    this.connectionLogOffset = 0;
-    this.connectionLogCarry = '';
-    this.ipv6BlockedRequests = 0;
-    this.dnsRequests = 0;
-    await native.configureXrayCa(await prepareCaBundle(context));
-    this.requireConnectionEpoch(epoch);
-    const versionReply = this.decodeReply(await native.xrayCall('version', ''));
-    this.requireConnectionEpoch(epoch);
-    this.version = String(versionReply.data);
-    await this.checkRuntimeClock();
-    this.requireConnectionEpoch(epoch);
-    native.installSocketProtector(protectSocket);
-    this.protectorInstalled = true;
-    this.connectionPrepared = true;
-    await this.startConnectionCore(context, bootstrap, epoch);
-    this.hevAttempted = true;
-    await native.startHev(fd, ports.socksPort, true);
-    this.requireConnectionEpoch(epoch);
-    this.connectionStartedAt = Date.now();
-    this.connectionActive = true;
-    hilog.info(0x0000, 'HarmonyVpnLab',
-      'CONNECTION_CORE_READY version=%{public}s dns=proxied-doh ipv6=blocked', this.version);
   }
 
   private async startConnectionCore(context: common.Context, bootstrap: NodeBootstrap | undefined,
     epoch: number): Promise<void> {
-    this.requireConnectionEpoch(epoch);
-    const config = buildConnectionConfig(this.connectionOutboundJson, this.connectionSocksPort,
-      this.metricsPort, this.errorPath, bootstrap, this.connectionPolicy);
-    const request = JSON.stringify(new XrayStartRequest(context.filesDir, config));
-    const encoded = new util.Base64Helper().encodeToStringSync(new util.TextEncoder().encodeInto(request));
-    this.xrayAttempted = true;
-    this.decodeReply(await native.xrayCall('start', encoded));
-    this.requireConnectionEpoch(epoch);
-    const baseline = await this.readCounters();
-    this.requireConnectionEpoch(epoch);
-    this.baselineUp = baseline.uplink;
-    this.baselineDown = baseline.downlink;
-    this.connectionCachedUp = 0;
-    this.connectionCachedDown = 0;
+    let stage = 'core-init';
+    try {
+      this.requireConnectionEpoch(epoch);
+      stage = 'configuration';
+      const config = buildConnectionConfig(this.connectionOutboundJson, this.connectionSocksPort,
+        this.metricsPort, this.errorPath, bootstrap, this.connectionPolicy);
+      const request = JSON.stringify(new XrayStartRequest(context.filesDir, config));
+      const encoded = new util.Base64Helper().encodeToStringSync(new util.TextEncoder().encodeInto(request));
+      stage = 'core-init';
+      this.xrayAttempted = true;
+      this.decodeReply(await native.xrayCall('start', encoded));
+      this.requireConnectionEpoch(epoch);
+      const baseline = await this.readCounters();
+      this.requireConnectionEpoch(epoch);
+      this.baselineUp = baseline.uplink;
+      this.baselineDown = baseline.downlink;
+      this.connectionCachedUp = 0;
+      this.connectionCachedDown = 0;
+    } catch (error) {
+      const failure = connectionFailureFromError(error, stage);
+      throw new ConnectionFailureError(failure.stage, failure.reason);
+    }
   }
 
   private requireHevRunning(): void {
-    const forwarding = JSON.parse(native.forwardingStatus()) as ForwardingStatus;
-    if (!this.hevAttempted || typeof forwarding.hevRunning !== 'boolean' || !forwarding.hevRunning ||
-      typeof forwarding.hevExit !== 'number' || !Number.isInteger(forwarding.hevExit)) {
-      throw new Error('Hev 转发已停止，需要重新连接');
-    }
+    try {
+      const forwarding = JSON.parse(native.forwardingStatus()) as ForwardingStatus;
+      if (!this.hevAttempted || typeof forwarding.hevRunning !== 'boolean' || !forwarding.hevRunning ||
+        typeof forwarding.hevExit !== 'number' || !Number.isInteger(forwarding.hevExit)) {
+        throw new Error('Hev 转发已停止，需要重新连接');
+      }
+    } catch (_) { throw new ConnectionFailureError('forwarding'); }
   }
 
   private async queueConnectionRecovery(operation: () => Promise<void>): Promise<void> {
@@ -421,53 +445,60 @@ export class CoreProbe {
   }
 
   async readConnectionSnapshot(): Promise<ConnectionSnapshot> {
-    if (this.connectionSuspended && !this.connectionFinalStop) { throw new Error('持续连接核心已暂停'); }
-    if (!this.connectionActive || !this.connectionMode || !this.xrayAttempted || !this.hevAttempted) {
-      throw new Error('持续连接核心尚未运行或已经停止');
-    }
-    const epoch = this.connectionEpoch;
-    const counters = await this.readCounters();
-    this.requireConnectionEpoch(epoch);
-    if (!this.connectionActive) { throw new Error('连接快照已失效'); }
-    this.requireHevRunning();
-    this.cacheConnectionCounters(counters);
-    const protection = JSON.parse(native.socketProtectionStats()) as ProtectionStats;
-    const values = [protection.requests, protection.succeeded, protection.failed, protection.timedOut, protection.active];
-    for (const value of values) {
-      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-        throw new Error('Socket 保护计数无效');
+    try {
+      if (this.connectionSuspended && !this.connectionFinalStop) { throw new Error('持续连接核心已暂停'); }
+      if (!this.connectionActive || !this.connectionMode || !this.xrayAttempted || !this.hevAttempted) {
+        throw new Error('持续连接核心尚未运行或已经停止');
       }
+      const epoch = this.connectionEpoch;
+      const counters = await this.readCounters();
+      this.requireConnectionEpoch(epoch);
+      if (!this.connectionActive) { throw new Error('连接快照已失效'); }
+      this.requireHevRunning();
+      this.cacheConnectionCounters(counters);
+      const protection = JSON.parse(native.socketProtectionStats()) as ProtectionStats;
+      const values = [protection.requests, protection.succeeded, protection.failed, protection.timedOut, protection.active];
+      for (const value of values) {
+        if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+          throw new Error('Socket 保护计数无效');
+        }
+      }
+      try { this.collectConnectionDiagnostics(); }
+      catch (_) { throw new Error('读取或轮转核心诊断日志失败'); }
+      const snapshot = new ConnectionSnapshot();
+      snapshot.active = true;
+      snapshot.startedAt = this.connectionStartedAt;
+      snapshot.sampledAt = Date.now();
+      snapshot.coreVersion = this.version;
+      snapshot.uplink = this.connectionAccumulatedUp + this.connectionCachedUp;
+      snapshot.downlink = this.connectionAccumulatedDown + this.connectionCachedDown;
+      snapshot.protectionRequests = protection.requests;
+      snapshot.protectionSucceeded = protection.succeeded;
+      snapshot.protectionFailed = protection.failed;
+      snapshot.protectionTimedOut = protection.timedOut;
+      snapshot.protectionActive = protection.active;
+      snapshot.ipv6BlockedRequests = this.ipv6BlockedRequests;
+      snapshot.dnsRequests = this.dnsRequests;
+      return snapshot;
+    } catch (error) {
+      const failure = connectionFailureFromError(error, 'status');
+      throw new ConnectionFailureError(failure.stage, failure.reason);
     }
-    try { this.collectConnectionDiagnostics(); }
-    catch (_) { throw new Error('读取或轮转核心诊断日志失败'); }
-    const snapshot = new ConnectionSnapshot();
-    snapshot.active = true;
-    snapshot.startedAt = this.connectionStartedAt;
-    snapshot.sampledAt = Date.now();
-    snapshot.coreVersion = this.version;
-    snapshot.uplink = this.connectionAccumulatedUp + this.connectionCachedUp;
-    snapshot.downlink = this.connectionAccumulatedDown + this.connectionCachedDown;
-    snapshot.protectionRequests = protection.requests;
-    snapshot.protectionSucceeded = protection.succeeded;
-    snapshot.protectionFailed = protection.failed;
-    snapshot.protectionTimedOut = protection.timedOut;
-    snapshot.protectionActive = protection.active;
-    snapshot.ipv6BlockedRequests = this.ipv6BlockedRequests;
-    snapshot.dnsRequests = this.dnsRequests;
-    return snapshot;
   }
 
   private async readCounters(): Promise<TrafficCounters> {
-    if (!this.xrayAttempted) { throw new Error('Xray 核心未运行，不能读取流量计数'); }
-    const epoch = this.connectionEpoch;
-    const reply = this.decodeReply(await native.xrayCall('stats', ''));
-    if (!this.xrayAttempted || this.connectionEpoch !== epoch) { throw new Error('Xray 流量统计读取已失效'); }
-    const counts = reply.data as TrafficCounters;
-    if (!counts || typeof counts.uplink !== 'number' || typeof counts.downlink !== 'number' ||
-      !Number.isFinite(counts.uplink) || !Number.isFinite(counts.downlink) || counts.uplink < 0 || counts.downlink < 0) {
-      throw new Error('Xray 流量计数字段缺失');
-    }
-    return counts;
+    try {
+      if (!this.xrayAttempted) { throw new Error('Xray 核心未运行，不能读取流量计数'); }
+      const epoch = this.connectionEpoch;
+      const reply = this.decodeReply(await native.xrayCall('stats', ''));
+      if (!this.xrayAttempted || this.connectionEpoch !== epoch) { throw new Error('Xray 流量统计读取已失效'); }
+      const counts = reply.data as TrafficCounters;
+      if (!counts || typeof counts.uplink !== 'number' || typeof counts.downlink !== 'number' ||
+        !Number.isFinite(counts.uplink) || !Number.isFinite(counts.downlink) || counts.uplink < 0 || counts.downlink < 0) {
+        throw new Error('Xray 流量计数字段缺失');
+      }
+      return counts;
+    } catch (_) { throw new ConnectionFailureError('status'); }
   }
 
   async verifyNodeTraffic(): Promise<void> {
@@ -578,55 +609,57 @@ export class CoreProbe {
   }
 
   private async stopInternal(): Promise<void> {
-    // Drain an already queued start before stopping native resources. Without
-    // this ordering a thread-pool stop could run before a late start completes.
-    const pendingStart = this.connectionStartTask;
-    if (pendingStart !== undefined) {
-      try { await pendingStart; } catch (_) { /* cancellation/failure is cleaned below */ }
-    }
-    const pendingRecovery = this.connectionRecoveryTask;
-    if (pendingRecovery !== undefined) {
-      try { await pendingRecovery; } catch (_) { /* A late recovery cannot outlive final cleanup. */ }
-    }
-    let failures: string[] = [];
-    if (this.hevAttempted) {
-      try {
-        const result = await native.stopHev();
-        this.hevAttempted = false;
-        hilog.info(0x0000, 'HarmonyVpnLab', 'HEV_STOPPED %{public}s', result);
-      } catch (error) {
-        failures.push('停止 Hev：' + String(error));
+    try {
+      // Drain an already queued start before stopping native resources. Without
+      // this ordering a thread-pool stop could run before a late start completes.
+      const pendingStart = this.connectionStartTask;
+      if (pendingStart !== undefined) {
+        try { await pendingStart; } catch (_) { /* cancellation/failure is cleaned below */ }
       }
-    }
-    if (this.xrayAttempted) {
-      try {
-        this.decodeReply(await native.xrayCall('stop', ''));
-        this.xrayAttempted = false;
-        hilog.info(0x0000, 'HarmonyVpnLab', 'XRAY_STOPPED');
-      } catch (error) {
-        failures.push('停止 Xray：' + String(error));
+      const pendingRecovery = this.connectionRecoveryTask;
+      if (pendingRecovery !== undefined) {
+        try { await pendingRecovery; } catch (_) { /* A late recovery cannot outlive final cleanup. */ }
       }
-    }
-    if (this.fixtureAttempted) {
-      try {
-        const result = JSON.parse(await native.stopFixture()) as FixtureStatus;
-        this.requests = result.requests;
-        this.fixtureAttempted = false;
-        hilog.info(0x0000, 'HarmonyVpnLab', 'FIXTURE_STOPPED requests=%{public}d', this.requests);
-      } catch (error) {
-        failures.push('停止测试服务：' + String(error));
+      let failures: string[] = [];
+      if (this.hevAttempted) {
+        try {
+          const result = await native.stopHev();
+          this.hevAttempted = false;
+          hilog.info(0x0000, 'HarmonyVpnLab', 'HEV_STOPPED %{public}s', result);
+        } catch (error) {
+          failures.push('停止 Hev：' + String(error));
+        }
       }
-    }
-    if (this.protectorInstalled) {
-      try { await this.waitForProtectionIdle(); }
-      catch (error) { failures.push(String(error)); }
-      const protection = JSON.parse(native.socketProtectionStats()) as ProtectionStats;
-      hilog.info(0x0000, 'HarmonyVpnLab',
-        'SOCKET_PROTECTION requests=%{public}d succeeded=%{public}d failed=%{public}d timedOut=%{public}d active=%{public}d',
-        protection.requests, protection.succeeded, protection.failed, protection.timedOut, protection.active);
-    }
-    if (failures.length > 0) {
-      throw new Error(failures.join('; '));
-    }
+      if (this.xrayAttempted) {
+        try {
+          this.decodeReply(await native.xrayCall('stop', ''));
+          this.xrayAttempted = false;
+          hilog.info(0x0000, 'HarmonyVpnLab', 'XRAY_STOPPED');
+        } catch (error) {
+          failures.push('停止 Xray：' + String(error));
+        }
+      }
+      if (this.fixtureAttempted) {
+        try {
+          const result = JSON.parse(await native.stopFixture()) as FixtureStatus;
+          this.requests = result.requests;
+          this.fixtureAttempted = false;
+          hilog.info(0x0000, 'HarmonyVpnLab', 'FIXTURE_STOPPED requests=%{public}d', this.requests);
+        } catch (error) {
+          failures.push('停止测试服务：' + String(error));
+        }
+      }
+      if (this.protectorInstalled) {
+        try { await this.waitForProtectionIdle(); }
+        catch (error) { failures.push(String(error)); }
+        const protection = JSON.parse(native.socketProtectionStats()) as ProtectionStats;
+        hilog.info(0x0000, 'HarmonyVpnLab',
+          'SOCKET_PROTECTION requests=%{public}d succeeded=%{public}d failed=%{public}d timedOut=%{public}d active=%{public}d',
+          protection.requests, protection.succeeded, protection.failed, protection.timedOut, protection.active);
+      }
+      if (failures.length > 0) {
+        throw new Error(failures.join('; '));
+      }
+    } catch (_) { throw new ConnectionFailureError('cleanup'); }
   }
 }

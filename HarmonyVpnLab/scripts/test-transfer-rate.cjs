@@ -31,6 +31,11 @@ const modelCode = compile('model/TransferRate.ets');
 const snapshotCode = compile('model/ConnectionSnapshot.ets');
 const homeCode = compile('pages/Home.ets', true);
 const lifecycleCode = compile('model/ConnectionLifecycle.ets');
+const issueCode = compile('model/NodeIssue.ets');
+const importCode = compile('model/NodeImport.ets');
+const bootstrapCode = compile('model/NodeBootstrap.ets');
+const preflightCode = compile('model/NodePreflight.ets');
+const failureCode = compile('model/ConnectionFailure.ets');
 function execute(code, imports = {}, extra = {}) {
   const context = { exports: {}, require(name) { assert(Object.hasOwn(imports, name), name); return imports[name]; }, ...extra };
   vm.runInNewContext(code, context);
@@ -38,6 +43,14 @@ function execute(code, imports = {}, extra = {}) {
 }
 const snapshots = execute(snapshotCode);
 const rates = execute(modelCode, { './ConnectionSnapshot': snapshots });
+const issues = execute(issueCode), bootstrap = execute(bootstrapCode), failures = execute(failureCode);
+const nodeImports = execute(importCode, { './NodeIssue': issues, '@kit.ArkTS': {
+  url: { URL: { parseURL: value => new URL(value) } }, util: {
+    Base64Helper: class { decodeSync(value) { return new Uint8Array(Buffer.from(value, 'base64')); } },
+    TextDecoder: { create: (encoding, options) => ({ decodeToString: value => new TextDecoder(encoding, options).decode(value) }) }
+  }
+} });
+const preflight = execute(preflightCode, { './NodeImport': nodeImports, './NodeIssue': issues, './NodeBootstrap': bootstrap });
 const { TransferRateTracker: Tracker, formatTransferRate } = rates;
 function snapshot(sampledAt, uplink, downlink, changes = {}) {
   return Object.assign(new snapshots.ConnectionSnapshot(), { active: true, startedAt: 1000, sampledAt, uplink, downlink }, changes);
@@ -216,6 +229,9 @@ function homeHarness() {
     './ConnectionControl': imports['../model/ConnectionControl']
   }, { Date: class extends Date { static now() { return state.now; } } });
   imports['../model/ConnectionRecoveryStore'] = { recordConnectionRecovery() {} };
+  imports['../model/NodeIssue'] = issues;
+  imports['../model/NodePreflight'] = preflight;
+  imports['../model/ConnectionFailure'] = failures;
   const { Home } = execute(homeCode, imports, {
     Date: class extends Date { static now() { return state.now; } }, $r: name => name,
     AppStorage: { get: () => false },

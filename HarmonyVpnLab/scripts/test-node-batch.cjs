@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const Module = require('module');
 const path = require('path');
-const { loadNodeParser } = require('./node-import-loader.cjs');
+const { loadNodeImporter } = require('./node-import-loader.cjs');
 const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio';
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
 const sourcePath = path.resolve(__dirname, '../entry/src/main/ets/model/NodeBatchImport.ets');
@@ -24,9 +24,11 @@ const compiled = ts.transpileModule(original.replace(importLine, shim), {
     reportDiagnostics: true
 });
 assert.equal(compiled.diagnostics.length, 0);
-const parser = loadNodeParser();
+const importer = loadNodeImporter();
+const parser = importer.parser.parseNode;
 const loaded = new Module(sourcePath);
 loaded.require = name => {
+    if (name === './NodeIssue') return importer.issues;
     assert.equal(name, './NodeImport', 'Unexpected batch importer dependency');
     return { parseNode: parser };
 };
@@ -58,7 +60,8 @@ function bad(name, text, pattern) {
         assert(!error.message.includes(uuid));
         assert(!error.message.includes('example.invalid'));
         assert(!error.message.includes('fictional-password'));
-        if (pattern) assert.match(error.message, pattern);
+        const issue = importer.issues.nodeIssueFromError(error);
+        if (pattern) assert.match(issue ? importer.issues.formatNodeIssue(issue) : error.message, pattern);
         return name;
     });
 }
@@ -93,14 +96,14 @@ good('64 KiB single share link boundary', first.replace(/#.*$/, '#') + 'a'.repea
 good('oversize single entry contributes rejected count', first + '\n' + second + 'a'.repeat(65536), [1, 1, 0, 2]);
 good('UTF-8 byte limit is not character limit', first + '\n' + second + '中'.repeat(22000), [1, 1, 0, 2]);
 good('1 MiB total boundary includes surrounding whitespace', first + ' '.repeat(1048576 - Buffer.byteLength(first)), [1, 0, 0, 1]);
-bad('empty', '', /未找到/);
-bad('whitespace only', ' \r\n\t', /未找到/);
+bad('empty', '', /尚未填写/);
+bad('whitespace only', ' \r\n\t', /尚未填写/);
 bad('all invalid links', second.replace(':443', ':0') + '\n' + first.replace(uuid, 'fictional-bad-id'), /未找到/);
 bad('501 lines', Array(501).fill(first).join('\n'), /500/);
 bad('501 decoded lines', base64(Array(501).fill(first).join('\n')), /500/);
 bad('interior blank lines cannot evade line limit', first + '\n'.repeat(501) + second, /500/);
-bad('more than 1 MiB ASCII', 'a'.repeat(1048577), /1 MiB/);
-bad('more than 1 MiB UTF-8', '中'.repeat(349526), /1 MiB/);
+bad('more than 1 MiB ASCII', 'a'.repeat(1048577), /大小限制/);
+bad('more than 1 MiB UTF-8', '中'.repeat(349526), /大小限制/);
 bad('oversize JSON', JSON.stringify({ ...outbound, tag: 'a'.repeat(65536) }), /64 KiB/);
 bad('malformed JSON not split into links', '{\n' + first + '\n}', /JSON/);
 bad('JSON array not split into links', '[\n' + first + '\n]', /JSON/);
@@ -139,6 +142,8 @@ const record = {
     sourceSha256: crypto.createHash('sha256').update(original).digest('hex'),
     singleParserSha256: crypto.createHash('sha256').update(fs.readFileSync(path.resolve(__dirname,
         '../entry/src/main/ets/model/NodeImport.ets'))).digest('hex'),
+    nodeIssueSha256: crypto.createHash('sha256').update(fs.readFileSync(path.resolve(__dirname,
+        '../entry/src/main/ets/model/NodeIssue.ets'))).digest('hex'),
     fixturePolicy: 'fictional-only; offline; SDK shims; not a device result', tests: passed
 };
 const recordPath = path.resolve(__dirname, '../build/node-batch-verification.json');

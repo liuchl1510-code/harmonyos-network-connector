@@ -20,6 +20,11 @@ import { networkPolicyLabel } from '../model/NetworkPolicy';
 import { TransferRateTracker, formatTransferRate } from '../model/TransferRate';
 import { readConnectionLifecycle } from '../model/ConnectionLifecycle';
 import { recordConnectionRecovery } from '../model/ConnectionRecoveryStore';
+import { ImportedNode } from '../model/NodeImport';
+import { nodeIssue } from '../model/NodeIssue';
+import { checkNodeForConnection } from '../model/NodePreflight';
+import { ConnectionFailure, makeConnectionFailure, connectionFailureFromError, failureProblem } from '../model/ConnectionFailure';
+import { FailureNotice } from '../components/FailureNotice';
 
 @Entry
 @Component
@@ -51,6 +56,16 @@ struct Home {
   @State developerTools: boolean = false;
   @State routingSummary: string = '全部代理';
   @State routingHint: string = 'DNS 通过节点加密查询';
+  @State configurationChecked: boolean = false;
+  @State configurationIssueCode: string = '';
+  @State profileUnreadable: boolean = false;
+  @State startFailure: ConnectionFailure | undefined = undefined;
+  @State checkFailure: ConnectionFailure | undefined = undefined;
+  @State serviceFailure: ConnectionFailure | undefined = undefined;
+  @State serviceCleanupFailure: ConnectionFailure | undefined = undefined;
+  @State serviceCurrentIssue: ConnectionFailure | undefined = undefined;
+  private profileNode: ImportedNode | undefined = undefined;
+  private profileOutbound: string = '';
   private poll: number = -1;
   private authorizationSubscription: number = -1;
   private checkGeneration: number = 0;
@@ -77,6 +92,7 @@ struct Home {
             writeConnectionCommand(this.context().filesDir, new ConnectionCommand(current.runId, 'stop'));
             writeProbeState(this.context().filesDir, new ProbeState('failed', '未获得 VPN 授权。', current.runId, current.kind));
             this.startGeneration++; this.requesting = false;
+            this.startFailure = makeConnectionFailure('authorization');
             this.closed = true;
             this.refresh();
           }
@@ -120,6 +136,9 @@ struct Home {
   }
 
   private statusHint(): string {
+    if (!this.busy() && this.configurationIssueCode.length > 0) {
+      return nodeIssue(this.configurationIssueCode).problem + ' 请查看下方配置检查。';
+    }
     if (!VPN_CORE_AVAILABLE) { return '此构建用于界面与交互验证。'; }
     if (!this.hasNode) { return '添加一个节点，开始使用。'; }
     switch (this.phase) {
@@ -143,11 +162,35 @@ struct Home {
 
   private refreshProfile(): void {
     const filesDir = this.context().filesDir;
-    const node = readNodeProfile(filesDir);
-    this.hasNode = node !== undefined;
-    this.protocol = node?.protocol.toUpperCase() ?? '';
-    this.nodeName = node?.name ?? '';
+    try {
+      const node = readNodeProfile(filesDir);
+      const outbound = node?.outboundJson ?? '';
+      if (outbound !== this.profileOutbound || this.profileUnreadable) {
+        this.configurationChecked = false; this.configurationIssueCode = '';
+      }
+      this.profileNode = node; this.profileOutbound = outbound; this.profileUnreadable = false;
+      this.hasNode = node !== undefined;
+      this.protocol = node?.protocol.toUpperCase() ?? '';
+      this.nodeName = node?.name ?? '';
+    } catch (_) {
+      this.profileNode = undefined; this.profileOutbound = ''; this.profileUnreadable = true;
+      this.hasNode = false; this.protocol = ''; this.nodeName = '';
+      this.configurationChecked = true; this.configurationIssueCode = 'catalog-unreadable';
+    }
     this.refreshNetworkSummary();
+  }
+
+  private inspectCurrentConfiguration(): ImportedNode | undefined {
+    this.refreshProfile();
+    this.configurationChecked = true;
+    if (this.profileUnreadable) { this.configurationIssueCode = 'catalog-unreadable'; return undefined; }
+    const node = this.profileNode;
+    if (!node) { this.configurationIssueCode = 'node-missing'; return undefined; }
+    try {
+      const issues = checkNodeForConnection(node);
+      this.configurationIssueCode = issues.length > 0 ? issues[0].code : '';
+      return issues.length === 0 ? node : undefined;
+    } catch (_) { this.configurationIssueCode = 'configuration-invalid'; return undefined; }
   }
 
   private refreshNetworkSummary(): void {
@@ -163,6 +206,8 @@ struct Home {
   private async primaryAction(): Promise<void> {
     if (this.requesting || this.phase === 'diagnostic') { return; }
     if (this.busy()) { await this.disconnect(); return; }
+    this.refreshProfile();
+    if (this.profileUnreadable) { this.inspectCurrentConfiguration(); return; }
     if (!this.hasNode) {
       try { await this.getUIContext().getRouter().pushUrl({ url: 'pages/NodeConfig' }); }
       catch (_) { this.detail = '导入页面暂时无法打开，请从节点页重试。'; }
@@ -181,6 +226,10 @@ struct Home {
     this.now = Date.now();
     const assessment = readConnectionLifecycle(filesDir, this.now);
     const state = assessment.state, command = assessment.command, status = assessment.status;
+    if (this.runId !== state.runId) { this.startFailure = undefined; this.checkFailure = undefined; }
+    this.serviceFailure = status?.runId === state.runId ? status.failure : undefined;
+    this.serviceCleanupFailure = status?.runId === state.runId ? status.cleanupFailure : undefined;
+    this.serviceCurrentIssue = status?.runId === state.runId && !assessment.closed ? status.currentIssue : undefined;
     if (assessment.interruptionObserved) {
       try { recordConnectionRecovery(filesDir, assessment); } catch (_) { /* Diagnostic storage cannot block recovery. */ }
     }
@@ -201,6 +250,7 @@ struct Home {
       this.detail = command.action === 'stop' ? '本次连接请求已取消。' : '未收到 VPN 启动结果，请确认授权后重试。';
       writeProbeState(filesDir, new ProbeState(this.phase, this.detail, state.runId, state.kind));
       this.startGeneration++; this.requesting = false;
+      this.startFailure = makeConnectionFailure('start-request', 'timeout');
       this.closed = true;
       this.resetTransferRate();
       return;
@@ -269,7 +319,9 @@ struct Home {
   private async connect(kind: string = 'connection'): Promise<void> {
     if (!VPN_CORE_AVAILABLE) { this.detail = '模拟器界面预览不包含 VPN 转发核心。'; return; }
     this.refresh();
-    if (this.busy() || this.requesting || !this.hasNode || !this.closed) { return; }
+    if (this.busy() || this.requesting || !this.closed) { return; }
+    const checkedNode = this.inspectCurrentConfiguration();
+    if (!checkedNode) { return; }
     const filesDir = this.context().filesDir;
     const before = readConnectionLifecycle(filesDir);
     if (!before.closed) { this.refresh(); return; }
@@ -286,8 +338,14 @@ struct Home {
         current.command?.createdAt !== before.command?.createdAt || current.command?.ownerEpoch !== before.command?.ownerEpoch) {
         this.refresh(); return;
       }
+      const currentNode = this.inspectCurrentConfiguration();
+      if (!currentNode) { return; }
+      if (currentNode.outboundJson !== checkedNode.outboundJson) {
+        this.configurationIssueCode = 'node-changed'; return;
+      }
       const runId = Date.now().toString();
       startedRunId = runId;
+      this.startFailure = undefined; this.checkFailure = undefined;
       writeConnectionCommand(this.context().filesDir, new ConnectionCommand(runId, 'start'));
       writeProbeState(this.context().filesDir, new ProbeState('starting', '正在建立 VPN 和代理 DNS。', runId, kind));
       this.runId = runId;
@@ -309,6 +367,7 @@ struct Home {
       if (current.runId === startedRunId && current.phase === 'starting') {
         writeConnectionCommand(this.context().filesDir, new ConnectionCommand(current.runId, 'stop'));
         writeProbeState(this.context().filesDir, new ProbeState('failed', '连接未完成：' + describeError(error), current.runId, current.kind));
+        this.startFailure = connectionFailureFromError(error, 'start-request');
       }
       this.refresh();
     } finally { if (generation === this.startGeneration) { this.requesting = false; } }
@@ -356,6 +415,7 @@ struct Home {
     try {
       writeConnectionCommand(this.context().filesDir, new ConnectionCommand(this.runId, 'reconnect', command.ownerEpoch));
       this.checkGeneration++; this.checking = false; this.phase = 'recovering';
+      this.checkFailure = undefined;
       this.resetTransferRate();
       this.checkResult = '正在请求重连。'; this.exitMarker = '';
     } catch (_) { this.detail = '重新连接请求未保存，请重试。'; }
@@ -363,6 +423,7 @@ struct Home {
 
   private async checkPhysicalResolver(): Promise<void> {
     if (this.phase !== 'active' || this.checking) { return; }
+    this.checkFailure = undefined;
     this.checking = true; this.checkResult = '正在检查物理网络 DNS…';
     const runId = this.runId;
     const generation = this.checkGeneration;
@@ -390,11 +451,15 @@ struct Home {
   private async checkConnection(ipv6: boolean = false): Promise<void> {
     if (this.phase !== 'active' || this.checking) { return; }
     this.checking = true;
+    this.checkFailure = undefined;
     this.checkResult = ipv6 ? '正在检查 IPv6 拒绝路径…' : '正在检查 DNS 和 HTTPS…';
     const runId = this.runId;
     const generation = this.checkGeneration;
-    const request = http.createHttp();
+    let request: http.HttpRequest | undefined = undefined;
+    let failureStage: string = 'https';
     try {
+      request = http.createHttp();
+      failureStage = ipv6 ? 'https' : 'proxy-dns';
       if (!ipv6) {
         await checkProxyDns();
         hilog.info(0x0000, 'HarmonyVpnLab', 'CONNECTION_DNS_A_AND_AAAA_POLICY_OK runId=%{public}s', runId);
@@ -412,6 +477,7 @@ struct Home {
         }
       }
       if (!this.checkStillCurrent(runId, generation)) { return; }
+      failureStage = 'https';
       const url = ipv6 ? `https://[2606:4700:4700::1111]/cdn-cgi/trace?check=${Date.now()}`
         : `https://www.cloudflare.com/cdn-cgi/trace?check=${Date.now()}`;
       const response = await request.request(url, {
@@ -419,6 +485,7 @@ struct Home {
         usingCache: false, connectTimeout: 6000, readTimeout: 6000
       });
       if (!this.checkStillCurrent(runId, generation)) { return; }
+      failureStage = 'response';
       if (ipv6) {
         this.checkResult = 'IPv6 请求获得响应，需要检查捕获规则。';
         hilog.error(0x0000, 'HarmonyVpnLab', 'CONNECTION_IPV6_UNEXPECTED_RESPONSE runId=%{public}s', runId);
@@ -431,10 +498,18 @@ struct Home {
       } else { throw new Error('测试站点响应不符合预期'); }
     } catch (error) {
       if (!this.checkStillCurrent(runId, generation)) { return; }
-      this.checkResult = ipv6 ? 'IPv6 请求未成功，需结合黑洞命中计数确认阻断。' : '检查未通过：' + describeError(error);
+      if (ipv6) { this.checkResult = 'IPv6 请求未成功，需结合黑洞命中计数确认阻断。'; }
+      else {
+        this.checkFailure = failureStage === 'response' ? makeConnectionFailure('response', 'invalid-response') :
+          connectionFailureFromError(error, failureStage);
+        this.checkResult = failureProblem(this.checkFailure);
+      }
       hilog.info(0x0000, 'HarmonyVpnLab', ipv6 ? 'CONNECTION_IPV6_REQUEST_FAILED runId=%{public}s' : 'CONNECTION_DOMAIN_HTTPS_FAILED runId=%{public}s', runId);
       if (ipv6) { hilog.info(0x0000, 'HarmonyVpnLab', 'CONNECTION_IPV6_HTTP_ERROR %{public}s', describeError(error)); }
-    } finally { request.destroy(); if (this.runId === runId && generation === this.checkGeneration) { this.checking = false; } }
+    } finally {
+      try { request?.destroy(); }
+      finally { if (this.runId === runId && generation === this.checkGeneration) { this.checking = false; } }
+    }
   }
 
   build() {
@@ -468,24 +543,30 @@ struct Home {
           }
           if (this.developerTools) {
             this.connectionHero();
+            this.connectionFailureCards();
+            this.configurationCheckCard();
             this.developerContent();
           } else {
             if (homeUsesColumns(this.windowWidthVp)) {
               Row({ space: 24 }) {
                 Column({ space: 20 }) {
                   this.connectionHero();
+                  this.connectionFailureCards();
                   if (this.busy()) { this.connectionCheckCard(); }
                   this.connectionFootnote();
                 }.layoutWeight(1).alignItems(HorizontalAlign.Start);
                 Column({ space: 20 }) {
                   if (this.hasNode) { this.nodeCard(); }
+                  this.configurationCheckCard();
                   this.networkSettingsCard();
                   this.trafficCard();
                 }.layoutWeight(1).alignItems(HorizontalAlign.Start);
               }.id('homeTwoColumns').width('100%').alignItems(VerticalAlign.Top);
             } else {
             this.connectionHero();
+            this.connectionFailureCards();
             if (this.hasNode) { this.nodeCard(); }
+            this.configurationCheckCard();
             this.networkSettingsCard();
             this.trafficCard();
             if (this.busy()) { this.connectionCheckCard(); }
@@ -530,7 +611,7 @@ struct Home {
         }.width(80).height(80).backgroundColor($r('app.color.accent_soft')).borderRadius(40).accessibilityLevel('no');
       }
       Text(this.statusHint()).fontSize(14).fontColor($r('app.color.text_secondary')).textAlign(TextAlign.Center);
-      Button(!this.hasNode && !this.busy() ? '添加节点' : this.busy() ? '断开' : '连接').id('toggleConnection').width('100%').constraintSize({ minHeight: 54 })
+      Button(this.busy() ? '断开' : this.profileUnreadable ? '检查节点库' : this.hasNode ? '连接' : '添加节点').id('toggleConnection').width('100%').constraintSize({ minHeight: 54 })
         .fontSize(19).fontWeight(FontWeight.Medium).borderRadius(18)
         .fontColor($r('app.color.on_accent')).backgroundColor($r('app.color.accent'))
         .enabled(this.phase !== 'diagnostic' && !this.requesting &&
@@ -551,7 +632,7 @@ struct Home {
         Text('连接通知未启用，可在系统设置中为本应用开启通知。')
           .fontSize(12).fontColor($r('app.color.warning'));
       }
-      if (!this.hasNode && !this.busy()) {
+      if (!this.hasNode && !this.busy() && !this.profileUnreadable) {
         Text('已有节点链接或二维码？添加后即可开始。').fontSize(12)
           .fontColor($r('app.color.text_secondary')).textAlign(TextAlign.Center);
       }
@@ -632,6 +713,50 @@ struct Home {
   }
 
   @Builder
+  configurationCheckCard() {
+    Column({ space: 12 }) {
+      Flex({ direction: FlexDirection.Row, wrap: FlexWrap.Wrap, alignItems: ItemAlign.Center,
+        justifyContent: FlexAlign.SpaceBetween }) {
+        Text('本地配置检查').fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
+        Button('检查配置', { type: ButtonType.Normal }).id('checkNodeConfiguration').constraintSize({ minHeight: 44 })
+          .padding({ left: 14, right: 14 }).fontSize(13).fontColor($r('app.color.accent'))
+          .backgroundColor($r('app.color.accent_soft')).borderRadius(14).enabled(!this.requesting)
+          .onClick(() => { this.inspectCurrentConfiguration(); });
+      }.width('100%');
+      if (this.configurationIssueCode.length > 0) {
+        Text('需要检查：' + nodeIssue(this.configurationIssueCode).field).id('nodeConfigurationField')
+          .fontSize(14).fontWeight(FontWeight.Medium).fontColor($r('app.color.warning')).width('100%');
+        Text(nodeIssue(this.configurationIssueCode).problem).id('nodeConfigurationProblem')
+          .fontSize(14).fontColor($r('app.color.text_primary')).width('100%');
+        Text('建议：' + nodeIssue(this.configurationIssueCode).suggestion).id('nodeConfigurationSuggestion')
+          .fontSize(13).fontColor($r('app.color.text_secondary')).width('100%');
+      } else {
+        Text(this.configurationChecked ? '本地检查通过，尚未验证节点联网。' : '检查格式与当前连接入口，不会联网或修改配置。')
+          .id('nodeConfigurationResult').fontSize(13).fontColor($r('app.color.text_secondary')).width('100%');
+      }
+    }.width('100%').padding(20).alignItems(HorizontalAlign.Start)
+      .backgroundColor($r('app.color.surface')).borderRadius(20);
+  }
+
+  @Builder
+  connectionFailureCards() {
+    if (this.startFailure) {
+      FailureNotice({ title: '本次启动未完成', stage: this.startFailure.stage, reason: this.startFailure.reason, idPrefix: 'startupFailure' });
+    }
+    if (this.serviceFailure) {
+      FailureNotice({ title: this.closed ? '上次连接的失败阶段' : '本次连接的失败阶段',
+        stage: this.serviceFailure.stage, reason: this.serviceFailure.reason, idPrefix: 'serviceFailure' });
+    } else if (this.serviceCurrentIssue) {
+      FailureNotice({ title: '当前步骤尚未完成', stage: this.serviceCurrentIssue.stage,
+        reason: this.serviceCurrentIssue.reason, idPrefix: 'currentConnectionIssue' });
+    }
+    if (this.serviceCleanupFailure) {
+      FailureNotice({ title: '清理回执需要确认', stage: this.serviceCleanupFailure.stage,
+        reason: this.serviceCleanupFailure.reason, idPrefix: 'cleanupFailure' });
+    }
+  }
+
+  @Builder
   connectionCheckCard() {
     Column({ space: 12 }) {
       Row() {
@@ -643,6 +768,10 @@ struct Home {
       }.width('100%');
       Text(this.checkResult).id('connectionCheckResult').width('100%')
         .fontSize(13).fontColor($r('app.color.text_secondary'));
+      if (this.checkFailure) {
+        FailureNotice({ title: '本次联网检查未完成', stage: this.checkFailure.stage,
+          reason: this.checkFailure.reason, idPrefix: 'connectionCheckFailure' });
+      }
     }.width('100%').padding(20).backgroundColor($r('app.color.surface')).borderRadius(20);
   }
 

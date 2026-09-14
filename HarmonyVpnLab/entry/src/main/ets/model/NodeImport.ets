@@ -1,4 +1,5 @@
 import { url, util } from '@kit.ArkTS';
+import { NodeIssueError, importIssueCode } from './NodeIssue';
 
 // Format references and deliberately restricted coverage: docs/node-import-support.md.
 // No caller input or core configuration is included in an error message or a log.
@@ -120,7 +121,7 @@ const QUERY_KEYS: string[] = ['type', 'security', 'encryption', 'flow', 'sni', '
   'skip-cert-verify', 'skipCertVerify'];
 
 function fail(message: string): never {
-  throw new Error(message);
+  throw new NodeIssueError(importIssueCode(message));
 }
 
 function requireObject(value: Object | undefined, message: string): void {
@@ -139,10 +140,10 @@ function optionalString(value: string | undefined): string {
   return value;
 }
 
-function requireSecret(value: string | undefined): string {
+function requireSecret(value: string | undefined, code: string = 'credential-missing'): string {
   const result = optionalString(value);
   if (result.trim().length === 0) {
-    return fail('节点认证信息不能为空。');
+    throw new NodeIssueError(code);
   }
   return result;
 }
@@ -264,7 +265,7 @@ function splitShare(text: string): ShareParts {
   }
   const at = body.lastIndexOf('@');
   if (at <= 0 || body.indexOf('@') !== at) {
-    return fail('分享链接缺少认证信息或服务器地址。');
+    throw new NodeIssueError('endpoint-format');
   }
   result.userInfo = percentDecode(body.substring(0, at));
   const endpoint = body.substring(at + 1);
@@ -380,11 +381,10 @@ function streamFromQuery(query: Map<string, string>, protocol: string): StreamCo
     const key = get(query, 'pbk');
     const shortId = get(query, 'sid');
     const sni = get(query, 'sni');
-    if (!/^[A-Za-z0-9_-]{43}$/.test(key) || sni.length === 0) {
-      return fail('REALITY 需要有效的 pbk 公钥和 sni。');
-    }
+    if (!/^[A-Za-z0-9_-]{43}$/.test(key)) { throw new NodeIssueError('reality-key'); }
+    if (sni.length === 0) { throw new NodeIssueError('reality-sni'); }
     if (!/^(?:[0-9a-fA-F]{2}){0,8}$/.test(shortId)) {
-      return fail('REALITY sid 必须是最长 16 位、偶数长度的十六进制字符串。');
+      throw new NodeIssueError('reality-short-id');
     }
     const reality: RealityConfig = { serverName: sni, fingerprint: get(query, 'fp', 'chrome') || 'chrome',
       publicKey: key, shortId: shortId };
@@ -589,12 +589,10 @@ function checkOutboundStream(stream: StreamConfig | undefined): StreamConfig {
     if (reality === undefined || network === 'ws') {
       return fail('REALITY 不支持 WebSocket。');
     }
-    if (!/^[A-Za-z0-9_-]{43}$/.test(requireSecret(reality.publicKey)) ||
-      !/^(?:[0-9a-fA-F]{2}){0,8}$/.test(optionalString(reality.shortId))) {
-      return fail('REALITY 公钥或 shortId 格式不正确。');
-    }
-    requireSecret(reality.serverName);
-    requireSecret(reality.fingerprint);
+    if (!/^[A-Za-z0-9_-]{43}$/.test(requireSecret(reality.publicKey, 'reality-key'))) { throw new NodeIssueError('reality-key'); }
+    if (!/^(?:[0-9a-fA-F]{2}){0,8}$/.test(optionalString(reality.shortId))) { throw new NodeIssueError('reality-short-id'); }
+    requireSecret(reality.serverName, 'reality-sni');
+    requireSecret(reality.fingerprint, 'reality-fingerprint');
     if (reality.mldsa65Verify !== undefined && reality.mldsa65Verify !== '') {
       return fail('当前导入器尚未验证非空 mldsa65Verify，暂不接受此配置，也不会忽略该校验。');
     }
@@ -663,9 +661,8 @@ function parseOutbound(text: string): ImportedNode {
 
 export function parseNode(text: string): ImportedNode {
   const input = text.trim();
-  if (input.length === 0 || input.length > 131072) {
-    return fail('请粘贴一个节点，长度不能超过 131072 个字符。');
-  }
+  if (input.length === 0) { throw new NodeIssueError('input-empty'); }
+  if (input.length > 131072) { throw new NodeIssueError('input-size'); }
   if (input.startsWith('{')) {
     return parseOutbound(input);
   }
@@ -684,5 +681,5 @@ export function parseNode(text: string): ImportedNode {
   if (input.startsWith('ss://')) {
     return parseShadowsocks(input);
   }
-  return fail('支持单个 VLESS、Trojan、VMess、Shadowsocks SIP002 链接或 Xray outbound JSON；暂不支持订阅。');
+  throw new NodeIssueError(/^[A-Za-z0-9]+:\/\//.test(input) ? 'protocol-unsupported' : 'input-format');
 }

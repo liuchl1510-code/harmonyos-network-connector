@@ -1,5 +1,6 @@
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
+import { failureFromDiagnosticEvent } from './ConnectionFailure';
 
 const JOURNAL_NAME: string = 'diagnostic-journal.json';
 const MAX_EVENTS: number = 200;
@@ -36,7 +37,8 @@ function validEvent(event: DiagnosticEvent): boolean {
   return fields.length === EVENT_FIELDS.length && fields.every((field: string) => EVENT_FIELDS.includes(field)) &&
     typeof event.at === 'number' && Number.isSafeInteger(event.at) && event.at >= 0 &&
     typeof event.runId === 'string' && /^[0-9]{13}$/.test(event.runId) &&
-    typeof event.code === 'string' && EVENT_CODES.includes(event.code) &&
+    typeof event.code === 'string' && (EVENT_CODES.includes(event.code) ||
+      event.kind === '' && failureFromDiagnosticEvent(event.code, event.value, event.at) !== undefined) &&
     typeof event.kind === 'string' && EVENT_KINDS.includes(event.kind) &&
     typeof event.value === 'number' && Number.isFinite(event.value) && Number.isInteger(event.value) && event.value >= 0;
 }

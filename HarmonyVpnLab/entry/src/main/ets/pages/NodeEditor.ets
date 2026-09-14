@@ -5,6 +5,7 @@ import { ImportedNode } from '../model/NodeImport';
 import { isNodeManagementAllowed } from '../model/NodeEditGuard';
 import { NodeEditorDraft, nodeEditorDraft, nodeFromEditorDraft, nodeFromEditorJson } from '../model/NodeEditor';
 import { formContentWidth } from '../model/AdaptiveLayout';
+import { nodeIssue, nodeIssueFromError } from '../model/NodeIssue';
 
 interface NodeEditorParams { nodeId?: string; }
 
@@ -23,6 +24,7 @@ struct NodeEditor {
   @State confirmingLeave: boolean = false;
   @State leaving: boolean = false;
   @State portError: string = '';
+  @State issueCode: string = '';
   private nodeId: string = '';
   private revision: number = -1;
   private original?: ImportedNode;
@@ -45,7 +47,7 @@ struct NodeEditor {
 
   private clearDraft(): void {
     this.original = undefined; this.baseline = undefined; this.jsonText = ''; this.draft = new NodeEditorDraft();
-    this.loaded = false; this.dirty = false; this.portError = '';
+    this.loaded = false; this.dirty = false; this.portError = ''; this.issueCode = '';
   }
 
   private editedNode(): ImportedNode {
@@ -64,6 +66,7 @@ struct NodeEditor {
 
   private draftChanged(): void {
     this.message = '';
+    this.issueCode = '';
     this.portError = !this.jsonMode && (!/^[0-9]{1,5}$/.test(this.draft.port) ||
       Number(this.draft.port) < 1 || Number(this.draft.port) > 65535) ? '端口应为 1–65535 的整数。' : '';
     this.refreshDirty();
@@ -210,7 +213,10 @@ struct NodeEditor {
       }
       this.message = '';
       this.portError = ''; this.refreshDirty();
-    } catch (_) { this.message = '当前内容未通过校验，已保留输入；请修正后再切换编辑方式。'; }
+    } catch (error) {
+      this.issueCode = nodeIssueFromError(error as Object)?.code ?? '';
+      this.message = '当前内容未通过校验，已保留输入；请修正后再切换编辑方式。';
+    }
   }
 
   private save(): void {
@@ -220,7 +226,7 @@ struct NodeEditor {
     this.refreshEditable();
     if (!this.editable) { this.message = '请先断开连接并等待清理完成，再保存修改。'; return; }
     this.draftChanged();
-    if (this.portError) { this.message = this.portError; return; }
+    if (this.portError) { this.issueCode = 'port-format'; this.message = this.portError; return; }
     let committed: boolean = false;
     try {
       const edited = this.editedNode();
@@ -237,8 +243,14 @@ struct NodeEditor {
       this.draft = nodeEditorDraft(this.original);
       if (this.jsonMode) { this.jsonText = saved.outboundJson; }
       this.refreshDirty();
+      this.issueCode = '';
       this.message = '节点修改已保存，原选中项保持不变。';
     } catch (error) {
+      const issue = !committed ? nodeIssueFromError(error as Object) : undefined;
+      if (issue) {
+        this.issueCode = issue.code;
+        this.message = '配置未通过检查，输入已保留；请按字段提示修正。'; return;
+      }
       const safeErrors: string[] = [
         '节点库已发生变化，请返回列表后重新打开编辑。',
         '相同配置的节点已存在，请直接选择该节点。',
@@ -270,6 +282,18 @@ struct NodeEditor {
               }
               if (!this.editable) { Text('连接运行或清理期间不能保存节点修改。').fontSize(13).fontColor($r('app.color.warning')); }
             }.padding(20).width('100%').alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.surface')).borderRadius(18);
+
+            if (this.issueCode) {
+              Column({ space: 8 }) {
+                Text(nodeIssue(this.issueCode).field).id('nodeEditorIssueField').fontSize(15).fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary')).width('100%');
+                Text(nodeIssue(this.issueCode).problem).id('nodeEditorIssueProblem').fontSize(14)
+                  .fontColor($r('app.color.danger')).width('100%');
+                Text('建议：' + nodeIssue(this.issueCode).suggestion).id('nodeEditorIssueSuggestion').fontSize(13)
+                  .fontColor($r('app.color.text_secondary')).width('100%');
+              }.padding(16).width('100%').alignItems(HorizontalAlign.Start)
+                .backgroundColor($r('app.color.surface')).borderRadius(14);
+            }
 
             if (this.jsonMode) {
               Column({ space: 12 }) {
@@ -363,6 +387,7 @@ struct NodeEditor {
         .onChange((text: string) => { this.changeField(id, text); });
       if (id === 'editNodePort' && this.portError) {
         Text(this.portError).id('editNodePortError').fontSize(13).fontColor($r('app.color.danger'));
+        Text(nodeIssue('port-format').suggestion).fontSize(12).fontColor($r('app.color.text_secondary')).width('100%');
       }
     }.width('100%').alignItems(HorizontalAlign.Start);
   }

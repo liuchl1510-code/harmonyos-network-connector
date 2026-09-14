@@ -45,6 +45,8 @@ const source = fs.readFileSync(path, 'utf8').replace("import { url, util } from 
 const out = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true });
 assert.equal(out.diagnostics.length, 0);
 const m = new Module(path);
+const issues = require('./node-import-loader.cjs').loadNodeImporter(tsPath).issues;
+m.require = name => { assert.equal(name, './NodeIssue'); return issues; };
 m._compile(out.outputText, path);
 const parse = m.exports.parseNode;
 const uuid = 'd83b7e56-c9d8-4ce7-b8fb-90a784b40c60', base = `vless://${uuid}@example.invalid:443`, b64 = s => Buffer.from(s).toString('base64');
@@ -143,6 +145,7 @@ const report = {
     checkedAt: new Date().toISOString(),
     source: 'entry/src/main/ets/model/NodeImport.ets',
     sourceSha256: crypto.createHash('sha256').update(fs.readFileSync(path)).digest('hex'),
+    nodeIssueSha256: crypto.createHash('sha256').update(fs.readFileSync(nodePath.join(projectRoot, 'entry/src/main/ets/model/NodeIssue.ets'))).digest('hex'),
     nodeVersion: process.version,
     typescriptVersion: ts.version,
     passed: passed, failed: failed, total: tests.length,

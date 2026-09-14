@@ -33,7 +33,7 @@ function compile(relative, page = false) {
     assert.equal(output.diagnostics.length, 0, 'SDK transpilation failed: ' + relative);
     compiledFiles.set(relative, output.outputText);
 }
-for (const file of ['model/NodeImport.ets', 'model/NodeBatchImport.ets', 'model/SubscriptionFetch.ets', 'model/ConnectionLifecycle.ets', 'model/NodeEditGuard.ets', 'model/BatchLatency.ets', 'model/NodeScanner.ets', 'model/AdaptiveLayout.ets', 'model/NodeListFilter.ets', 'model/NodeListNavigation.ets', 'model/NodeLatencySort.ets']) compile(file);
+for (const file of ['model/NodeIssue.ets', 'model/NodeImport.ets', 'model/NodeBatchImport.ets', 'model/SubscriptionFetch.ets', 'model/ConnectionLifecycle.ets', 'model/NodeEditGuard.ets', 'model/BatchLatency.ets', 'model/NodeScanner.ets', 'model/AdaptiveLayout.ets', 'model/NodeListFilter.ets', 'model/NodeListNavigation.ets', 'model/NodeLatencySort.ets']) compile(file);
 for (const file of ['pages/NodeConfig.ets', 'pages/Subscriptions.ets', 'pages/Nodes.ets']) compile(file, true);
 function execute(relative, imports, timers = {}) {
     const context = { VPN_CORE_AVAILABLE: true, exports: {}, Error, Date, Uint8Array, ArrayBuffer, Promise, URL, TextDecoder, $r: name => name,
@@ -56,8 +56,9 @@ const sdk = {
         TextDecoder: { create: (name, options) => ({ decodeToString: bytes => new TextDecoder(name, options).decode(bytes) }) }
     }
 };
-const single = execute('model/NodeImport.ets', { '@kit.ArkTS': sdk });
-const batch = execute('model/NodeBatchImport.ets', { '@kit.ArkTS': sdk, './NodeImport': single });
+const nodeIssues = execute('model/NodeIssue.ets', {});
+const single = execute('model/NodeImport.ets', { '@kit.ArkTS': sdk, './NodeIssue': nodeIssues });
+const batch = execute('model/NodeBatchImport.ets', { '@kit.ArkTS': sdk, './NodeImport': single, './NodeIssue': nodeIssues });
 const batchLatency = execute('model/BatchLatency.ets', {});
 const adaptiveLayout = execute('model/AdaptiveLayout.ets', {});
 const nodeListFilter = execute('model/NodeListFilter.ets', {});
@@ -219,7 +220,7 @@ function harness(options = {}) {
                 'Receipt created before read-back of the latest catalog write');
             state.events.push('receipt'); return '00000000-0000-4000-8000-' + String(++state.receipt).padStart(12, '0');
         } } },
-        '../model/NodeImport': single, '../model/NodeBatchImport': batch, '../model/NodeCatalog': catalog,
+        '../model/NodeImport': single, '../model/NodeBatchImport': batch, '../model/NodeCatalog': catalog, '../model/NodeIssue': nodeIssues,
         '../model/NodeEditGuard': { assertNodeManagementAllowed: allowed, isNodeManagementAllowed: managementAllowed },
         '../model/ConnectionLifecycle': lifecycle,
         '../model/ConnectionControl': {
@@ -310,7 +311,7 @@ function harness(options = {}) {
 }
 
 function noVisibleSecrets(page, state) {
-    const text = JSON.stringify({ message: page.message, previewNames: page.previewNames, logs: state.logs });
+    const text = JSON.stringify({ message: page.message, previewNames: page.previewNames, inputIssues: page.inputIssues, logs: state.logs });
     for (const value of [ADDRESS, TOKEN, 'synthetic-secret-body', 'native-error=']) {
         assert(!text.includes(value), 'A native exception leaked into rendered state or logs');
     }
@@ -338,6 +339,41 @@ function casesNodeConfig() {
         assert.equal(h.state.writes.length, 0); assert.equal(h.state.receipt, 0); assert.equal(p.partialCount, 1);
         assert.match(p.saveReceipt, /请确认/); assert.equal(p.pendingNodes[0].outboundJson, secondNode.outboundJson);
         p.savePartial(); assert.equal(h.state.writes.length, 1); assert.equal(h.state.receipt, 1); assert.equal(p.input, '');
+    });
+    add('single invalid node exposes field details and retains input without a save or network request', () => {
+        const h = harness(), p = h.page('NodeConfig'), before = clone(h.state.catalog);
+        const input = FIRST.replace(UUID, 'invalid-' + TOKEN); p.input = input; p.save();
+        assert.equal(p.input, input); assert.equal(p.inputIssues.length, 1);
+        assert.deepEqual(clone(p.inputIssues[0]), { entryIndex: 1, code: 'uuid-format' });
+        assert.equal(p.partialCount, 0); assert.equal(p.pendingNodes.length, 0); assert.equal(p.rejectedCount, 1);
+        assert.equal(h.state.requests.length, 0); assert.equal(h.state.writes.length, 0); assert.deepEqual(h.state.catalog, before);
+        noVisibleSecrets(p, h.state);
+    });
+    add('invalid single JSON preserves its concrete field issue', () => {
+        const h = harness(), p = h.page('NodeConfig'), before = clone(h.state.catalog);
+        const raw = JSON.parse(firstNode.outboundJson); raw.settings.vnext[0].port = 0; p.input = JSON.stringify(raw); p.save();
+        assert.deepEqual(clone(p.inputIssues), [{ entryIndex: 0, code: 'port-format' }]);
+        assert.equal(h.state.writes.length, 0); assert.deepEqual(h.state.catalog, before); assert.equal(p.partialCount, 0);
+    });
+    add('a mixed batch keeps details until explicitly saving only the accepted node', () => {
+        const h = harness(), p = h.page('NodeConfig'); p.input = SECOND + '\n' + FIRST.replace(UUID, 'invalid'); p.save();
+        assert.equal(h.state.writes.length, 0); assert.equal(p.partialCount, 1);
+        assert.deepEqual(clone(p.inputIssues), [{ entryIndex: 2, code: 'uuid-format' }]);
+        p.savePartial(); assert.equal(h.state.writes.length, 1); assert.equal(h.state.catalog.activeNodeId, 'node-old');
+        assert.equal(p.inputIssues.length, 0); assert.equal(p.rejectedCount, 0); assert.equal(p.input, '');
+    });
+    add('a later all-invalid attempt cannot retain an earlier saveable partial preview', () => {
+        const h = harness(), p = h.page('NodeConfig'); p.input = SECOND + '\ninvalid'; p.save(); assert.equal(p.partialCount, 1);
+        p.input = FIRST.replace(UUID, 'invalid'); p.save(); p.savePartial();
+        assert.equal(p.partialCount, 0); assert.equal(p.pendingNodes.length, 0); assert.equal(p.inputIssues[0].code, 'uuid-format');
+        assert.equal(h.state.writes.length, 0); assert.equal(h.state.receipt, 0);
+    });
+    add('large rejected batches keep ten details with an accurate remainder and unchanged catalog', () => {
+        const h = harness(), p = h.page('NodeConfig'); const before = clone(h.state.catalog);
+        p.input = Array(15).fill(FIRST.replace(':443', ':0')).join('\n'); p.save();
+        assert.equal(p.inputIssues.length, 10); assert.equal(p.rejectedCount, 15); assert.equal(p.partialCount, 0);
+        assert.equal(h.state.writes.length, 0); assert.deepEqual(h.state.catalog, before);
+        p.changeInput(SECOND); assert.equal(p.inputIssues.length, 0); assert.equal(p.rejectedCount, 0);
     });
     add('missing one read-back node cannot report success', () => {
         const h = harness(), p = h.page('NodeConfig'); h.state.catalog.nodes = []; h.state.mode = 'readback-missing';
@@ -593,7 +629,11 @@ function casesNodeScan() {
         add(name + ' cannot trigger HTTP or persistence', async () => {
             const h = harness(), p = h.page('NodeConfig'); const before = clone(h.state.catalog); const pending = p.scan(); await flush();
             h.state.scans[0].resolve({ originalValue: content }); await pending;
-            assert.equal(p.input, ''); assert.equal(p.scanning, false); assert.match(p.message, /^扫码未完成/);
+            assert.equal(p.input, ''); assert.equal(p.scanning, false);
+            if (typeof content === 'string') {
+                assert.match(p.message, /^二维码内容未通过检查/); assert.equal(p.inputIssues.length, 1);
+                assert(nodeIssues.nodeIssue(p.inputIssues[0].code).field);
+            } else { assert.match(p.message, /^扫码未完成/); assert.equal(p.inputIssues.length, 0); }
             assert.equal(h.state.requests.length, 0); assert.equal(h.state.writes.length, 0); assert.deepEqual(h.state.catalog, before);
             noVisibleSecrets(p, h.state);
         });

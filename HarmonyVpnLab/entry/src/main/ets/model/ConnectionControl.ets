@@ -1,6 +1,7 @@
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { ConnectionSnapshot } from './ConnectionSnapshot';
+import { ConnectionFailure, validConnectionFailure } from './ConnectionFailure';
 
 export const CONNECTION_UI_EPOCH: string = util.generateRandomUUID();
 
@@ -64,6 +65,9 @@ export class ConnectionStatus {
   servicePid: number;
   networkKind: string;
   reconnectCount: number;
+  failure?: ConnectionFailure;
+  cleanupFailure?: ConnectionFailure;
+  currentIssue?: ConnectionFailure;
   constructor(runId: string, phase: string, snapshot?: ConnectionSnapshot, cleanupConfirmed: boolean = false, servicePid: number = 0,
     networkKind: string = '', reconnectCount: number = 0) {
     this.runId = runId;
@@ -87,6 +91,12 @@ export function readConnectionStatus(filesDir: string): ConnectionStatus | undef
     const value = JSON.parse(fs.readTextSync(`${filesDir}/connection-status.json`)) as ConnectionStatus;
     if (typeof value.runId !== 'string' || typeof value.phase !== 'string' ||
       typeof value.updatedAt !== 'number' || !Number.isFinite(value.updatedAt)) { return undefined; }
+    // Optional diagnostics must never make otherwise usable lifecycle evidence
+    // disappear. Reject malformed diagnostic fields individually, retaining the
+    // original on-disk bytes and all existing cleanup/process guards.
+    if (value.failure !== undefined && !validConnectionFailure(value.failure)) { value.failure = undefined; }
+    if (value.cleanupFailure !== undefined && !validConnectionFailure(value.cleanupFailure)) { value.cleanupFailure = undefined; }
+    if (value.currentIssue !== undefined && !validConnectionFailure(value.currentIssue)) { value.currentIssue = undefined; }
     if (value.networkKind !== undefined && !['', 'wifi', 'cellular', 'ethernet', 'other'].includes(value.networkKind)) { return undefined; }
     if (value.reconnectCount !== undefined && (!Number.isSafeInteger(value.reconnectCount) || value.reconnectCount < 0)) { return undefined; }
     if (value.snapshot && (typeof value.snapshot.uplink !== 'number' || !Number.isFinite(value.snapshot.uplink) ||

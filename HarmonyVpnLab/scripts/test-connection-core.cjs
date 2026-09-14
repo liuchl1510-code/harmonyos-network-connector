@@ -17,6 +17,7 @@ const bootstrapModule = load('entry/src/main/ets/model/NodeBootstrap.ets');
 const policyModule = load('entry/src/main/ets/model/NetworkPolicy.ets', { './NodeBootstrap': bootstrapModule });
 const configModule = load('entry/src/main/ets/model/ConnectionConfig.ets', { './NodeBootstrap': bootstrapModule, './NetworkPolicy': policyModule });
 const snapshotModule = load('entry/src/main/ets/model/ConnectionSnapshot.ets');
+const failureModule = load('entry/src/main/ets/model/ConnectionFailure.ets');
 const uuid = 'd83b7e56-c9d8-4ce7-b8fb-90a784b40c60';
 const fixtures = [];
 const hostnameFixtures = [];
@@ -194,12 +195,13 @@ function harness(options = {}) {
   const outboundJson = JSON.stringify(samples[2][1]);
   const native = {
     getFreePorts: () => JSON.stringify({ socksPort: 18900, metricsPort: 18901 }),
-    configureXrayCa: async () => { state.calls.push('ca'); },
+    configureXrayCa: async () => { state.calls.push('ca'); if (options.failAt === 'ca') throw Error('private secret'); },
     installSocketProtector: () => { state.calls.push('protector'); },
     xrayCall: async (operation, request) => {
       state.calls.push(operation);
+      if (options.failAt === operation) throw Error('private secret');
       if (operation === 'version') return encodedReply('26.6.1');
-      if (operation === 'runtime') return encodedReply({ unixMillis: Date.now(), goVersion: 'go1.26.7', goos: 'linux', goarch: 'arm64' });
+      if (operation === 'runtime') return encodedReply({ unixMillis: Date.now() + (options.clockSkew || 0), goVersion: 'go1.26.7', goos: 'linux', goarch: 'arm64' });
       if (operation === 'start') {
         const input = JSON.parse(Buffer.from(request, 'base64').toString());
         state.config = JSON.parse(input.configJSON);
@@ -215,8 +217,8 @@ function harness(options = {}) {
       }
       return encodedReply('');
     },
-    startHev: async (fd, port, ipv6) => { state.calls.push(['hev-start', fd, port, ipv6]); },
-    stopHev: async () => { state.calls.push('hev-stop'); },
+    startHev: async (fd, port, ipv6) => { state.calls.push(['hev-start', fd, port, ipv6]); if (options.failAt === 'hev-start') throw Error('private secret'); },
+    stopHev: async () => { state.calls.push('hev-stop'); if (options.failAt === 'hev-stop') throw Error('private secret'); },
     socketProtectionStats: () => JSON.stringify(state.protection),
     forwardingStatus: () => JSON.stringify(state.forwarding)
   };
@@ -248,12 +250,13 @@ function harness(options = {}) {
       if (!options.diagnosticNode) throw new Error('Unexpected probe-only endpoint path');
       return { address: '198.51.100.10', port: 443, protocol: 'vless', network: 'raw', security: 'reality' };
     } },
-    '../model/NodeImport': { parseNode: value => ({ outboundJson: value }) },
+    '../model/NodeImport': { parseNode: value => { if (options.failAt === 'configuration') throw Error('private secret'); return { outboundJson: value }; } },
     '../model/ErrorInfo': { describeError: () => 'synthetic error' },
     '../model/ConnectionConfig': configModule,
     '../model/NodeBootstrap': bootstrapModule,
     '../model/NetworkPolicy': policyModule,
     '../model/ConnectionSnapshot': snapshotModule,
+    '../model/ConnectionFailure': failureModule,
     '@kit.CoreFileKit': { fileIo }
   };
   const { CoreProbe } = load('entry/src/main/ets/vpn/CoreProbe.ets', imports);
@@ -261,6 +264,26 @@ function harness(options = {}) {
 }
 
 async function main() {
+  for (const [failAt, stage] of [['configuration','configuration'], ['ca','core-init'], ['version','core-init'],
+    ['runtime','runtime-clock'], ['start','core-init'], ['stats','status'], ['hev-start','forwarding']]) {
+    const { core, state } = harness({ failAt });
+    await assert.rejects(core.startConnection(7, { filesDir: '/synthetic' }, async () => {}), error =>
+      error instanceof failureModule.ConnectionFailureError && error.failure.stage === stage && !String(error).includes('secret'));
+    assert.equal(state.diagnosticTcpConnects, 0); assert.equal(state.httpRequests, 0);
+    passed++; console.log('PASS typed actual core operation failure: ' + failAt);
+  }
+  {
+    const { core, state } = harness({ clockSkew: 20000 });
+    await assert.rejects(core.startConnection(7, { filesDir: '/synthetic' }, async () => {}), error => error.failure?.stage === 'runtime-clock');
+    assert(!state.calls.includes('start'));
+    passed++; console.log('PASS runtime clock mismatch fails before starting the core');
+  }
+  {
+    const { core } = harness({ failAt: 'hev-stop' });
+    await core.startConnection(7, { filesDir: '/synthetic' }, async () => {});
+    await assert.rejects(core.stop(), error => error.failure?.stage === 'cleanup' && !String(error).includes('secret'));
+    passed++; console.log('PASS cleanup failure has a separate fixed classification');
+  }
   {
     const { state, core } = harness();
     await core.startConnection(7, { filesDir: '/synthetic' }, async () => {});
@@ -298,7 +321,7 @@ async function main() {
     const { state, core } = harness();
     await core.startConnection(7, { filesDir: '/synthetic' }, async () => {});
     state.forwarding = { hevRunning: false, hevExit: 1 };
-    await assert.rejects(core.readConnectionSnapshot(), /Hev/);
+    await assert.rejects(core.readConnectionSnapshot(), error => error.failure?.stage === 'forwarding');
     await core.stop();
     passed++; console.log('PASS stopped forwarding worker rejected by heartbeat snapshot');
   }
@@ -306,7 +329,7 @@ async function main() {
     const { state, core } = harness();
     state.startGate = deferred();
     const starting = core.startConnection(7, { filesDir: '/synthetic' }, async () => {});
-    const rejected = assert.rejects(starting, /取消/);
+    const rejected = assert.rejects(starting, error => error instanceof failureModule.ConnectionFailureError);
     await state.startEntered.promise;
     const stopping = core.stop();
     await Promise.resolve();
@@ -362,7 +385,8 @@ async function main() {
     dnsScope: 'A via routed DoH; AAAA and all other qtypes empty NOERROR, no raw forwarding',
     configSourceSHA256: crypto.createHash('sha256').update(fs.readFileSync(path.join(project, 'entry/src/main/ets/model/ConnectionConfig.ets'))).digest('hex'),
     bootstrapSourceSHA256: crypto.createHash('sha256').update(fs.readFileSync(path.join(project, 'entry/src/main/ets/model/NodeBootstrap.ets'))).digest('hex'),
-    coreProbeSourceSHA256: crypto.createHash('sha256').update(fs.readFileSync(path.join(project, 'entry/src/main/ets/vpn/CoreProbe.ets'))).digest('hex')
+    coreProbeSourceSHA256: crypto.createHash('sha256').update(fs.readFileSync(path.join(project, 'entry/src/main/ets/vpn/CoreProbe.ets'))).digest('hex'),
+    connectionFailureSourceSHA256: crypto.createHash('sha256').update(fs.readFileSync(path.join(project, 'entry/src/main/ets/model/ConnectionFailure.ets'))).digest('hex')
   }, null, 2) + '\n');
   console.log(`Offline connection checks passed: ${passed}; synthetic core fixtures: ${fixtures.length}`);
 }

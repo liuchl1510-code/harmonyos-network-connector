@@ -1,7 +1,8 @@
 import { common } from '@kit.AbilityKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { ImportedNode } from '../model/NodeImport';
-import { parseNodeBatch } from '../model/NodeBatchImport';
+import { BatchImportFailure, BatchNodeIssue, parseNodeBatch } from '../model/NodeBatchImport';
+import { nodeIssue, nodeIssueFromError } from '../model/NodeIssue';
 import { importManualNodes, readNodeCatalog } from '../model/NodeCatalog';
 import { nodeServerAddress, readNodeProfile, updateNodeServerAddress } from '../model/NodeProfile';
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -23,6 +24,8 @@ struct NodeConfig {
   @State replacementAddress: string = '';
   @State saveReceipt: string = '尚未生成本次保存回执';
   @State partialCount: number = 0;
+  @State inputIssues: BatchNodeIssue[] = [];
+  @State rejectedCount: number = 0;
   @State scanning: boolean = false;
   @State scanSupported: boolean = false;
   @State advancedExpanded: boolean = false;
@@ -107,6 +110,9 @@ struct NodeConfig {
   }
 
   private importError(error: Error): string {
+    if (error instanceof BatchImportFailure) { return '本次未找到可用节点，输入已保留；请按下面的问题修正。'; }
+    const issue = nodeIssueFromError(error);
+    if (issue) { return '内容未通过本地检查，输入已保留；请按下面的问题修正。'; }
     const safeErrors: string[] = [
       '未找到可导入的受支持节点。请使用分享链接列表或单个 Xray outbound JSON。',
       '订阅内容的 Base64 编码或 UTF-8 文本无效。', '订阅内容包含二进制或不受支持的控制字符，无法导入。',
@@ -123,6 +129,17 @@ struct NodeConfig {
       '导入未完成，输入已保留；请检查内容并先断开连接，再重试。';
   }
 
+  private showImportIssues(error: Error): void {
+    if (error instanceof BatchImportFailure) {
+      this.inputIssues = error.issues.slice(0, 10).map((item: BatchNodeIssue) => new BatchNodeIssue(item.entryIndex, nodeIssue(item.code).code));
+      this.rejectedCount = error.rejected;
+    } else {
+      const issue = nodeIssueFromError(error);
+      this.inputIssues = issue ? [new BatchNodeIssue(0, issue.code)] : [];
+      this.rejectedCount = issue ? 1 : 0;
+    }
+  }
+
   private scannerAvailable(): boolean {
     try { return canIUse('SystemCapability.Multimedia.Scan.ScanBarcode'); }
     catch (_) { return false; }
@@ -133,11 +150,13 @@ struct NodeConfig {
     this.clearImportedNavigation();
     this.refreshEditable();
     if (!this.editable) { this.message = '请先断开连接并等待清理完成，再保存节点。'; return; }
+    this.pendingNodes = []; this.partialCount = 0; this.inputIssues = []; this.rejectedCount = 0;
     this.saveReceipt = '本次保存正在校验';
     try {
       const result = parseNodeBatch(this.input);
       if (result.rejected > 0) {
         this.pendingNodes = result.nodes; this.partialCount = result.nodes.length;
+        this.inputIssues = result.issues; this.rejectedCount = result.rejected;
         this.message = `检测到 ${result.nodes.length} 个可用节点、${result.duplicates} 个重复项和 ${result.rejected} 个无效或不支持项。确认后仅导入可用节点。`;
         this.saveReceipt = '部分内容未通过，请确认可用节点';
         return;
@@ -145,6 +164,7 @@ struct NodeConfig {
       this.persist(result.nodes);
     } catch (error) {
       this.saveReceipt = '本次保存未完成';
+      this.showImportIssues(error as Error);
       this.message = this.importError(error as Error);
     }
   }
@@ -173,14 +193,17 @@ struct NodeConfig {
       const parsed = parseNodeBatch(content);
       this.input = content;
       this.pendingNodes = []; this.partialCount = 0;
+      this.inputIssues = parsed.issues; this.rejectedCount = parsed.rejected;
       this.saveReceipt = '尚未生成本次保存回执';
       this.message = `已识别 ${parsed.nodes.length} 个可用节点，请点击“解析并保存”加入节点列表。`;
       try { hilog.info(0x0000, 'HarmonyVpnLab', 'NODE_SCAN_PARSED count=%{public}d', parsed.nodes.length); }
       catch (_) { /* Diagnostic logging must not discard a parsed result. */ }
     } catch (error) {
       if (epoch !== this.scanEpoch) { return; }
+      this.showImportIssues(error as Error);
       this.message = (error as ScanFailure)?.code === 1000500002 ? '已取消扫码。' :
-        '扫码未完成或二维码不是支持的节点内容，可尝试粘贴分享链接。';
+        this.inputIssues.length > 0 ? '二维码内容未通过检查，请按下面的问题核对原始节点。' :
+          '扫码未完成或二维码不是支持的节点内容，可尝试粘贴分享链接。';
     } finally { if (epoch === this.scanEpoch) { this.scanning = false; } }
   }
 
@@ -204,6 +227,7 @@ struct NodeConfig {
       if (navigationIds.length === 0) { throw new Error('保存后的节点列表未通过读回校验'); }
       const receipt = '保存回执：' + requestId;
       this.input = ''; this.pendingNodes = []; this.partialCount = 0;
+      this.inputIssues = []; this.rejectedCount = 0;
       this.message = `已新增 ${result.added} 个节点，跳过 ${result.duplicates} 个已有节点。可返回节点列表选择连接。`;
       this.saveReceipt = receipt;
       this.importedNodeIds = navigationIds;
@@ -231,6 +255,7 @@ struct NodeConfig {
     if (this.input !== value) { this.clearImportedNavigation(); }
     this.input = value;
     this.pendingNodes = []; this.partialCount = 0;
+    this.inputIssues = []; this.rejectedCount = 0;
     if (value.length > 0) { this.saveReceipt = '尚未生成本次保存回执'; }
   }
 
@@ -254,7 +279,7 @@ struct NodeConfig {
     }
   }
 
-  private clearDraft(): void { this.scanEpoch++; this.scanning = false; this.input = ''; this.pendingNodes = []; this.partialCount = 0; this.replacementAddress = ''; this.clearImportedNavigation(); }
+  private clearDraft(): void { this.scanEpoch++; this.scanning = false; this.input = ''; this.pendingNodes = []; this.partialCount = 0; this.inputIssues = []; this.rejectedCount = 0; this.replacementAddress = ''; this.clearImportedNavigation(); }
   aboutToDisappear(): void { this.pageEpoch++; this.leaveRequest++; this.confirmingLeave = false; this.clearDraft(); }
 
   private updateAddress(): void {
@@ -346,6 +371,26 @@ struct NodeConfig {
               .fontColor(this.partialCount > 0 ? $r('app.color.warning') : $r('app.color.text_primary'));
             Text(this.message).id('nodeSaveResult').fontSize(15).fontColor($r('app.color.text_primary'))
               .width('100%').wordBreak(WordBreak.BREAK_ALL);
+            if (this.inputIssues.length > 0) {
+              Text('每项先显示一个需要修正的问题；Base64 列表按解码后的非空条目编号。')
+                .id('nodeImportIssueScope').fontSize(13).fontColor($r('app.color.text_secondary')).width('100%');
+              ForEach(this.inputIssues, (item: BatchNodeIssue, index: number) => {
+                Column({ space: 7 }) {
+                  Text((item.entryIndex > 0 ? `第 ${item.entryIndex} 项 · ` : '') + nodeIssue(item.code).field)
+                    .id(`nodeImportIssueField-${index}`).fontSize(14).fontWeight(FontWeight.Medium)
+                    .fontColor($r('app.color.text_primary')).width('100%');
+                  Text(nodeIssue(item.code).problem).id(`nodeImportIssueProblem-${index}`).fontSize(14)
+                    .fontColor($r('app.color.danger')).width('100%');
+                  Text('建议：' + nodeIssue(item.code).suggestion).id(`nodeImportIssueSuggestion-${index}`).fontSize(13)
+                    .fontColor($r('app.color.text_secondary')).width('100%');
+                }.width('100%').padding(12).backgroundColor($r('app.color.surface_secondary')).borderRadius(12)
+                  .alignItems(HorizontalAlign.Start);
+              }, (item: BatchNodeIssue, index: number) => `${item.entryIndex}-${item.code}-${index}`);
+              if (this.rejectedCount > this.inputIssues.length) {
+                Text(`另有 ${this.rejectedCount - this.inputIssues.length} 项未通过，最多展示 10 项详情。`)
+                  .id('nodeImportIssueRemaining').fontSize(13).fontColor($r('app.color.text_secondary')).width('100%');
+              }
+            }
             if (this.importedNodeIds.length > 0) {
               Button('查看导入的节点').id('viewImportedNodes').width('100%')
                 .constraintSize({ minHeight: 48 }).fontSize(16)

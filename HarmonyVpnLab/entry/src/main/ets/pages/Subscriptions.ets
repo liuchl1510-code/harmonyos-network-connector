@@ -7,6 +7,7 @@ import { SubscriptionSource, SavedNode, readNodeCatalog, saveSubscriptionWithNod
 import { assertNodeManagementAllowed, isNodeManagementAllowed } from '../model/NodeEditGuard';
 import { fetchSubscription, normalizeSubscriptionUrl } from '../model/SubscriptionFetch';
 import { formContentWidth } from '../model/AdaptiveLayout';
+import { formatNodeIssue, nodeIssueFromError } from '../model/NodeIssue';
 
 @Entry
 @Component
@@ -134,6 +135,8 @@ struct Subscriptions {
     }
   }
   private safeMessage(error: Object, fallback: string): string {
+    const issue = nodeIssueFromError(error);
+    if (issue) { return formatNodeIssue(issue); }
     const allowed: string[] = [
       '订阅地址无效，请使用不含账号和片段的 HTTPS 链接（最多 4096 字符）',
       '订阅请求失败，请检查网络或订阅服务', '订阅请求超时（总时限 12 秒）',

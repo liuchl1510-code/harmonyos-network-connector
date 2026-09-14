@@ -9,7 +9,7 @@ const crypto = require('node:crypto');
 const root = path.resolve(__dirname, '..');
 const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio';
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
-const filenames = ['NodeCatalog.ets', 'NodeProfile.ets', 'NodeImport.ets'];
+const filenames = ['NodeCatalog.ets', 'NodeProfile.ets', 'NodeImport.ets', 'NodeIssue.ets'];
 const sources = new Map(filenames.map(name => [name,
   fs.readFileSync(path.join(root, 'entry/src/main/ets/model', name), 'utf8')]));
 const compiled = new Map([...sources].map(([name, source]) => {

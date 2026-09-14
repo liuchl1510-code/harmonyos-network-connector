@@ -9,8 +9,9 @@ const crypto = require('node:crypto');
 const root = path.resolve(__dirname, '..');
 const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio';
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
-const names = ['model/ConnectionControl.ets', 'model/ConnectionSnapshot.ets', 'model/ConnectionNotification.ets', 'model/TransferRate.ets',
-  'model/ProbeState.ets', 'model/ConnectionLifecycle.ets', 'model/NodeEditGuard.ets', 'model/NodeBootstrap.ets', 'model/NetworkPolicy.ets', 'model/VpnAuthorization.ets', 'vpn/VpnProbeAbility.ets', 'pages/Home.ets', 'pages/Index.ets'];
+const names = ['model/ConnectionFailure.ets', 'model/ConnectionControl.ets', 'model/ConnectionSnapshot.ets', 'model/ConnectionNotification.ets', 'model/TransferRate.ets',
+  'model/ProbeState.ets', 'model/ConnectionLifecycle.ets', 'model/NodeEditGuard.ets', 'model/NodeBootstrap.ets', 'model/NodeIssue.ets',
+  'model/NodeImport.ets', 'model/NodePreflight.ets', 'model/NetworkPolicy.ets', 'model/VpnAuthorization.ets', 'vpn/VpnProbeAbility.ets', 'pages/Home.ets', 'pages/Index.ets'];
 const sources = new Map(names.map(name => [name, fs.readFileSync(path.join(root, 'entry/src/main/ets', name), 'utf8')]));
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 async function flush() { for (let i = 0; i < 35; i++) await Promise.resolve(); }
@@ -23,7 +24,7 @@ function scenario(options = {}) {
     publish: [], cancel: [], transfer: 0, ipv6Datagrams: 0, partialWrites: 0, processAliveQueries: [],
     observerCreate: 0, observerOn: 0, observerOff: 0, coreConstruct: 0, coreSuspend: 0, coreResume: 0,
     coreStartArgs: [], coreResumeArgs: [], snapshot: 0, protect: [], networkRead: 0, dns: [], watcherStart: 0, watcherStop: 0,
-    commandWrites: [], resourceReads: [], recoveryObservations: [], vpnStarts: [] };
+    commandWrites: [], resourceReads: [], recoveryObservations: [], vpnStarts: [], journal: [] };
   class PhysicalNetwork {
     constructor(netId = 100, kind = 'wifi', key = `${netId}/${kind}/synthetic`) { Object.assign(this, { netId, kind, key }); }
   }
@@ -71,7 +72,11 @@ function scenario(options = {}) {
     setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, ms, interval: false }); return id; },
     clearTimeout: id => timers.delete(id),
     console: { info() {}, log() {}, warn() {}, error() {} },
-    readNodeProfile: () => selectedNode,
+    readNodeProfile: () => {
+      if (options.profileReadFailure) throw Error('private catalog secret');
+      return options.missingProfile ? undefined : { ...selectedNode };
+    },
+    url: { URL: { parseURL: value => new URL(value) } },
     recordConnectionRecovery: (_, value) => { calls.recoveryObservations.push(value); if (options.recoveryWriteThrows) throw new Error('synthetic recovery write failure'); },
     readNetworkPolicy: () => options.readNetworkPolicy ? options.readNetworkPolicy() : undefined,
     nodeServerAddress: node => JSON.parse(node.outboundJson).settings.vnext[0].address,
@@ -85,6 +90,7 @@ function scenario(options = {}) {
       return options.resolvePhysicalIpv4 ? options.resolvePhysicalIpv4(host, network, current) : Promise.resolve('192.0.2.123');
     },
     readTransferResult: () => ({ status: 'pending', runId: '' }),
+    appendDiagnosticEvent: (...args) => { calls.journal.push(args.slice(1)); },
     connectionExitMarker: () => 'synthetic-exit',
     checkProxyDns: () => options.checkProxyDns ? options.checkProxyDns() : Promise.resolve(),
     probeIpv6Datagram: () => {
@@ -106,6 +112,7 @@ function scenario(options = {}) {
     return exported;
   }
   Object.assign(shared, load('model/ConnectionSnapshot.ets'));
+  Object.assign(shared, load('model/ConnectionFailure.ets'));
   Object.assign(shared, load('model/TransferRate.ets'));
   Object.assign(shared, load('model/ConnectionControl.ets'));
   const writeConnectionCommand = shared.writeConnectionCommand;
@@ -115,6 +122,9 @@ function scenario(options = {}) {
   };
   Object.assign(shared, load('model/ProbeState.ets'));
   Object.assign(shared, load('model/NodeBootstrap.ets'));
+  Object.assign(shared, load('model/NodeIssue.ets'));
+  Object.assign(shared, load('model/NodeImport.ets'));
+  Object.assign(shared, load('model/NodePreflight.ets'));
   Object.assign(shared, load('model/NetworkPolicy.ets'));
   const notificationManager = {
     isNotificationEnabled: () => options.notificationEnabled ? options.notificationEnabled() : Promise.resolve(true),
@@ -134,9 +144,9 @@ function scenario(options = {}) {
     resumeConnection: async (...args) => { calls.coreResume++; calls.coreResumeArgs.push(args); if (options.coreResume) await options.coreResume(...args); },
     logNodeTraffic: async () => {}, readConnectionSnapshot: () => { calls.snapshot++; return options.snapshot ? options.snapshot() : Promise.resolve(snapshot); },
     diagnosticSummary: '', detectOutboundLoop: () => false };
-  const connection = { protectProcessNet: async () => {}, protect: async fd => { calls.protect.push(fd); if (options.protect) await options.protect(fd); },
+  const connection = { protectProcessNet: async () => { if (options.protectProcessNet) await options.protectProcessNet(); }, protect: async fd => { calls.protect.push(fd); if (options.protect) await options.protect(fd); },
     create: () => { calls.create++; return options.create ? options.create() : Promise.resolve(7000); },
-    destroy: async () => { calls.destroy++; } };
+    destroy: async () => { calls.destroy++; if (options.destroy) await options.destroy(); } };
   let service;
   let authorizationCallback;
   const vpnExtension = { createVpnConnection: () => connection,
@@ -198,6 +208,146 @@ function scenario(options = {}) {
 
 const tests = [];
 function test(name, body) { tests.push({ name, body }); }
+
+async function settleFailedService(s) {
+  await s.service.initialization; await flush(); if (s.service.cleanup) await s.service.cleanup; await flush();
+}
+for (const [name, options, stage] of [
+  ['VPN process protection', { protectProcessNet: async () => { throw Error('private secret'); } }, 'vpn-init'],
+  ['VPN creation', { create: async () => { throw Error('private secret'); } }, 'vpn-create'],
+  ['network watcher', { watcherStart: async () => { throw Error('private secret'); } }, 'network']
+]) test(name + ' failure records its actual stage through completed cleanup', async () => {
+  const s = scenario(options); s.service.onCreate({ parameters: s.prepare() }); await settleFailedService(s);
+  assert.equal(s.status().failure.stage, stage); assert.equal(s.status().cleanupConfirmed, true);
+  assert.equal(s.status().phase, 'destroyed'); assert(!JSON.stringify(s.status()).includes('secret'));
+  assert.equal(s.calls.journal.filter(item => item[1] === 'operation-failed-' + stage).length, 1);
+});
+test('node decoding failure is configuration and occurs before physical-network setup', async () => {
+  const s = scenario(); s.selectedNode.outboundJson = '{invalid private secret';
+  s.service.onCreate({ parameters: s.prepare() }); await settleFailedService(s);
+  assert.equal(s.status().failure.stage, 'configuration'); assert.equal(s.calls.create, 0); assert.equal(s.calls.watcherStart, 0);
+});
+test('first typed core failure survives a distinct cleanup failure and is not a recovery failure on initial start', async () => {
+  const s = scenario({ coreStart: async () => { throw new s.shared.ConnectionFailureError('forwarding'); },
+    coreStop: async () => { throw Error('private cleanup secret'); } });
+  s.service.onCreate({ parameters: s.prepare() }); await settleFailedService(s);
+  assert.equal(s.status().failure.stage, 'forwarding'); assert.equal(s.status().cleanupFailure.stage, 'cleanup');
+  assert.equal(s.status().cleanupConfirmed, false); assert(!JSON.stringify(s.status()).includes('secret'));
+  s.service.recordFailure('later operation', Error('private secret'), 'status');
+  s.service.recordFailure('later cleanup', Error('private secret'), 'cleanup', true);
+  assert.equal(s.status().failure.stage, 'forwarding');
+  assert.equal(s.calls.journal.filter(item => item[1] === 'operation-failed-forwarding').length, 1);
+  assert.equal(s.calls.journal.filter(item => item[1] === 'operation-failed-cleanup').length, 1);
+  assert.equal(s.calls.journal.filter(item => item[1] === 'recovery-failed').length, 0);
+});
+test('temporary endpoint DNS issue retries without fatal failure and clears after connection becomes active', async () => {
+  let fail = true;
+  const s = scenario({ hostname: true, resolvePhysicalIpv4: async () => { if (fail) throw Error('private dns secret'); return '192.0.2.123'; } });
+  s.service.onCreate({ parameters: s.prepare() }); await s.service.initialization; await flush();
+  assert.equal(s.status().currentIssue.stage, 'endpoint-dns'); assert.equal(s.status().failure, undefined);
+  assert.equal(s.service.stopRequested, false); assert.equal(s.calls.journal.some(item => String(item[1]).startsWith('operation-failed-')), false);
+  fail = false; s.service.retryAt = 0; await s.service.runNetworkTransition(); await flush();
+  assert.equal(s.status().phase, 'active'); assert.equal(s.status().currentIssue, undefined); assert.equal(s.status().failure, undefined);
+  await s.service.requestStop(false); await flush();
+});
+test('stopping during endpoint DNS retries removes the current issue from the completed receipt', async () => {
+  const s = scenario({ hostname: true, resolvePhysicalIpv4: async () => { throw Error('private dns secret'); } });
+  s.service.onCreate({ parameters: s.prepare() }); await s.service.initialization; await flush();
+  assert.equal(s.status().currentIssue.stage, 'endpoint-dns'); assert.equal(s.status().failure, undefined);
+  s.shared.writeConnectionCommand(s.context.filesDir, new s.shared.ConnectionCommand('run-one', 'stop'));
+  await s.service.requestStop(false); await flush();
+  assert.equal(s.status().phase, 'destroyed'); assert.equal(s.status().cleanupConfirmed, true);
+  assert.equal(s.status().currentIssue, undefined); assert.equal(s.status().failure, undefined); assert.equal(s.status().cleanupFailure, undefined);
+});
+test('late fatal or cleanup callbacks cannot replace a new run or append misleading failure events', async () => {
+  const s = scenario(); s.activate(); s.prepare('new-run', 'active');
+  s.shared.writeConnectionStatus(s.context.filesDir, new s.shared.ConnectionStatus('new-run', 'active', s.snapshot, false, 5555));
+  const before = JSON.stringify(s.status());
+  s.service.recordFailure('old operation', Error('secret'), 'core-init');
+  s.service.recordFailure('old cleanup', Error('secret'), 'cleanup', true);
+  assert.equal(JSON.stringify(s.status()), before); assert.equal(s.calls.journal.length, 0);
+});
+test('recording a late cleanup supplement never regresses stopped receipt to active', async () => {
+  const s = scenario(); s.activate();
+  s.shared.writeConnectionStatus(s.context.filesDir, new s.shared.ConnectionStatus('run-one', 'stopped', s.snapshot, true, 4242));
+  s.service.recordFailure('extension stop failed', Error('secret'), 'cleanup', true);
+  assert.equal(s.status().phase, 'stopped'); assert.equal(s.status().cleanupFailure.stage, 'cleanup');
+});
+for (const [name, change, expected] of [
+  ['UUID', value => value.settings.vnext[0].users[0].id = 'invalid-private-id', 'uuid-format'],
+  ['IPv6 entry', value => value.settings.vnext[0].address = '2001:db8::1', 'ipv4-entry-required']
+]) test('actual Home preflight rejects ' + name + ' without writing a start request', async () => {
+  const s = scenario(); const value = JSON.parse(s.selectedNode.outboundJson); change(value);
+  s.selectedNode.outboundJson = JSON.stringify(value); const before = s.selectedNode.outboundJson;
+  await s.home.connect(); assert.equal(s.home.configurationIssueCode, expected);
+  assert.equal(s.calls.commandWrites.length, 0); assert.equal(s.calls.vpnStarts.length, 0); assert.equal(s.calls.create, 0);
+  assert.equal(s.selectedNode.outboundJson, before);
+});
+test('unreadable catalog stays intact while Home presents a fixed preflight issue', async () => {
+  const s = scenario({ profileReadFailure: true }); const file = s.context.filesDir + '/node-catalog.json';
+  s.files.set(file, Buffer.from('{private catalog fixture')); const before = Buffer.from(s.files.get(file));
+  await s.home.connect(); assert.equal(s.home.configurationIssueCode, 'catalog-unreadable');
+  assert.equal(s.calls.commandWrites.length, 0); assert.equal(s.calls.vpnStarts.length, 0); assert.equal(s.files.size, 1);
+  assert.deepEqual(s.files.get(file), before); assert(!s.home.configurationIssueCode.includes('private'));
+});
+test('manual current-configuration inspection is synchronous and does not write or probe networking', () => {
+  const s = scenario(); const before = s.selectedNode.outboundJson;
+  const result = s.home.inspectCurrentConfiguration(); assert(result); assert(!(result instanceof Promise));
+  assert.equal(s.home.configurationIssueCode, ''); assert.equal(s.home.configurationChecked, true);
+  assert.equal(s.files.size, 0); assert.equal(s.calls.commandWrites.length, 0); assert.equal(s.calls.vpnStarts.length, 0);
+  assert.equal(s.calls.networkRead, 0); assert.equal(s.calls.dns.length, 0); assert.equal(s.calls.transfer, 0);
+  assert.equal(s.selectedNode.outboundJson, before);
+});
+test('notification wait cannot start a node whose outbound changed during the wait', async () => {
+  const gate = deferred(), s = scenario({ notificationEnabled: () => gate.promise });
+  const pending = s.home.connect(); await flush(); assert.equal(s.home.requesting, true);
+  const changed = JSON.parse(s.selectedNode.outboundJson); changed.settings.vnext[0].port = 8443;
+  s.selectedNode.outboundJson = JSON.stringify(changed); gate.resolve(true); await pending;
+  assert.equal(s.home.configurationIssueCode, 'node-changed'); assert.equal(s.calls.commandWrites.length, 0);
+  assert.equal(s.calls.vpnStarts.length, 0); assert.equal(s.home.requesting, false);
+});
+test('proxy DNS failure stays in its actual check stage and prevents HTTP', async () => {
+  const s = scenario({ checkProxyDns: async () => { throw Error('private dns timeout'); } }); s.activate(); s.home.refresh();
+  await s.home.checkConnection(false); assert.equal(s.home.checkFailure.stage, 'proxy-dns');
+  assert.equal(s.calls.transfer, 0); assert.match(s.home.checkResult, /不等同于 DNS 配置错误/);
+  assert.equal(s.status().phase, 'active'); assert.equal(s.status().failure, undefined);
+  assert(!s.home.checkResult.includes('private'));
+});
+for (const [code, reason] of [[2300028, 'timeout'], [2300060, 'tls']]) {
+  test('Home HTTPS SDK failure maps a known operation code: ' + code, async () => {
+    const s = scenario({ httpRequest: async () => { throw { code, message: 'private target secret' }; } }); s.activate(); s.home.refresh();
+    await s.home.checkConnection(false); assert.equal(s.calls.transfer, 1);
+    assert.equal(s.home.checkFailure.stage, 'https'); assert.equal(s.home.checkFailure.reason, reason);
+    assert(!s.home.checkResult.includes('private')); assert.equal(s.status().failure, undefined);
+  });
+}
+test('unexpected HTTP response is response validation failure rather than DNS or node authentication', async () => {
+  const s = scenario({ httpRequest: async () => ({ responseCode: 503, result: 'private target secret' }) }); s.activate(); s.home.refresh();
+  await s.home.checkConnection(false); assert.equal(s.home.checkFailure.stage, 'response');
+  assert.equal(s.home.checkFailure.reason, 'invalid-response'); assert.equal(s.calls.transfer, 1);
+  assert(!s.home.checkResult.includes('private'));
+});
+test('late failed HTTPS after recovery cannot replace a newer typed check result', async () => {
+  const gate = deferred(), s = scenario({ httpRequest: () => gate.promise }); s.activate(); s.home.refresh();
+  const pending = s.home.checkConnection(false); await flush(); writeServicePhase(s, 'active', 1); s.home.refresh();
+  const newer = s.shared.makeConnectionFailure('response', 'invalid-response');
+  s.home.checkFailure = newer; s.home.checkResult = 'new recovered check';
+  gate.reject({ code: 2300028, message: 'old private request' }); await pending;
+  assert.equal(s.home.checkFailure, newer); assert.equal(s.home.checkResult, 'new recovered check');
+});
+for (const physicalFailed of [false, true]) {
+  test('a new physical DNS check discards the previous HTTPS failure: ' + (physicalFailed ? 'physical failure' : 'physical success'), async () => {
+    const s = scenario({ httpRequest: async () => { throw { code: 2300028 }; },
+      resolvePhysicalIpv4: async () => { if (physicalFailed) throw Error('synthetic physical lookup failure'); return '192.0.2.123'; } });
+    s.activate(); s.home.refresh(); await s.home.checkConnection(false);
+    assert.equal(s.home.checkFailure.stage, 'https'); assert.equal(s.home.checkFailure.reason, 'timeout');
+    await s.home.checkPhysicalResolver();
+    assert.equal(s.home.checkFailure, undefined); assert.equal(s.home.checking, false); assert.equal(s.calls.transfer, 1);
+    assert.equal(s.home.checkResult, physicalFailed ? '物理网络 DNS 检查未完成，请检查当前网络。' :
+      '物理网络 DNS 检查通过，已得到 IPv4 结果。');
+    assert.equal(s.status().failure, undefined); assert.equal(s.status().phase, 'active');
+  });
+}
 
 test('atomic stop command survives service heartbeats and partial writes', async () => {
   const s = scenario(); s.prepare();
@@ -354,7 +504,7 @@ test('unstarted timeout cannot cancel another UI process owner', async () => {
 });
 
 test('Home first-run primary action opens import without a VPN start', async () => {
-  const s = scenario(), routes = [];
+  const s = scenario({ missingProfile: true }), routes = [];
   s.home.getUIContext = () => ({ getHostContext: () => s.context, getRouter: () => ({ pushUrl: async want => routes.push(want.url) }) });
   s.home.hasNode = false; s.home.closed = true; await s.home.primaryAction();
   assert.deepEqual(routes, ['pages/NodeConfig']); assert.equal(s.calls.commandWrites.length, 0); assert.equal(s.calls.create, 0);
