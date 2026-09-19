@@ -4,9 +4,9 @@ let navigationPending: boolean = false;
 
 // Home remains at the bottom of the route stack, retaining the single VPN
 // authorization subscription while Nodes and Settings replace one another.
-export async function openMainTab(context: UIContext, current: string, target: string): Promise<void> {
+export async function openMainTab(context: UIContext, current: string, target: string): Promise<boolean> {
   if (current === target || navigationPending || !['home', 'nodes', 'settings'].includes(current) ||
-    !['home', 'nodes', 'settings'].includes(target)) { return; }
+    !['home', 'nodes', 'settings'].includes(target)) { return false; }
   navigationPending = true;
   try {
     const router = context.getRouter();
@@ -20,7 +20,9 @@ export async function openMainTab(context: UIContext, current: string, target: s
       if (current === 'home') { await router.pushUrl({ url }); }
       else { await router.replaceUrl({ url }); }
     }
+    return true;
   } catch (_) {
     try { context.getPromptAction().showToast({ message: '页面暂未打开，请重试。' }); } catch (_) {}
+    return false;
   } finally { navigationPending = false; }
 }

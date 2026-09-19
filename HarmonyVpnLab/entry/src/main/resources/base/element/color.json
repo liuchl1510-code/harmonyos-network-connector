@@ -51,6 +51,26 @@
     {
       "name": "on_accent",
       "value": "#FFFFFF"
+    },
+    {
+      "name": "dock_glass_tint",
+      "value": "#99FFFFFF"
+    },
+    {
+      "name": "dock_glass_edge",
+      "value": "#CCFFFFFF"
+    },
+    {
+      "name": "dock_glass_selected",
+      "value": "#24285ED7"
+    },
+    {
+      "name": "status_bar_tint",
+      "value": "#EDF4F6FA"
+    },
+    {
+      "name": "status_bar_clear",
+      "value": "#00F4F6FA"
     }
   ]
 }

@@ -370,7 +370,7 @@ struct NodeEditor {
           .backgroundColor($r('app.color.accent')).fontColor(Color.White).onClick(() => { this.save(); });
       }.width(formContentWidth(this.windowWidthVp)).padding({ left: 20, right: 20, top: 10, bottom: 18 })
         .backgroundColor($r('app.color.page_bg')).alignItems(HorizontalAlign.Start);
-    }.width('100%').height('100%').alignItems(HorizontalAlign.Center).backgroundColor($r('app.color.page_bg'));
+    }.width('100%').height('100%').alignItems(HorizontalAlign.Center).background($r('app.color.page_bg'));
   }
 
   @Builder

@@ -16,6 +16,7 @@ import { LatencyRequest, writeLatencyRequest, writeLatencyProof } from '../model
 import { measureNodeLatency } from '../model/LatencyProbe';
 import { BatchLatencyTarget, BatchLatencyObservation, BatchLatencyQueue } from '../model/BatchLatency';
 import { AppTabBar } from '../components/AppTabBar';
+import { GlassDockLayout } from '../components/GlassDockLayout';
 import { AppSideNav } from '../components/AppSideNav';
 import { NodeDetailsCard } from '../components/NodeDetailsCard';
 import { useSideNavigation, nodeListContentWidth, nodeListUsesDetails, nodeListPaneWidth } from '../model/AdaptiveLayout';
@@ -32,6 +33,7 @@ class HistoryFingerprint {
 @Component
 struct Nodes {
   @StorageProp('windowWidthVp') windowWidthVp: number = 360;
+  @State dockHeight: number = 84;
   @State nodes: SavedNode[] = [];
   @State sources: SubscriptionSource[] = [];
   @State activeId: string = '';
@@ -545,6 +547,14 @@ struct Nodes {
   build() {
     Row() {
       if (useSideNavigation(this.windowWidthVp)) { AppSideNav({ current: 'nodes' }); }
+      GlassDockLayout({ showDock: !useSideNavigation(this.windowWidthVp), dockHeight: this.dockHeight,
+        content: () => { this.pageContent(); }, dock: () => { this.navigationDock(); }
+      }).layoutWeight(1).height('100%');
+    }.width('100%').height('100%').background($r('app.color.page_bg'));
+  }
+
+  @Builder
+  private pageContent() {
     Column() {
       Row({ space: 12 }) {
         Button('返回', { type: ButtonType.Normal }).id('backToConnection').constraintSize({ minHeight: 36 })
@@ -767,8 +777,10 @@ struct Nodes {
                 .fontSize(14).lineHeight('21fp').fontColor($r('app.color.text_secondary')).width('100%');
             }.id('nodeSearchEmpty').width('100%').padding({ top: 40, bottom: 40 });
           }
-        }.id('nodeListContent').width(nodeListPaneWidth(this.windowWidthVp)).padding({ bottom: 20 }).alignItems(HorizontalAlign.Start);
-      }.layoutWeight(1).height('100%').scrollBar(BarState.Off).align(Alignment.Top);
+        }.id('nodeListContent').width(nodeListPaneWidth(this.windowWidthVp))
+          .padding({ bottom: useSideNavigation(this.windowWidthVp) ? 20 : this.dockHeight + 20 }).alignItems(HorizontalAlign.Start);
+      }.id('nodesScroll').layoutWeight(1).height('100%').scrollBar(BarState.Off).align(Alignment.Top)
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM]);
       if (nodeListUsesDetails(this.windowWidthVp)) {
         Scroll() {
           Column({ space: 12 }) {
@@ -785,7 +797,7 @@ struct Nodes {
           }.id('nodeDetailsPanel').width('100%').alignItems(HorizontalAlign.Start);
         }.width(300).height('100%').scrollBar(BarState.Off).align(Alignment.Top);
       }
-      }.width(nodeListContentWidth(this.windowWidthVp)).padding({ left: 20, right: 20, bottom: 12 }).layoutWeight(1).alignItems(VerticalAlign.Top);
+      }.width(nodeListContentWidth(this.windowWidthVp)).padding({ left: 20, right: 20 }).layoutWeight(1).alignItems(VerticalAlign.Top);
       if (this.testingId || this.batchActive) {
         Row({ space: 12 }) {
           Text(this.batchActive ? '正在依次检测节点' : '节点 HTTPS 检测中').fontSize(13).fontColor($r('app.color.accent')).layoutWeight(1);
@@ -793,11 +805,16 @@ struct Nodes {
             .fontSize(13).fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
             .onClick(() => { this.cancelLatency(); });
         }.width(nodeListContentWidth(this.windowWidthVp)).padding({ left: 20, right: 20, top: 10, bottom: 10 })
-          .backgroundColor($r('app.color.surface'));
+          .backgroundColor($r('app.color.surface'))
+          .margin({ bottom: useSideNavigation(this.windowWidthVp) ? 0 : this.dockHeight });
       }
-      if (!useSideNavigation(this.windowWidthVp)) { AppTabBar({ current: 'nodes' }); }
-    }.layoutWeight(1).height('100%').alignItems(HorizontalAlign.Center);
-    }.width('100%').height('100%').backgroundColor($r('app.color.page_bg'));
+    }.width('100%').height('100%').alignItems(HorizontalAlign.Center);
+  }
+
+  @Builder
+  private navigationDock() {
+        AppTabBar({ current: 'nodes', requestInProgress: this.preparing || this.batchActive || this.testingId.length > 0 })
+          .onAreaChange((_oldArea: Area, area: Area) => { this.dockHeight = Number(area.height); });
   }
 
   @Builder

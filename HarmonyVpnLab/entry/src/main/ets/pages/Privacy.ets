@@ -40,7 +40,7 @@ struct Privacy {
         this.explanation('你可以管理的内容',
           '断开连接并完成清理后，可在节点页改名或删除节点；在订阅页可更新或删除订阅。删除订阅会同时删除属于它的节点，手动导入的节点保留。更新失败或尚未确认预览时，原节点保持不变。删除节点或订阅不等同于清空历史检测与诊断记录。');
       }.width(formContentWidth(this.windowWidthVp)).padding(24).alignItems(HorizontalAlign.Start);
-    }.id('privacyPage').width('100%').height('100%').align(Alignment.Top).backgroundColor($r('app.color.page_bg'));
+    }.id('privacyPage').width('100%').height('100%').align(Alignment.Top).background($r('app.color.page_bg'));
   }
 
   @Builder

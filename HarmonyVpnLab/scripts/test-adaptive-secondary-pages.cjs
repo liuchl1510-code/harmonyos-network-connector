@@ -91,8 +91,26 @@ for (const name of pages) {
   const rootAttributes = componentAttributes(pageRoot);
   assert.equal(rootAttributes.get('width')?.[0].text, '100%', name + ': page stopped filling the window');
   assert.equal(rootAttributes.get('height')?.[0].text, '100%', name + ': page stopped filling available height');
+  let contentBody = build.body;
+  if (name === 'Settings') {
+    const shells = [];
+    walk(build.body, node => {
+      if ((ts.isCallExpression(node) || ts.isEtsComponentExpression(node)) && node.expression.getText(source) === 'GlassDockLayout') shells.push(node);
+    });
+    assert.equal(shells.length, 1, 'Settings: missing shared shell');
+    const shell = shells[0], argument = shell.arguments[0]; assert(ts.isObjectLiteralExpression(argument));
+    const props = new Map(argument.properties.map(property => [property.name.getText(source), property.initializer.getText(source)]));
+    assert.equal(props.get('content'), '() => { this.pageContent(); }');
+    assert.equal(props.get('showDock'), '!useSideNavigation(this.windowWidthVp)');
+    const pane = componentAttributes(shell);
+    assert(pane.has('layoutWeight'), 'Settings: main pane does not receive remaining width');
+    assert.equal(pane.get('height')?.[0].text, '100%', 'Settings: main pane lost available height');
+    const builder = structure.members.find(member => ts.isMethodDeclaration(member) && member.name.getText(source) === 'pageContent');
+    assert(builder?.modifiers?.some(modifier => ts.isDecorator(modifier) && modifier.expression.getText(source) === 'Builder'));
+    contentBody = builder.body;
+  }
   const scrolls = [];
-  walk(build.body, node => { if (ts.isEtsComponentExpression(node) && node.expression.getText(source) === 'Scroll') scrolls.push(node); });
+  walk(contentBody, node => { if (ts.isEtsComponentExpression(node) && node.expression.getText(source) === 'Scroll') scrolls.push(node); });
   let geometries;
   if (name === 'RuntimeSmoke') {
     assert.equal(rootAttributes.get('justifyContent')?.[0].getText(source), 'FlexAlign.Center');

@@ -338,7 +338,8 @@ struct NetworkSettings {
           .enabled(this.editable && (this.dirty || this.needsRepair) && !this.confirmingLeave && !this.leaving)
           .onClick(() => { this.save(); });
       }.width(formContentWidth(this.windowWidthVp)).padding({ left: 20, right: 20, top: 12, bottom: 16 })
-        .alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.surface'));
-    }.width('100%').height('100%').alignItems(HorizontalAlign.Center).backgroundColor($r('app.color.page_bg'));
+        .alignItems(HorizontalAlign.Start)
+        .background($r('app.color.surface'), { ignoresLayoutSafeAreaEdges: [LayoutSafeAreaEdge.BOTTOM] });
+    }.width('100%').height('100%').alignItems(HorizontalAlign.Center).background($r('app.color.page_bg'));
   }
 }

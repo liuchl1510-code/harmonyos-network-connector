@@ -68,7 +68,7 @@ struct About {
         }.padding(20).width('100%').alignItems(HorizontalAlign.Start)
           .backgroundColor($r('app.color.surface')).borderRadius(20);
       }.width(formContentWidth(this.windowWidthVp)).padding(24).alignItems(HorizontalAlign.Start);
-    }.id('aboutPage').width('100%').height('100%').align(Alignment.Top).backgroundColor($r('app.color.page_bg'));
+    }.id('aboutPage').width('100%').height('100%').align(Alignment.Top).background($r('app.color.page_bg'));
   }
 
   @Builder

@@ -221,6 +221,7 @@ function homeHarness() {
     '../model/ConnectionNotification': {}, '../model/ConnectionDiagnostics': {},
     '../model/VpnAuthorization': { subscribeVpnAuthorization: () => 10, unsubscribeVpnAuthorization() {} },
     '../model/PhysicalNetwork': {}, '../model/MainNavigation': {},
+    '../model/DockConnectionAction': { consumeDockConnectionAction: () => undefined },
     '../model/BuildCapabilities': { VPN_CORE_AVAILABLE: true },
     '../model/NetworkPolicyStore': { readNetworkPolicy: () => ({ appMode: 'all', appBundles: [] }) },
     '../model/AppRouting': execute(appRoutingCode),

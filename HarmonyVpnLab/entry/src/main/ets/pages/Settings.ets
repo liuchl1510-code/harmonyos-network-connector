@@ -1,5 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { AppTabBar } from '../components/AppTabBar';
+import { GlassDockLayout } from '../components/GlassDockLayout';
 import { AppSideNav } from '../components/AppSideNav';
 import { applyAppearance, readAppearance, saveAppearance } from '../model/Appearance';
 import { formContentWidth, useSideNavigation } from '../model/AdaptiveLayout';
@@ -9,6 +10,7 @@ import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
 @Component
 struct Settings {
   @StorageProp('windowWidthVp') windowWidthVp: number = 360;
+  @State dockHeight: number = 84;
   @State appearance: string = 'system';
   @State message: string = '';
 
@@ -53,7 +55,14 @@ struct Settings {
       if (useSideNavigation(this.windowWidthVp)) {
         AppSideNav({ current: 'settings' });
       }
-      Column() {
+      GlassDockLayout({ showDock: !useSideNavigation(this.windowWidthVp), dockHeight: this.dockHeight,
+        content: () => { this.pageContent(); }, dock: () => { this.navigationDock(); }
+      }).layoutWeight(1).height('100%');
+    }.width('100%').height('100%').background($r('app.color.page_bg'));
+  }
+
+  @Builder
+  private pageContent() {
         Scroll() {
           Column({ space: 24 }) {
             Column({ space: 6 }) {
@@ -77,7 +86,7 @@ struct Settings {
             Column({ space: 2 }) {
               Text('连接与数据').fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_secondary'))
                 .padding({ left: 18, right: 18, top: 14, bottom: 4 });
-              this.navigationRow('分流与 DNS', '连接模式、自定义规则与 HTTPS DNS', 'openNetworkSettings', 'NetworkSettings');
+              this.navigationRow('网络设置', '应用范围、分流规则与 HTTPS DNS', 'openNetworkSettings', 'NetworkSettings');
               Divider().color($r('app.color.border')).margin({ left: 18, right: 18 });
               this.navigationRow('节点备份与恢复', '导出节点与订阅，或从文件恢复', 'openNodeBackup', 'NodeBackup');
             }.width('100%').padding({ top: 4, bottom: 4 }).alignItems(HorizontalAlign.Start)
@@ -109,13 +118,17 @@ struct Settings {
               Text(this.message).id('settingsResult').fontSize(14).lineHeight('22fp')
                 .fontColor($r('app.color.text_secondary')).width('100%');
             }
-          }.width(formContentWidth(this.windowWidthVp)).padding({ left: 24, right: 24, top: 24, bottom: 28 }).alignItems(HorizontalAlign.Start);
-        }.layoutWeight(1).width('100%').align(Alignment.Top);
-        if (!useSideNavigation(this.windowWidthVp)) {
-          AppTabBar({ current: 'settings' });
-        }
-      }.layoutWeight(1).height('100%');
-    }.width('100%').height('100%').backgroundColor($r('app.color.page_bg'));
+          }.width(formContentWidth(this.windowWidthVp))
+            .padding({ left: 24, right: 24, top: 16, bottom: useSideNavigation(this.windowWidthVp) ? 28 : this.dockHeight + 28 })
+            .alignItems(HorizontalAlign.Start);
+        }.id('settingsScroll').width('100%').height('100%').align(Alignment.Top)
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM]);
+  }
+
+  @Builder
+  private navigationDock() {
+          AppTabBar({ current: 'settings' })
+            .onAreaChange((_oldArea: Area, area: Area) => { this.dockHeight = Number(area.height); });
   }
 
   @Builder

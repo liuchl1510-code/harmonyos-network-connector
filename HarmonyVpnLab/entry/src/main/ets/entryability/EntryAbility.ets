@@ -21,10 +21,12 @@ export default class EntryAbility extends UIAbility {
   private uiFontScaleTest: number = 0;
   private mainWindow?: window.Window;
   private resizeListener?: (size: window.Size) => void;
+  private avoidAreaListener?: (options: window.AvoidAreaOptions) => void;
   private windowSizeTest: string = '';
 
   onCreate(want: Want): void {
     AppStorage.setOrCreate('windowWidthVp', 360);
+    AppStorage.setOrCreate('statusBarHeightVp', 0);
     this.readUiFontTest(want);
     const mode = want.parameters?.['runtimeSmoke'];
     if (mode === 'fixtures' || mode === 'go') {
@@ -118,6 +120,7 @@ export default class EntryAbility extends UIAbility {
       }
       this.contentReady = true;
       this.attachWindowSize();
+      this.attachStatusBarHeight();
       try { applyAppearance(this.context, readAppearance(this.context.filesDir)); this.applyUiFontTest(); }
       catch (_) { hilog.warn(0x0000, 'HarmonyVpnLab', 'APPEARANCE_APPLY_FAILED'); }
       hilog.info(0x0000, 'HarmonyVpnLab', 'UI_READY');
@@ -132,6 +135,7 @@ export default class EntryAbility extends UIAbility {
         const width = normalizedWindowWidth(main.getUIContext().px2vp(size.width));
         AppStorage.setOrCreate('windowWidthVp', Math.round(width * 10) / 10);
       } catch (_) { /* Retain the last valid window width during destruction. */ }
+      this.updateStatusBarHeight(main);
     };
     try {
       const rect = main.getWindowProperties().windowRect;
@@ -141,9 +145,41 @@ export default class EntryAbility extends UIAbility {
     } catch (_) { hilog.warn(0x0000, 'HarmonyVpnLab', 'WINDOW_SIZE_LISTENER_UNAVAILABLE'); }
   }
 
+  private updateStatusBarHeight(main: window.Window, area?: window.AvoidArea): void {
+    if (this.mainWindow !== main) { return; }
+    if (deviceInfo.deviceType === '2in1' || deviceInfo.deviceType === 'pc') {
+      AppStorage.setOrCreate('statusBarHeightVp', 0); return;
+    }
+    try {
+      const current = area ?? main.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+      const pixels = current.topRect.height;
+      if (!Number.isFinite(pixels) || pixels < 0) { return; }
+      const height = main.getUIContext().px2vp(pixels);
+      if (!Number.isFinite(height) || height < 0) { return; }
+      AppStorage.setOrCreate('statusBarHeightVp', Math.round(height * 10) / 10);
+    } catch (_) { /* Retain the last measured inset if the window is not ready. */ }
+  }
+
+  private attachStatusBarHeight(): void {
+    const main = this.mainWindow;
+    if (!main) { return; }
+    this.updateStatusBarHeight(main);
+    if (this.avoidAreaListener || deviceInfo.deviceType === '2in1' || deviceInfo.deviceType === 'pc') { return; }
+    const update = (options: window.AvoidAreaOptions): void => {
+      if (options.type === window.AvoidAreaType.TYPE_SYSTEM) { this.updateStatusBarHeight(main, options.area); }
+    };
+    try {
+      main.on('avoidAreaChange', update);
+      this.avoidAreaListener = update;
+    } catch (_) { hilog.warn(0x0000, 'HarmonyVpnLab', 'WINDOW_AVOID_AREA_LISTENER_UNAVAILABLE'); }
+  }
+
   onWindowStageDestroy(): void {
     try { if (this.mainWindow && this.resizeListener) { this.mainWindow.off('windowSizeChange', this.resizeListener); } }
     catch (_) { /* The platform may already have destroyed the window. */ }
-    this.resizeListener = undefined; this.mainWindow = undefined; this.contentReady = false;
+    try { if (this.mainWindow && this.avoidAreaListener) { this.mainWindow.off('avoidAreaChange', this.avoidAreaListener); } }
+    catch (_) { /* Remove the independent listener even if resize cleanup failed. */ }
+    this.resizeListener = undefined; this.avoidAreaListener = undefined; this.mainWindow = undefined; this.contentReady = false;
+    AppStorage.setOrCreate('statusBarHeightVp', 0);
   }
 }

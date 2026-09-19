@@ -11,6 +11,7 @@ import { checkProxyDns, connectionExitMarker, probeIpv6Datagram } from '../model
 import { subscribeVpnAuthorization, unsubscribeVpnAuthorization } from '../model/VpnAuthorization';
 import { readPhysicalNetwork, resolvePhysicalIpv4 } from '../model/PhysicalNetwork';
 import { AppTabBar } from '../components/AppTabBar';
+import { GlassDockLayout } from '../components/GlassDockLayout';
 import { openMainTab } from '../model/MainNavigation';
 import { AppSideNav } from '../components/AppSideNav';
 import { useSideNavigation, primaryContentWidth, formContentWidth, homeUsesColumns } from '../model/AdaptiveLayout';
@@ -26,11 +27,13 @@ import { nodeIssue } from '../model/NodeIssue';
 import { checkNodeForConnection } from '../model/NodePreflight';
 import { ConnectionFailure, makeConnectionFailure, connectionFailureFromError, failureProblem } from '../model/ConnectionFailure';
 import { FailureNotice } from '../components/FailureNotice';
+import { consumeDockConnectionAction } from '../model/DockConnectionAction';
 
 @Entry
 @Component
 struct Home {
   @StorageProp('windowWidthVp') windowWidthVp: number = 360;
+  @State dockHeight: number = 84;
   @State phase: string = 'idle';
   @State detail: string = '';
   @State hasNode: boolean = false;
@@ -117,6 +120,7 @@ struct Home {
     this.refreshProfile();
     if (this.poll < 0) { this.poll = setInterval(() => this.refresh(), 1000); }
     this.refresh();
+    void this.handleDockConnectionAction();
   }
 
   onPageHide(): void {
@@ -216,6 +220,17 @@ struct Home {
       return;
     }
     await this.connect();
+  }
+
+  private async handleDockConnectionAction(): Promise<void> {
+    try {
+      const request = consumeDockConnectionAction(this.context().filesDir, VPN_CORE_AVAILABLE);
+      if (!request || this.requesting || this.developerTools) { return; }
+      this.refresh();
+      if (request.runId !== this.runId || this.phase === 'diagnostic') { return; }
+      if (request.action === 'connect' && this.closed && !this.busy()) { await this.primaryAction(); }
+      else if (request.action === 'disconnect' && !this.closed && this.busy()) { await this.disconnect(); }
+    } catch (_) { this.detail = '快捷启停暂未完成，请在连接页重试。'; }
   }
 
   private openNetworkSettings(): void {
@@ -517,7 +532,15 @@ struct Home {
   build() {
     Row() {
       if (useSideNavigation(this.windowWidthVp) && !this.developerTools) { AppSideNav({ current: 'home' }); }
-    Column() {
+      GlassDockLayout({
+        showDock: !this.developerTools && !useSideNavigation(this.windowWidthVp), dockHeight: this.dockHeight,
+        content: () => { this.pageContent(); }, dock: () => { this.navigationDock(); }
+      }).layoutWeight(1).height('100%');
+    }.id('homePage').width('100%').height('100%').background($r('app.color.page_bg'));
+  }
+
+  @Builder
+  private pageContent() {
       Scroll() {
         Column({ space: 20 }) {
           if (this.developerTools) {
@@ -584,11 +607,18 @@ struct Home {
             }
           }
         }.id('homeContent').width(this.developerTools ? formContentWidth(this.windowWidthVp) : primaryContentWidth(this.windowWidthVp))
-          .padding({ top: 20, left: 20, right: 20, bottom: 24 }).alignItems(HorizontalAlign.Start);
-      }.width('100%').layoutWeight(1).scrollBar(BarState.Off).align(Alignment.Top);
-      if (!this.developerTools && !useSideNavigation(this.windowWidthVp)) { AppTabBar({ current: 'home' }); }
-    }.layoutWeight(1).height('100%');
-    }.id('homePage').width('100%').height('100%').backgroundColor($r('app.color.page_bg'));
+          .padding({ top: 12, left: 20, right: 20,
+            bottom: !this.developerTools && !useSideNavigation(this.windowWidthVp) ? this.dockHeight + 24 : 24 })
+          .alignItems(HorizontalAlign.Start);
+      }.id('homeScroll').width('100%').height('100%').scrollBar(BarState.Off).align(Alignment.Top)
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM]);
+  }
+
+  @Builder
+  private navigationDock() {
+        AppTabBar({ current: 'home', requestInProgress: this.requesting,
+          onConnectionAction: () => { void this.handleDockConnectionAction(); } })
+          .onAreaChange((_oldArea: Area, area: Area) => { this.dockHeight = Number(area.height); });
   }
 
   @Builder

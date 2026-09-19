@@ -63,7 +63,7 @@ function fixture(options = {}) {
       TextEncoder: class { encodeInto(value) { return new Uint8Array(Buffer.from(value, 'utf8')); } } } };
     if (name === '../model/Appearance') return api;
     if (name === '../model/BuildCapabilities') return { VPN_CORE_AVAILABLE: options.coreAvailable !== false };
-    if (name === '../components/AppTabBar') return {};
+    if (name === '../components/AppTabBar' || name === '../components/GlassDockLayout') return {};
     throw Error(`Unexpected import ${name}`);
   };
   vm.runInNewContext(appearanceCode, { exports: api, require: imports, Uint8Array });

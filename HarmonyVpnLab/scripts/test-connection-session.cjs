@@ -10,7 +10,7 @@ const root = path.resolve(__dirname, '..');
 const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio';
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
 const names = ['model/ConnectionFailure.ets', 'model/ConnectionControl.ets', 'model/ConnectionSnapshot.ets', 'model/ConnectionNotification.ets', 'model/TransferRate.ets',
-  'model/ProbeState.ets', 'model/ConnectionLifecycle.ets', 'model/NodeEditGuard.ets', 'model/NodeBootstrap.ets', 'model/NodeIssue.ets',
+  'model/ProbeState.ets', 'model/ConnectionLifecycle.ets', 'model/DockConnectionAction.ets', 'model/NodeEditGuard.ets', 'model/NodeBootstrap.ets', 'model/NodeIssue.ets',
   'model/NodeImport.ets', 'model/NodePreflight.ets', 'model/AppRouting.ets', 'model/NetworkPolicy.ets', 'model/VpnAuthorization.ets', 'vpn/VpnProbeAbility.ets', 'pages/Home.ets', 'pages/Index.ets'];
 const sources = new Map(names.map(name => [name, fs.readFileSync(path.join(root, 'entry/src/main/ets', name), 'utf8')]));
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
@@ -172,6 +172,15 @@ function scenario(options = {}) {
       processAlive: pid => { calls.processAliveQueries.push(pid); return options.processAlive ? options.processAlive(pid) : true; } } });
   shared.native.processAlive = shared.nativeBridge.processAlive;
   Object.assign(shared, load('model/ConnectionLifecycle.ets'));
+  const readLifecycle = shared.readConnectionLifecycle;
+  shared.readConnectionLifecycle = (filesDir, now) => {
+    const result = readLifecycle(filesDir, now);
+    // Fault injection between two authored reads, without replacing the
+    // lifecycle resolver or Home action methods under test.
+    if (options.afterLifecycleRead) options.afterLifecycleRead(result);
+    return result;
+  };
+  Object.assign(shared, load('model/DockConnectionAction.ets'));
   Object.assign(shared, load('model/NodeEditGuard.ets'));
   Object.assign(shared, load('model/VpnAuthorization.ets'));
   const Service = load('vpn/VpnProbeAbility.ets').default;
@@ -598,6 +607,114 @@ test('Home primary action preserves request and preview-core guards', async () =
   s.home.hasNode = false; s.home.requesting = true;
   s.home.getUIContext = () => { assert.fail('requesting primary action must not navigate'); };
   await s.home.primaryAction();
+});
+
+function queueDock(s, action, runId) {
+  const request = s.shared.queueDockConnectionAction(s.context.filesDir, s.shared.VPN_CORE_AVAILABLE,
+    action, runId, s.clock.now);
+  assert(request, 'synthetic dock intent must pass the actual lifecycle guard');
+  return request;
+}
+
+test('queued cross-page dock connect uses Home node validation and starts once on page show', async () => {
+  const s = scenario(); s.home.onPageHide(); queueDock(s, 'connect', '');
+  s.home.onPageShow(); await flush();
+  assert.equal(s.calls.vpnStarts.length, 1); assert.equal(s.command().action, 'start');
+  assert.equal(s.calls.commandWrites.length, 1); assert.equal(s.home.configurationIssueCode, '');
+  assert.equal(s.calls.vpnStarts[0].parameters.kind, 'connection');
+  s.home.onPageShow(); s.home.onPageShow(); await flush();
+  assert.equal(s.calls.vpnStarts.length, 1); assert.equal(s.calls.commandWrites.length, 1);
+});
+
+test('queued cross-page dock stop writes only the current run stop through Home disconnect', async () => {
+  const s = scenario(); s.activate(); s.home.onPageHide(); queueDock(s, 'disconnect', 'run-one');
+  const before = s.calls.commandWrites.length; s.home.onPageShow(); await flush();
+  assert.equal(s.command().action, 'stop'); assert.equal(s.command().runId, 'run-one');
+  assert.equal(s.calls.commandWrites.length, before + 1); assert.equal(s.calls.vpnStarts.length, 0);
+  s.home.onPageShow(); s.home.onPageShow(); await flush();
+  assert.equal(s.calls.commandWrites.length, before + 1, 'page appearances cannot repeat a consumed stop');
+});
+
+test('Home requesting guard consumes an intent without later replay or overlap', async () => {
+  const s = scenario(); queueDock(s, 'connect', ''); s.home.requesting = true;
+  await s.home.handleDockConnectionAction(); assert.equal(s.calls.vpnStarts.length, 0);
+  s.home.requesting = false; s.home.onPageShow(); await flush();
+  assert.equal(s.calls.vpnStarts.length, 0); assert.equal(s.calls.commandWrites.length, 0);
+});
+
+test('developer page flag discards a queued dock action without starting in developer tools', async () => {
+  const s = scenario(); queueDock(s, 'connect', '');
+  s.shared.AppStorage.setOrCreate('openDeveloperTools', true); s.home.onPageShow(); await flush();
+  assert.equal(s.home.developerTools, true); assert.equal(s.calls.vpnStarts.length, 0);
+  s.home.onBackPress(); s.home.onPageShow(); await flush();
+  assert.equal(s.calls.vpnStarts.length, 0); assert.equal(s.calls.commandWrites.length, 0);
+});
+
+for (const action of ['connect', 'disconnect']) {
+  test('Home refresh after dock consumption detects a replacement run and does not ' + action, async () => {
+    const options = {}, s = scenario(options);
+    if (action === 'disconnect') s.activate('run-one');
+    queueDock(s, action, action === 'disconnect' ? 'run-one' : '');
+    let readCount = 0;
+    options.afterLifecycleRead = () => {
+      if (++readCount === 1) s.activate('replacement-run');
+    };
+    await s.home.handleDockConnectionAction();
+    assert(readCount >= 2, 'consumption and Home refresh must independently observe lifecycle');
+    assert.equal(s.home.runId, 'replacement-run'); assert.equal(s.command().runId, 'replacement-run');
+    assert.equal(s.command().action, 'start'); assert.equal(s.calls.vpnStarts.length, 0);
+    assert.equal(s.calls.commandWrites.filter(command => command.action === 'stop').length, 0);
+    await s.home.handleDockConnectionAction(); assert.equal(s.calls.vpnStarts.length, 0);
+  });
+}
+
+test('dock starts without a saved node enter the existing import route instead of starting VPN', async () => {
+  const s = scenario({ missingProfile: true }), routes = [];
+  s.home.getUIContext = () => ({ getHostContext: () => s.context,
+    getRouter: () => ({ pushUrl: async request => routes.push(request.url) }) });
+  queueDock(s, 'connect', ''); s.home.onPageShow(); await flush();
+  assert.deepEqual(routes, ['pages/NodeConfig']); assert.equal(s.calls.vpnStarts.length, 0);
+  assert.equal(s.calls.commandWrites.length, 0);
+  s.home.onPageShow(); await flush(); assert.deepEqual(routes, ['pages/NodeConfig']);
+});
+
+test('dock start cannot bypass existing local node preflight', async () => {
+  const s = scenario(); const outbound = JSON.parse(s.selectedNode.outboundJson);
+  outbound.settings.vnext[0].users[0].id = 'private-invalid-value'; s.selectedNode.outboundJson = JSON.stringify(outbound);
+  queueDock(s, 'connect', ''); s.home.onPageShow(); await flush();
+  assert.equal(s.home.configurationIssueCode, 'uuid-format'); assert.equal(s.calls.vpnStarts.length, 0);
+  assert.equal(s.calls.commandWrites.length, 0);
+});
+
+test('preview Home drops an existing dock intent even when synthetic model was queued with core enabled', async () => {
+  const s = scenario({ preview: true });
+  assert(s.shared.queueDockConnectionAction(s.context.filesDir, true, 'connect', '', s.clock.now));
+  s.home.onPageShow(); await flush();
+  assert.equal(s.calls.vpnStarts.length, 0); assert.equal(s.calls.commandWrites.length, 0);
+  assert.equal(s.shared.consumeDockConnectionAction(s.context.filesDir, true, s.clock.now), undefined);
+});
+
+test('expired cross-page request cannot start after a delayed page show', async () => {
+  const s = scenario(); queueDock(s, 'connect', ''); s.clock.now += 5000;
+  s.home.onPageShow(); await flush(); assert.equal(s.calls.vpnStarts.length, 0);
+  assert.equal(s.calls.commandWrites.length, 0);
+});
+
+test('temporary node test taking ownership before Home appears invalidates the queued start', async () => {
+  const s = scenario(); queueDock(s, 'connect', ''); s.prepare('latency-run', 'starting', 'node-latency');
+  const before = s.calls.commandWrites.length; s.home.onPageShow(); await flush();
+  assert.equal(s.home.phase, 'diagnostic'); assert.equal(s.calls.commandWrites.length, before);
+  assert.equal(s.calls.vpnStarts.length, 0); assert.equal(s.command().runId, 'latency-run');
+});
+
+test('dock stop consumed before a cleanup receipt never turns into a reconnect on later appearance', async () => {
+  const s = scenario(); s.activate(); queueDock(s, 'disconnect', 'run-one');
+  s.shared.writeConnectionStatus(s.context.filesDir,
+    new s.shared.ConnectionStatus('run-one', 'destroyed', undefined, true, 4242));
+  const before = s.calls.commandWrites.length; s.home.onPageShow(); await flush();
+  assert.equal(s.home.closed, true); assert.equal(s.calls.commandWrites.length, before);
+  assert.equal(s.calls.vpnStarts.length, 0); s.home.onPageShow(); await flush();
+  assert.equal(s.calls.vpnStarts.length, 0);
 });
 
 test('Home network summary refreshes saved preferences without changing the session', async () => {
