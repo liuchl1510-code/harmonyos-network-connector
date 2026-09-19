@@ -1,6 +1,6 @@
 'use strict';
 // Execute the authored policy, config builder and atomic store with synthetic files.
-const assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path'), Module = require('node:module');
+const assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path'), Module = require('node:module'), crypto = require('node:crypto');
 const root = path.resolve(__dirname, '..');
 const ts = require(path.join(process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio',
   'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
@@ -12,7 +12,8 @@ function load(name, imports = {}) {
   const mod = new Module(file); mod.require = key => { assert(Object.hasOwn(imports, key), key); return imports[key]; };
   mod._compile(result.outputText, file); return mod.exports;
 }
-const bootstrap = load('NodeBootstrap'), policy = load('NetworkPolicy', { './NodeBootstrap': bootstrap });
+const bootstrap = load('NodeBootstrap'), apps = load('AppRouting');
+const policy = load('NetworkPolicy', { './NodeBootstrap': bootstrap, './AppRouting': apps });
 const config = load('ConnectionConfig', { './NodeBootstrap': bootstrap, './NetworkPolicy': policy });
 const node = JSON.stringify({ protocol: 'vless', settings: { vnext: [{ address: '192.0.2.1', port: 443,
   users: [{ id: '00000000-0000-4000-8000-000000000001', encryption: 'none' }] }] } });
@@ -35,6 +36,81 @@ test('bounded schema and lists, no silent unknown fields', () => {
   for (const value of [null, [], {}, { ...new policy.NetworkPolicy(), ignored: true },
     { ...new policy.NetworkPolicy(), direct: [17] }, { ...new policy.NetworkPolicy(), mode: 'unknown' },
     { ...new policy.NetworkPolicy(), block: Array(301).fill('example.com') }]) assert.throws(() => policy.validateNetworkPolicy(value));
+});
+test('legacy policy migrates to schema two only in memory', () => {
+  const legacy = { schemaVersion: 1, mode: 'rules', bypassLan: true, direct: ['example.com'], proxy: [], block: [],
+    dnsUrl: 'https://8.8.8.8/dns-query' };
+  const original = JSON.stringify(legacy), checked = policy.validateNetworkPolicy(legacy);
+  assert.equal(checked.schemaVersion, 2); assert.equal(checked.appMode, 'all'); assert.deepEqual(checked.appBundles, []);
+  assert.equal(checked.dnsUrl, legacy.dnsUrl); assert.deepEqual(checked.direct, ['domain:example.com']);
+  assert.equal(JSON.stringify(legacy), original);
+  assert.throws(() => policy.validateNetworkPolicy({ ...legacy, appMode: 'include' }));
+  assert.throws(() => policy.validateNetworkPolicy({ ...legacy, schemaVersion: 2 }));
+});
+test('app identities preserve case and do not normalize whitespace', () => {
+  for (const valid of ['com.Example.App', 'org_test.App2.x', 'a.bc.de', 'org.2app.3name', 'a'.repeat(124) + '.b.c']) {
+    assert.equal(apps.normalizeAppBundle(valid), valid);
+  }
+  for (const invalid of [undefined, null, 123, '', 'sixsix', 'a'.repeat(129), ' com.test.app', 'com.test.app ',
+    '1com.test.app', 'com/test/app', 'com.test.app\n', 'com.test.应用', 'com.test-application',
+    'com.test', 'com..app', 'com.test.', 'com._test.app', 'com.test_.app', 'com.test.app_', 'a.b.c']) {
+    assert.throws(() => apps.normalizeAppBundle(invalid), error => !error.message.includes(String(invalid)) || !invalid);
+  }
+});
+test('app selections are bounded cloned and deduplicated without case folding', () => {
+  const input = ['com.Example.App', 'com.example.app', 'com.Example.App'];
+  const selected = apps.validateAppRouting('include', input);
+  assert.deepEqual(selected.bundles, ['com.Example.App', 'com.example.app']);
+  input.push('com.example.changed'); assert.equal(selected.bundles.length, 2);
+  for (const value of [null, {}, 'com.example.app', Array(256).fill('com.example.app')]) {
+    assert.throws(() => apps.validateAppRouting('include', value));
+  }
+  for (const mode of [undefined, null, '', 'other', 1]) assert.throws(() => apps.validateAppRouting(mode, []));
+});
+for (const mode of ['exclude', 'include']) test(mode + ' refuses empty or own-only scope', () => {
+  assert.throws(() => apps.validateAppRouting(mode, []));
+  assert.throws(() => apps.validateAppRouting(mode, [apps.OWN_VPN_BUNDLE]));
+  const bad = new policy.NetworkPolicy(); bad.appMode = mode;
+  assert.throws(() => policy.validateNetworkPolicy(bad));
+  assert.throws(() => apps.appRoutingScope('connection', mode, []));
+});
+test('native app scope is exclusive and includes self only where intended', () => {
+  const selected = ['com.example.browser', 'com.example.mail'];
+  const included = apps.appRoutingScope('connection', 'include', selected);
+  assert.deepEqual(included.trustedApplications, [apps.OWN_VPN_BUNDLE, ...selected]);
+  assert.equal(included.blockedApplications, undefined);
+  const excluded = apps.appRoutingScope('connection', 'exclude', selected);
+  assert.deepEqual(excluded.blockedApplications, selected); assert.equal(excluded.trustedApplications, undefined);
+  selected.push('com.example.other'); assert.equal(excluded.blockedApplications.length, 2);
+  const all = apps.appRoutingScope('connection', 'all', selected);
+  assert.equal(all.trustedApplications, undefined); assert.equal(all.blockedApplications, undefined);
+});
+test('API24 limit reserves the final trusted application slot for self', () => {
+  const names = Array.from({ length: 255 }, (_, n) => 'com.example.app' + n);
+  assert.equal(apps.appRoutingScope('connection', 'include', names).trustedApplications.length, 256);
+  assert.equal(apps.appRoutingScope('connection', 'exclude', names).blockedApplications.length, 255);
+  assert.throws(() => apps.appRoutingScope('connection', 'all', [...names, 'com.example.toomany']));
+});
+test('temporary tests ignore saved application selections and remain self-only', () => {
+  for (const kind of ['connection-app-test', 'node-latency', 'node', 'xray', 'reject']) {
+    const scope = apps.appRoutingScope(kind, 'invalid-saved-mode', null);
+    assert.deepEqual(scope.trustedApplications, [apps.OWN_VPN_BUNDLE]); assert.equal(scope.blockedApplications, undefined);
+  }
+  for (const kind of ['lifecycle', 'hev']) {
+    const scope = apps.appRoutingScope(kind, 'include', ['com.example.browser']);
+    assert.equal(scope.trustedApplications, undefined); assert.equal(scope.blockedApplications, undefined);
+  }
+});
+test('all apps retains selection without affecting domain IP DNS core configuration', () => {
+  const p = new policy.NetworkPolicy(); p.mode = 'rules'; p.direct = ['example.com'];
+  const before = build(p); p.appBundles = ['com.example.browser'];
+  assert.deepEqual(policy.validateNetworkPolicy(p).appBundles, p.appBundles);
+  for (const mode of ['all', 'include', 'exclude']) { p.appMode = mode; assert.deepEqual(build(p), before); }
+});
+test('application scope labels do not imply domain rules are disabled', () => {
+  assert.equal(apps.appRoutingLabel('all', 2), '全部应用');
+  assert.equal(apps.appRoutingLabel('include', 2), '仅代理所选应用（2）');
+  assert.equal(apps.appRoutingLabel('exclude', 2), '绕过所选应用（2）');
 });
 test('global ignores retained rules and custom DNS remains proxied', () => {
   const p = new policy.NetworkPolicy(); p.bypassLan = true; p.direct = ['0.0.0.0/0']; p.dnsUrl = 'https://8.8.8.8/dns-query';
@@ -82,6 +158,25 @@ test('missing store defaults, valid atomic save and readback', () => {
   const p = new policy.NetworkPolicy(); p.mode = 'rules'; f.api.saveNetworkPolicy('/test', p);
   assert.equal(f.api.readNetworkPolicy('/test').mode, 'rules'); assert.equal(f.files.size, 1);
 });
+test('legacy store read never writes back and explicit save persists new app schema', () => {
+  const f = storeFixture(), destination = '/test/network-policy.json';
+  const legacy = JSON.stringify({ schemaVersion: 1, mode: 'rules', bypassLan: false, direct: ['example.com'],
+    proxy: [], block: [], dnsUrl: 'https://1.1.1.1/dns-query' });
+  f.files.set(destination, legacy); const p = f.api.readNetworkPolicy('/test');
+  assert.equal(p.schemaVersion, 2); assert.equal(f.files.get(destination), legacy); assert.equal(f.state.next, 0);
+  p.appMode = 'include'; p.appBundles = ['com.example.browser']; f.api.saveNetworkPolicy('/test', p);
+  const saved = JSON.parse(f.files.get(destination)); assert.equal(saved.schemaVersion, 2);
+  assert.equal(saved.appMode, 'include'); assert.deepEqual(saved.appBundles, ['com.example.browser']);
+  assert.deepEqual(f.api.readNetworkPolicy('/test').appBundles, saved.appBundles);
+});
+test('invalid app settings cannot write or replace previously saved policy', () => {
+  const f = storeFixture(); f.api.saveNetworkPolicy('/test', new policy.NetworkPolicy());
+  const before = f.files.get('/test/network-policy.json');
+  for (const mode of ['include', 'exclude']) {
+    const p = new policy.NetworkPolicy(); p.appMode = mode;
+    assert.throws(() => f.api.saveNetworkPolicy('/test', p)); assert.equal(f.files.get('/test/network-policy.json'), before);
+  }
+});
 test('corruption is fail closed without overwriting file', () => {
   const f = storeFixture(); f.files.set('/test/network-policy.json', '{broken');
   assert.throws(() => f.api.readNetworkPolicy('/test')); assert.equal(f.files.get('/test/network-policy.json'), '{broken');
@@ -98,5 +193,8 @@ const fixturePolicy = new policy.NetworkPolicy(); fixturePolicy.mode = 'rules'; 
 fixturePolicy.block = ['full:blocked.example.com']; fixturePolicy.direct = ['192.0.2.0/24', 'direct.example.com'];
 const outputDir = path.join(root, 'build/network-policy-tests'); fs.mkdirSync(outputDir, { recursive: true });
 fs.writeFileSync(path.join(outputDir, 'synthetic-core-config.json'), JSON.stringify(build(fixturePolicy), null, 2));
-fs.writeFileSync(path.join(outputDir, 'result.json'), JSON.stringify({ passed, scope: 'synthetic policy/config/store, no device or network' }, null, 2));
+const sourceHashes = Object.fromEntries(['AppRouting', 'NetworkPolicy', 'NetworkPolicyStore', 'NodeBootstrap', 'ConnectionConfig'].map(name =>
+  [name + '.ets', crypto.createHash('sha256').update(fs.readFileSync(path.join(root, 'entry/src/main/ets/model', name + '.ets'))).digest('hex')]));
+fs.writeFileSync(path.join(outputDir, 'result.json'), JSON.stringify({ passed, sourceHashes,
+  scope: 'synthetic policy/config/store, no device or network' }, null, 2));
 console.log(`PASS ${passed} network policy checks`);

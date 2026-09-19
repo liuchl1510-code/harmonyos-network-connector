@@ -14,7 +14,8 @@ function load(relative, imports = {}) {
   return module.exports;
 }
 const bootstrapModule = load('entry/src/main/ets/model/NodeBootstrap.ets');
-const policyModule = load('entry/src/main/ets/model/NetworkPolicy.ets', { './NodeBootstrap': bootstrapModule });
+const appsModule = load('entry/src/main/ets/model/AppRouting.ets');
+const policyModule = load('entry/src/main/ets/model/NetworkPolicy.ets', { './NodeBootstrap': bootstrapModule, './AppRouting': appsModule });
 const configModule = load('entry/src/main/ets/model/ConnectionConfig.ets', { './NodeBootstrap': bootstrapModule, './NetworkPolicy': policyModule });
 const snapshotModule = load('entry/src/main/ets/model/ConnectionSnapshot.ets');
 const failureModule = load('entry/src/main/ets/model/ConnectionFailure.ets');
@@ -385,6 +386,8 @@ async function main() {
     dnsScope: 'A via routed DoH; AAAA and all other qtypes empty NOERROR, no raw forwarding',
     configSourceSHA256: crypto.createHash('sha256').update(fs.readFileSync(path.join(project, 'entry/src/main/ets/model/ConnectionConfig.ets'))).digest('hex'),
     bootstrapSourceSHA256: crypto.createHash('sha256').update(fs.readFileSync(path.join(project, 'entry/src/main/ets/model/NodeBootstrap.ets'))).digest('hex'),
+    appRoutingSourceSHA256: crypto.createHash('sha256').update(fs.readFileSync(path.join(project, 'entry/src/main/ets/model/AppRouting.ets'))).digest('hex'),
+    networkPolicySourceSHA256: crypto.createHash('sha256').update(fs.readFileSync(path.join(project, 'entry/src/main/ets/model/NetworkPolicy.ets'))).digest('hex'),
     coreProbeSourceSHA256: crypto.createHash('sha256').update(fs.readFileSync(path.join(project, 'entry/src/main/ets/vpn/CoreProbe.ets'))).digest('hex'),
     connectionFailureSourceSHA256: crypto.createHash('sha256').update(fs.readFileSync(path.join(project, 'entry/src/main/ets/model/ConnectionFailure.ets'))).digest('hex')
   }, null, 2) + '\n');

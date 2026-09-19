@@ -10,7 +10,7 @@ const root = path.resolve(__dirname, '..');
 const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio';
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
 const names = ['model/ConnectionFailure.ets', 'model/ConnectionSnapshot.ets', 'model/ConnectionControl.ets', 'model/ProbeState.ets',
-  'model/NodeBootstrap.ets', 'model/LatencyProtocol.ets', 'model/NodeLatency.ets', 'model/DiagnosticJournal.ets', 'vpn/VpnProbeAbility.ets'];
+  'model/NodeBootstrap.ets', 'model/AppRouting.ets', 'model/NetworkPolicy.ets', 'model/LatencyProtocol.ets', 'model/NodeLatency.ets', 'model/DiagnosticJournal.ets', 'vpn/VpnProbeAbility.ets'];
 const sources = new Map(names.map(name => [name, fs.readFileSync(path.join(root, 'entry/src/main/ets', name), 'utf8')]));
 const compiled = new Map([...sources].map(([name, source]) => {
   const result = ts.transpileModule(source.replace(/^import[\s\S]*?;\r?\n/gm, ''), {
@@ -69,6 +69,7 @@ function scenario(options = {}) {
     setTimeout(fn, ms) { const id = nextTimer++; timers.set(id, { fn, ms, interval: false }); return id; },
     clearTimeout(id) { timers.delete(id); },
     hilog: { info() {}, warn() {}, error() {} }, describeError: () => 'synthetic safe error',
+    readNetworkPolicy: () => { assert.fail('Node latency must never read the daily network policy'); },
     readNodeCatalog: () => catalog,
     readNodeProfile: () => { calls.profileRead++; return active; },
     nodeServerAddress: node => JSON.parse(node.outboundJson).settings.vnext[0].address,

@@ -3,8 +3,8 @@
     "bundleName": "com.example.harmonyvpnlab",
     "vendor": "HarmonyVpnLab",
     "configuration": "$profile:configuration",
-    "versionCode": 40,
-    "versionName": "0.19.0",
+    "versionCode": 41,
+    "versionName": "0.20.0",
     "icon": "$media:app_icon",
     "label": "$string:app_name"
   }

@@ -20,6 +20,8 @@ import { fingerprintOutbound, NodeLatencyResult, saveNodeLatency } from '../mode
 import { LatencyProof, readLatencyRequest, readLatencyProof } from '../model/LatencyProtocol';
 import { appendDiagnosticEvent } from '../model/DiagnosticJournal';
 import { readNetworkPolicy } from '../model/NetworkPolicyStore';
+import { NetworkPolicy, validateNetworkPolicy } from '../model/NetworkPolicy';
+import { appRoutingLabel, appRoutingScope } from '../model/AppRouting';
 import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
 import { ConnectionFailure, ConnectionFailureError, makeConnectionFailure, connectionFailureFromError,
   failureDiagnosticCode, failureDiagnosticValue } from '../model/ConnectionFailure';
@@ -67,6 +69,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
   private dialEpoch: number = -1;
   private appliedNetworkKey: string = '';
   private connectionNode?: ImportedNode;
+  private connectionPolicy?: NetworkPolicy;
   private preparedBootstrap?: NodeBootstrap;
   private preparedEpoch: number = -1;
   private connectionPhase: string = 'starting';
@@ -204,6 +207,13 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
       if (this.checkPersistentCancellation() || this.stopRequested) {
         return;
       }
+      if (this.testKind === 'connection') {
+        stage = 'configuration';
+        // One owned snapshot drives both VPN scope and core policy, including retries.
+        // Invalid preferences must fail before any VPN connection is created.
+        this.connectionPolicy = validateNetworkPolicy(readNetworkPolicy(this.context.filesDir));
+      }
+      stage = 'vpn-init';
       this.publish('starting', isConnectionKind(this.testKind)
         ? '正在建立代理连接与 DNS。'
         : this.testKind === 'node' || this.testKind === 'xray' || this.testKind === 'reject'
@@ -274,10 +284,10 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
           hasGateway: false,
           isDefaultRoute: true
         }];
-        if (!isConnectionKind(this.testKind) || this.testKind === 'connection-app-test' || this.testKind === 'node-latency') {
-          config.trustedApplications = ['com.example.harmonyvpnlab'];
-        }
       }
+      const scope = appRoutingScope(this.testKind, this.connectionPolicy?.appMode ?? 'all', this.connectionPolicy?.appBundles ?? []);
+      if (scope.trustedApplications) { config.trustedApplications = scope.trustedApplications; }
+      if (scope.blockedApplications) { config.blockedApplications = scope.blockedApplications; }
       if (isConnectionKind(this.testKind)) {
           config.dnsAddresses = ['198.18.0.1'];
           // This complete IPv6 address/route combination captured real UDP6 on
@@ -496,11 +506,9 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
       if (this.coreProbe) { await this.coreProbe.resumeConnection(this.context, bootstrap); }
       else {
         this.coreProbe = new CoreProbe();
-        stage = 'configuration';
-        const policy = this.testKind === 'connection' ? readNetworkPolicy(this.context.filesDir) : undefined;
         stage = 'core-init';
         await this.coreProbe.startConnection(this.tunFd, this.context, (fd: number) => this.protectSocket(fd), bootstrap,
-          this.connectionNode?.outboundJson, policy);
+          this.connectionNode?.outboundJson, this.connectionPolicy);
       }
       if (this.stopRequested || epoch !== this.networkEpoch) { return; }
       this.appliedNetworkKey = target.key; this.retryAt = 0; this.retryCount = 0;
@@ -509,7 +517,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
       if (this.testKind === 'node-latency') { this.latencyEpoch = epoch; }
       this.setConnectionPhase('active', this.connectionDetail());
       hilog.info(DOMAIN, TAG, 'CONNECTION_ACTIVE runId=%{public}s scope=%{public}s kind=%{public}s recoveries=%{public}d',
-        this.runId, ['connection-app-test', 'node-latency'].includes(this.testKind) ? 'application' : 'all-applications', target.kind, this.reconnectCount);
+        this.runId, ['connection-app-test', 'node-latency'].includes(this.testKind) ? 'application' : this.connectionPolicy?.appMode ?? 'all', target.kind, this.reconnectCount);
     } catch (error) {
       if (!this.stopRequested) {
         if (epoch !== this.networkEpoch && hadCore) { this.appliedNetworkKey = ''; return; }
@@ -745,9 +753,10 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
 
   private connectionDetail(): string {
     if (this.testKind === 'node-latency') { return '正在检测指定节点，仅接管本应用流量；完成后自动断开。'; }
-    const scope = this.testKind === 'connection-app-test' ? '本应用验证' : '全设备 IPv4 代理';
+    const scope = this.testKind === 'connection-app-test' ? '本应用验证' : this.testKind === 'connection'
+      ? appRoutingLabel(this.connectionPolicy?.appMode ?? 'all', this.connectionPolicy?.appBundles.length ?? 0) : '全设备验证';
     const network = this.desiredNetwork?.kind === 'wifi' ? 'Wi-Fi' : this.desiredNetwork?.kind === 'cellular' ? '移动数据' : '物理网络';
-    return `${scope}与代理 DNS 已启动，当前使用${network}，IPv6 请求暂不转发。` +
+    return `应用范围：${scope}。IPv4 代理与代理 DNS 已启动，当前使用${network}，纳入 VPN 的 IPv6 请求暂不转发。` +
       (this.testKind === 'connection' ? '' : '本次验证到 90 秒会自动断开。');
   }
 

@@ -1,14 +1,17 @@
 import { isBootstrapIpv4Address, normalizeBootstrapHost } from './NodeBootstrap';
+import { validateAppRouting } from './AppRouting';
 
 // Pure policy validation. The saved policy never embeds a complete core config.
 export class NetworkPolicy {
-  schemaVersion: number = 1;
+  schemaVersion: number = 2;
   mode: string = 'global';
   bypassLan: boolean = false;
   direct: string[] = [];
   proxy: string[] = [];
   block: string[] = [];
   dnsUrl: string = 'https://1.1.1.1/dns-query';
+  appMode: string = 'all';
+  appBundles: string[] = [];
 }
 
 export class RoutingRule {
@@ -71,8 +74,9 @@ export function policyDnsHost(url: string): string {
 export function validateNetworkPolicy(value: NetworkPolicy): NetworkPolicy {
   if (!value || typeof value !== 'object' || Array.isArray(value)) { throw new Error('网络设置格式无效。'); }
   const keys = ['schemaVersion', 'mode', 'bypassLan', 'direct', 'proxy', 'block', 'dnsUrl'];
+  if (value.schemaVersion === 2) { keys.push('appMode', 'appBundles'); }
   if (Object.keys(value).length !== keys.length || Object.keys(value).some((key: string) => !keys.includes(key)) ||
-    value.schemaVersion !== 1 || !['global', 'rules'].includes(value.mode) || typeof value.bypassLan !== 'boolean') {
+    ![1, 2].includes(value.schemaVersion) || !['global', 'rules'].includes(value.mode) || typeof value.bypassLan !== 'boolean') {
     throw new Error('网络设置格式或版本无效。');
   }
   const result = new NetworkPolicy();
@@ -89,6 +93,11 @@ export function validateNetworkPolicy(value: NetworkPolicy): NetworkPolicy {
   if (result.direct.length + result.proxy.length + result.block.length > 300) { throw new Error('分流条目合计最多 300 条。'); }
   policyDnsHost(value.dnsUrl);
   result.dnsUrl = value.dnsUrl;
+  // Legacy preferences migrate only in memory. The store writes only after an explicit save.
+  if (value.schemaVersion === 2) {
+    const apps = validateAppRouting(value.appMode, value.appBundles);
+    result.appMode = apps.mode; result.appBundles = apps.bundles;
+  }
   return result;
 }
 

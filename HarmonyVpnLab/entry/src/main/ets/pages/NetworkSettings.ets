@@ -4,6 +4,9 @@ import { NetworkPolicy, parseRoutingEntries } from '../model/NetworkPolicy';
 import { readNetworkPolicy, saveNetworkPolicy } from '../model/NetworkPolicyStore';
 import { isNodeManagementAllowed } from '../model/NodeEditGuard';
 import { formContentWidth } from '../model/AdaptiveLayout';
+import { MAX_ROUTED_APPS, OWN_VPN_BUNDLE, normalizeAppBundle } from '../model/AppRouting';
+import { AppCandidate, COMMON_APP_CANDIDATES } from '../model/AppCandidates';
+
 
 @Entry
 @Component
@@ -15,6 +18,12 @@ struct NetworkSettings {
   @State proxy: string = '';
   @State block: string = '';
   @State dnsUrl: string = 'https://1.1.1.1/dns-query';
+  @State appMode: string = 'all';
+  @State appBundles: string[] = [];
+  @State appSearch: string = '';
+  @State appInput: string = '';
+  @State appMessage: string = '';
+  @State appPickerOpen: boolean = false;
   @State message: string = '';
   @State editable: boolean = false;
   @State dirty: boolean = false;
@@ -28,6 +37,7 @@ struct NetworkSettings {
   private context(): common.UIAbilityContext { return this.getUIContext().getHostContext() as common.UIAbilityContext; }
   aboutToAppear(): void {
     this.pageEpoch++; this.confirmingLeave = false; this.leaving = false;
+    this.appInput = ''; this.appSearch = ''; this.appMessage = ''; this.appPickerOpen = false;
     this.baseline = this.snapshot(); this.dirty = false; this.needsRepair = false;
     this.refreshEditable();
     try { this.load(readNetworkPolicy(this.context().filesDir)); }
@@ -41,7 +51,8 @@ struct NetworkSettings {
     catch (_) { this.editable = false; }
   }
   private snapshot(): string {
-    return JSON.stringify([this.mode, String(this.bypassLan), this.direct, this.proxy, this.block, this.dnsUrl]);
+    return JSON.stringify([this.mode, String(this.bypassLan), this.direct, this.proxy, this.block, this.dnsUrl,
+      this.appMode, this.appBundles.slice().sort(), this.appInput]);
   }
   private draftChanged(): void { this.dirty = this.snapshot() !== this.baseline; this.message = ''; }
   onBackPress(): boolean {
@@ -61,7 +72,7 @@ struct NetworkSettings {
     this.confirmingLeave = true;
     try {
       const result = await this.getUIContext().getPromptAction().showDialog({
-        title: '放弃未保存的设置？', message: '返回后，这次未保存的分流与 DNS 修改将丢失。',
+        title: '放弃未保存的设置？', message: '返回后，这次未保存的应用范围、分流与 DNS 修改将丢失。',
         buttons: [{ text: '继续编辑', color: $r('app.color.accent') }, { text: '放弃修改', color: $r('app.color.danger') }]
       });
       if (epoch !== this.pageEpoch || request !== this.leaveRequest) { return; }
@@ -76,10 +87,14 @@ struct NetworkSettings {
     this.mode = policy.mode; this.bypassLan = policy.bypassLan;
     this.direct = policy.direct.join('\n'); this.proxy = policy.proxy.join('\n'); this.block = policy.block.join('\n');
     this.dnsUrl = policy.dnsUrl;
+    this.appMode = policy.appMode; this.appBundles = policy.appBundles.slice();
     this.baseline = this.snapshot(); this.dirty = false; this.needsRepair = false;
   }
   private save(): void {
     if (this.confirmingLeave || this.leaving) { return; }
+    if (this.appInput.length > 0) {
+      this.message = '还有未添加的应用包名。请先核对并添加，或清空输入后保存。'; return;
+    }
     this.dirty = this.snapshot() !== this.baseline;
     if (!this.dirty && !this.needsRepair) { return; }
     this.refreshEditable();
@@ -90,6 +105,7 @@ struct NetworkSettings {
       policy.mode = this.mode; policy.bypassLan = this.bypassLan;
       policy.direct = parseRoutingEntries(this.direct); policy.proxy = parseRoutingEntries(this.proxy);
       policy.block = parseRoutingEntries(this.block); policy.dnsUrl = this.dnsUrl.trim();
+      policy.appMode = this.appMode; policy.appBundles = this.appBundles.slice();
       saveNetworkPolicy(this.context().filesDir, policy);
       committed = true;
       // A successful atomic commit is distinct from a failed subsequent read.
@@ -102,11 +118,61 @@ struct NetworkSettings {
         '分流域名无效；支持普通域名、domain:域名、full:域名和 IPv4 网段。',
         '分流列表过长。', '每类分流最多 300 条。', '分流列表格式无效。',
         'DNS 地址需为有效的 HTTPS URL。', 'DNS 地址需包含 HTTPS 域名或 IPv4 地址及路径，不支持账号、片段或 IPv6 地址。',
-        'DNS 服务器地址格式无效。', '网络设置超过 32 KiB，未保存。', '网络设置未保存，原设置已保留。'
+        'DNS 服务器地址格式无效。', '网络设置超过 32 KiB，未保存。', '网络设置未保存，原设置已保留。',
+        '应用代理范围无效。', '应用列表格式无效或超过 255 项。',
+        '请至少选择一个应用，或切换到全部应用。', '本应用自动参与连接检查，无需加入应用选择列表。',
+        '应用包名格式无效；需为 7 至 128 位且至少三段，以字母开头，各段以字母或数字结尾。'
       ];
       this.message = committed ? '保存已提交，但设置读回未确认，请返回后重新打开核对。' :
         (error instanceof Error && safeErrors.includes(error.message) ? error.message : '网络设置未保存，输入已保留；请检查输入并先断开连接。');
     }
+  }
+
+  private changeAppMode(mode: string): void {
+    this.refreshEditable();
+    if (!this.editable || this.confirmingLeave || this.leaving ||
+      !['all', 'exclude', 'include'].includes(mode)) { return; }
+    this.appMode = mode; this.draftChanged();
+  }
+
+  private appName(bundle: string): string {
+    return COMMON_APP_CANDIDATES.find((app: AppCandidate) => app.bundleName === bundle)?.name ?? bundle;
+  }
+
+  private visibleAppChoices(): AppCandidate[] {
+    const query = this.appSearch.trim().toLowerCase();
+    return COMMON_APP_CANDIDATES.filter((app: AppCandidate) => !this.appBundles.includes(app.bundleName) &&
+      (query.length === 0 || app.name.toLowerCase().includes(query) || app.bundleName.toLowerCase().includes(query)));
+  }
+
+  private toggleApp(bundle: string, selected: boolean): void {
+    this.refreshEditable();
+    if (!this.editable || this.confirmingLeave || this.leaving || this.appMode === 'all') { return; }
+    if (!selected) { this.appBundles = this.appBundles.filter((item: string) => item !== bundle); this.draftChanged(); return; }
+    if (bundle === OWN_VPN_BUNDLE || !COMMON_APP_CANDIDATES.some((app: AppCandidate) => app.bundleName === bundle)) { return; }
+    if (this.appBundles.includes(bundle)) { return; }
+    if (this.appBundles.length >= MAX_ROUTED_APPS) { this.appMessage = '最多选择 255 个应用。'; return; }
+    this.appBundles = [...this.appBundles, bundle]; this.draftChanged();
+  }
+
+  private refreshAppChoices(): void {
+    this.refreshEditable();
+    if (!this.editable || this.confirmingLeave || this.leaving || this.appMode === 'all') { return; }
+    this.appPickerOpen = !this.appPickerOpen;
+  }
+
+  private addAppByBundle(): void {
+    this.refreshEditable();
+    if (!this.editable || this.confirmingLeave || this.leaving || this.appMode === 'all') { return; }
+    let bundle: string = '';
+    try { bundle = normalizeAppBundle(this.appInput.trim()); }
+    catch (_) { this.appMessage = '请填写完整的鸿蒙应用包名，如 com.example.reader，而不是应用名称。'; return; }
+    if (bundle === OWN_VPN_BUNDLE) { this.appMessage = 'Harmony VPN 已固定参与连接检查，无需添加。'; return; }
+    if (this.appBundles.includes(bundle)) { this.appMessage = '这个应用已经在所选列表中。'; return; }
+    if (this.appBundles.length >= MAX_ROUTED_APPS) { this.appMessage = '最多选择 255 个应用。'; return; }
+    this.appBundles = [...this.appBundles, bundle]; this.appInput = '';
+    this.appMessage = '已加入所选应用。安装状态未自动核实，请确认包名对应本机已安装的鸿蒙应用后保存。';
+    this.draftChanged();
   }
 
   build() {
@@ -115,13 +181,106 @@ struct NetworkSettings {
         Button('返回').id('backFromNetworkSettings').fontColor($r('app.color.accent'))
           .backgroundColor($r('app.color.accent_soft')).enabled(!this.confirmingLeave && !this.leaving)
           .onClick(() => { void this.requestBack(); });
-        Text('分流与 DNS').fontSize(24).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary')).layoutWeight(1);
+        Text('网络设置').fontSize(24).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary')).layoutWeight(1);
       }.width(formContentWidth(this.windowWidthVp)).padding(20);
       Scroll() {
         Column({ space: 18 }) {
           if (!this.editable) { Text('请先断开连接并等待清理完成，再修改设置。').fontColor($r('app.color.warning')); }
           Column({ space: 12 }) {
-            Text('连接模式').fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
+            Text('应用范围').fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
+            Flex({ wrap: FlexWrap.Wrap }) {
+              Button(this.appMode === 'all' ? '✓ 全部应用' : '全部应用').id('networkAppAll')
+                .constraintSize({ minHeight: 44, maxWidth: '100%' }).margin({ right: 8, bottom: 8 })
+                .fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving)
+                .onClick(() => { this.changeAppMode('all'); });
+              Button(this.appMode === 'exclude' ? '✓ 绕过所选应用' : '绕过所选应用').id('networkAppExclude')
+                .constraintSize({ minHeight: 44, maxWidth: '100%' }).margin({ right: 8, bottom: 8 })
+                .fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving)
+                .onClick(() => { this.changeAppMode('exclude'); });
+              Button(this.appMode === 'include' ? '✓ 仅代理所选应用' : '仅代理所选应用').id('networkAppInclude')
+                .constraintSize({ minHeight: 44, maxWidth: '100%' }).margin({ right: 8, bottom: 8 })
+                .fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving)
+                .onClick(() => { this.changeAppMode('include'); });
+            }.width('100%');
+            Text(this.appMode === 'all' ? '所有应用进入 VPN。已有的应用选择会保留，当前不启用。' :
+              this.appMode === 'exclude' ? '所选应用直接使用系统网络，其他应用进入 VPN。' :
+                '只有所选应用进入 VPN，其他应用直接使用系统网络。')
+              .id('networkAppScopeHint').fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
+            Text('Harmony VPN 始终参与 VPN，用于本应用的连接检查。绕过的应用不使用下面的 DNS 和分流规则，其 IPv6 也不由本应用阻断。')
+              .fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
+            if (this.appMode !== 'all') {
+              Text(`已选择 ${this.appBundles.length} 个应用`).id('networkAppSelectedCount')
+                .fontSize(15).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
+              if (this.appBundles.length === 0) {
+                Text('请至少选择一个应用后保存。').id('networkAppEmptyHint').fontSize(13).fontColor($r('app.color.warning'));
+              }
+              ForEach(this.appBundles, (bundle: string) => {
+                Row({ space: 12 }) {
+                  Column({ space: 4 }) {
+                    Text(this.appName(bundle)).fontSize(16).fontColor($r('app.color.text_primary')).width('100%');
+                    Text(bundle).fontSize(12).fontColor($r('app.color.text_secondary')).width('100%');
+                  }.layoutWeight(1).alignItems(HorizontalAlign.Start);
+                  Button('移除').id('removeApp-' + bundle).constraintSize({ minHeight: 44 })
+                    .fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
+                    .enabled(this.editable && !this.confirmingLeave && !this.leaving)
+                    .onClick(() => { this.toggleApp(bundle, false); });
+                }.width('100%').padding(12).borderRadius(12).backgroundColor($r('app.color.surface_secondary'));
+              }, (bundle: string) => bundle);
+              Button(this.appPickerOpen ? '收起常见应用预设' : '选择常见应用预设').id('refreshAppCandidates')
+                .width('100%').constraintSize({ minHeight: 44 }).fontColor($r('app.color.accent'))
+                .backgroundColor($r('app.color.accent_soft'))
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving)
+                .onClick(() => { void this.refreshAppChoices(); });
+              Text('以下为常见鸿蒙应用的包名预设，不是已安装列表。请按本机实际安装情况选择；未安装或包名不匹配的项目不会生效。')
+                .fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
+              if (this.appPickerOpen) {
+                TextInput({ text: this.appSearch, placeholder: '搜索预设应用的名称或包名' }).id('appCandidateSearch')
+                  .enableKeyboardOnFocus(deviceInfo.deviceType !== '2in1').maxLength(128)
+                  .enabled(!this.confirmingLeave && !this.leaving)
+                  .fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.surface_secondary'))
+                  .onChange((value: string) => { this.appSearch = value; });
+                ForEach(this.visibleAppChoices(), (app: AppCandidate) => {
+                  Row({ space: 12 }) {
+                    Column({ space: 4 }) {
+                      Text(app.name).fontSize(16).fontColor($r('app.color.text_primary')).width('100%');
+                      Text(app.bundleName).fontSize(12).fontColor($r('app.color.text_secondary')).width('100%');
+                    }.layoutWeight(1).alignItems(HorizontalAlign.Start);
+                    Checkbox({ name: app.bundleName }).id('selectApp-' + app.bundleName).select(false)
+                      .selectedColor($r('app.color.accent'))
+                      .enabled(this.editable && !this.confirmingLeave && !this.leaving)
+                      .onChange((selected: boolean) => { this.toggleApp(app.bundleName, selected); });
+                  }.width('100%').padding(12).borderRadius(12).backgroundColor($r('app.color.surface_secondary'));
+                }, (app: AppCandidate) => app.bundleName);
+              }
+              Text('添加其他应用').fontSize(15).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
+              TextInput({ text: this.appInput, placeholder: '鸿蒙应用包名，例如 com.example.reader' }).id('appBundleInput')
+                .enableKeyboardOnFocus(deviceInfo.deviceType !== '2in1').maxLength(128)
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving)
+                .fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.surface_secondary'))
+                .onChange((value: string) => {
+                  if (value === this.appInput) { return; }
+                  this.appInput = value; this.appMessage = ''; this.draftChanged();
+                });
+              Button('添加到所选应用').id('addAppBundle').width('100%').constraintSize({ minHeight: 44 })
+                .fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving && this.appInput.trim().length > 0)
+                .onClick(() => { void this.addAppByBundle(); });
+              if (this.appMessage) {
+                Text(this.appMessage).id('appCandidatesResult').fontSize(13).fontColor($r('app.color.text_secondary')).width('100%');
+              }
+            }
+            if (this.appInput.length > 0) {
+              Button('清空待添加包名').id('clearAppBundleInput').constraintSize({ minHeight: 44, maxWidth: '100%' })
+                .fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving)
+                .onClick(() => { this.appInput = ''; this.appMessage = ''; this.draftChanged(); });
+            }
+          }.width('100%').padding(18).borderRadius(16).backgroundColor($r('app.color.surface'));
+          Column({ space: 12 }) {
+            Text('进入 VPN 后的流量规则').fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
             Flex({ wrap: FlexWrap.Wrap }) {
               Button(this.mode === 'global' ? '✓ 全部代理' : '全部代理').id('routingGlobal')
                 .constraintSize({ minHeight: 44, maxWidth: '100%' }).margin({ right: 8, bottom: 8 })
@@ -132,7 +291,7 @@ struct NetworkSettings {
                 .fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
                 .enabled(this.editable && !this.confirmingLeave && !this.leaving).onClick(() => { this.mode = 'rules'; this.draftChanged(); });
             }.width('100%');
-            Text('未匹配的 IPv4 流量使用当前节点；IPv6 继续阻断。全部代理模式保留但不启用下面的分流规则。')
+            Text('进入 VPN 的 IPv4 流量默认使用当前节点，IPv6 继续阻断。全部代理模式保留但不启用下面的域名/IP 分流规则。')
               .fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
             if (this.mode === 'rules') {
               Row({ space: 12 }) {

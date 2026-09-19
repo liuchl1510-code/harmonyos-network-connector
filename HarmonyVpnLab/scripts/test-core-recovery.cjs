@@ -10,7 +10,7 @@ const project = path.resolve(__dirname, '..');
 const etsRoot = path.join(project, 'entry/src/main/ets');
 const ts = require(path.join(process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio',
   'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
-const sourceNames = ['vpn/CoreProbe.ets', 'model/ConnectionConfig.ets', 'model/ConnectionSnapshot.ets', 'model/NodeBootstrap.ets', 'model/NetworkPolicy.ets'];
+const sourceNames = ['vpn/CoreProbe.ets', 'model/ConnectionConfig.ets', 'model/ConnectionSnapshot.ets', 'model/NodeBootstrap.ets', 'model/NetworkPolicy.ets', 'model/AppRouting.ets', 'model/ConnectionFailure.ets'];
 const sources = new Map(sourceNames.map(name => [name, fs.readFileSync(path.join(etsRoot, name), 'utf8')]));
 function deferred() { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; }
 async function flush() { for (let i = 0; i < 40; i++) await Promise.resolve(); }
@@ -39,7 +39,8 @@ function scenario() {
     return exported;
   }
   const bootstrap = load('model/NodeBootstrap.ets');
-  const policy = load('model/NetworkPolicy.ets', { './NodeBootstrap': bootstrap });
+  const apps = load('model/AppRouting.ets'), failures = load('model/ConnectionFailure.ets');
+  const policy = load('model/NetworkPolicy.ets', { './NodeBootstrap': bootstrap, './AppRouting': apps });
   const config = load('model/ConnectionConfig.ets', { './NodeBootstrap': bootstrap, './NetworkPolicy': policy });
   const snapshot = load('model/ConnectionSnapshot.ets');
   const native = {
@@ -94,12 +95,18 @@ function scenario() {
     '../model/NodeProfile': { readNodeProfile: () => { s.profileReads++; return { outboundJson: outbound }; } },
     '../model/NodeImport': { parseNode: value => ({ outboundJson: value }) }, '../model/ErrorInfo': { describeError: () => 'synthetic' },
     '../model/ConnectionConfig': config, '../model/ConnectionSnapshot': snapshot, '../model/NodeBootstrap': bootstrap,
-    '../model/NetworkPolicy': policy,
+    '../model/NetworkPolicy': policy, '../model/ConnectionFailure': failures,
     '@kit.NetworkKit': { http: { createHttp: () => { s.httpRequests++; throw new Error('Stats must not make an HTTP request'); } }, socket: {} }
   }).CoreProbe;
   s.probe = new CoreProbe(); s.context = { filesDir: '/synthetic' };
   s.pin = ip => new bootstrap.NodeBootstrap('node.example.test', ip);
   s.newPolicy = () => new policy.NetworkPolicy();
+  s.typedFailure = (stage, reason = 'failed') => error => {
+    assert.ok(error instanceof failures.ConnectionFailureError);
+    assert.ok(failures.validConnectionFailure(error.failure));
+    assert.equal(error.failure.stage, stage); assert.equal(error.failure.reason, reason);
+    return true;
+  };
   s.start = p => s.probe.startConnection(7000, s.context, async () => {}, s.pin('192.0.2.1'), outbound, p);
   s.resume = (ip = '192.0.2.2') => s.probe.resumeConnection(s.context, s.pin(ip));
   s.appendDiagnostics = () => { const name = '/synthetic/xray-connection-diagnostic.log';
@@ -130,7 +137,7 @@ test('three recoveries preserve Hev TUN ports credentials duration and cumulativ
     const before = await s.probe.readConnectionSnapshot();
     assert.equal(before.uplink, up + 11 * i); assert.equal(before.downlink, down + 13 * i);
     await s.probe.suspendConnection(); await s.probe.suspendConnection();
-    await assert.rejects(s.probe.readConnectionSnapshot(), { message: '持续连接核心已暂停' });
+    await assert.rejects(s.probe.readConnectionSnapshot(), s.typedFailure('status'));
     up += 11 * i; down += 13 * i; s.clock += 500;
     await s.resume('192.0.2.' + (i + 1));
     const after = await s.probe.readConnectionSnapshot();
@@ -201,7 +208,7 @@ test('late native counters cannot revive a snapshot from the previous epoch', as
 });
 test('dead Hev refuses recovery without restarting it', async () => {
   const s = scenario(); await s.start(); await s.probe.suspendConnection(); s.hev = false;
-  await assert.rejects(s.resume(), { message: 'Hev 转发已停止，需要重新连接' });
+  await assert.rejects(s.resume(), s.typedFailure('forwarding'));
   assert.equal(count(s, 'start'), 1); assert.equal(s.calls.filter(Array.isArray).length, 1); await s.probe.stop();
 });
 test('protection completion is awaited asynchronously before resume', async () => {
@@ -234,7 +241,7 @@ test('wrong bootstrap cannot replace the frozen selected node', async () => {
 });
 test('late native stats completion after final stop cannot expose the previous core counters', async () => {
   const s = scenario(); await s.start(); s.count = { uplink: 120, downlink: 230 }; s.statsGate = deferred();
-  const rejected = assert.rejects(s.probe.readCounters(), { message: 'Xray 流量统计读取已失效' });
+  const rejected = assert.rejects(s.probe.readCounters(), s.typedFailure('status'));
   await flush(); await s.probe.stop(); s.statsGate.resolve(); await rejected;
   const before = count(s, 'stats'); await assert.rejects(s.probe.readCounters());
   assert.equal(count(s, 'stats'), before); assert.equal(s.httpRequests, 0);
@@ -258,6 +265,7 @@ test('socket protection timeout uses monotonic uptime despite repeated wall-cloc
   for (const item of tests) { await item.fn(); results.push({ name: item.name, passed: true }); console.log('PASS ' + item.name); }
   const record = { createdAtUtc: new Date().toISOString(), mode: 'authored CoreProbe with synthetic SDK/native adapters',
     realNetwork: false, realPhone: false, privateFilesRead: false, passed: results.length, tests: results,
+    testSourceSHA256: crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex'),
     sources: Object.fromEntries(sourceNames.map(name => [name, crypto.createHash('sha256').update(sources.get(name)).digest('hex')])) };
   const output = path.join(project, 'build/core-recovery-verification.json');
   fs.mkdirSync(path.dirname(output), { recursive: true }); fs.writeFileSync(output, JSON.stringify(record, null, 2) + '\n');

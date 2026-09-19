@@ -17,6 +17,7 @@ import { useSideNavigation, primaryContentWidth, formContentWidth, homeUsesColum
 import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
 import { readNetworkPolicy } from '../model/NetworkPolicyStore';
 import { networkPolicyLabel } from '../model/NetworkPolicy';
+import { appRoutingLabel } from '../model/AppRouting';
 import { TransferRateTracker, formatTransferRate } from '../model/TransferRate';
 import { readConnectionLifecycle } from '../model/ConnectionLifecycle';
 import { recordConnectionRecovery } from '../model/ConnectionRecoveryStore';
@@ -195,8 +196,9 @@ struct Home {
 
   private refreshNetworkSummary(): void {
     try {
-      this.routingSummary = networkPolicyLabel(readNetworkPolicy(this.context().filesDir));
-      this.routingHint = 'DNS 通过节点加密查询';
+      const policy = readNetworkPolicy(this.context().filesDir);
+      this.routingSummary = appRoutingLabel(policy.appMode, policy.appBundles.length);
+      this.routingHint = networkPolicyLabel(policy) + ' · VPN 内 DNS 通过节点查询';
     } catch (_) {
       this.routingSummary = '网络设置需要检查';
       this.routingHint = '打开设置并重新保存后再连接';

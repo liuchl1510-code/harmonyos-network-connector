@@ -11,7 +11,7 @@ const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
 const names = ['model/ConnectionFailure.ets', 'model/ConnectionControl.ets', 'model/ConnectionSnapshot.ets', 'model/ConnectionNotification.ets', 'model/TransferRate.ets',
   'model/ProbeState.ets', 'model/ConnectionLifecycle.ets', 'model/NodeEditGuard.ets', 'model/NodeBootstrap.ets', 'model/NodeIssue.ets',
-  'model/NodeImport.ets', 'model/NodePreflight.ets', 'model/NetworkPolicy.ets', 'model/VpnAuthorization.ets', 'vpn/VpnProbeAbility.ets', 'pages/Home.ets', 'pages/Index.ets'];
+  'model/NodeImport.ets', 'model/NodePreflight.ets', 'model/AppRouting.ets', 'model/NetworkPolicy.ets', 'model/VpnAuthorization.ets', 'vpn/VpnProbeAbility.ets', 'pages/Home.ets', 'pages/Index.ets'];
 const sources = new Map(names.map(name => [name, fs.readFileSync(path.join(root, 'entry/src/main/ets', name), 'utf8')]));
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 async function flush() { for (let i = 0; i < 35; i++) await Promise.resolve(); }
@@ -24,7 +24,8 @@ function scenario(options = {}) {
     publish: [], cancel: [], transfer: 0, ipv6Datagrams: 0, partialWrites: 0, processAliveQueries: [],
     observerCreate: 0, observerOn: 0, observerOff: 0, coreConstruct: 0, coreSuspend: 0, coreResume: 0,
     coreStartArgs: [], coreResumeArgs: [], snapshot: 0, protect: [], networkRead: 0, dns: [], watcherStart: 0, watcherStop: 0,
-    commandWrites: [], resourceReads: [], recoveryObservations: [], vpnStarts: [], journal: [] };
+    commandWrites: [], resourceReads: [], recoveryObservations: [], vpnStarts: [], journal: [], policyRead: 0, connectionConstruct: 0,
+    createdConfigs: [] };
   class PhysicalNetwork {
     constructor(netId = 100, kind = 'wifi', key = `${netId}/${kind}/synthetic`) { Object.assign(this, { netId, kind, key }); }
   }
@@ -78,7 +79,7 @@ function scenario(options = {}) {
     },
     url: { URL: { parseURL: value => new URL(value) } },
     recordConnectionRecovery: (_, value) => { calls.recoveryObservations.push(value); if (options.recoveryWriteThrows) throw new Error('synthetic recovery write failure'); },
-    readNetworkPolicy: () => options.readNetworkPolicy ? options.readNetworkPolicy() : undefined,
+    readNetworkPolicy: () => { calls.policyRead++; return options.readNetworkPolicy ? options.readNetworkPolicy() : new shared.NetworkPolicy(); },
     nodeServerAddress: node => JSON.parse(node.outboundJson).settings.vnext[0].address,
     PhysicalNetwork, PhysicalNetworkWatcher: class {
       async start(listener) { calls.watcherStart++; physical.listener = listener; if (options.watcherStart) await options.watcherStart(); }
@@ -125,6 +126,7 @@ function scenario(options = {}) {
   Object.assign(shared, load('model/NodeIssue.ets'));
   Object.assign(shared, load('model/NodeImport.ets'));
   Object.assign(shared, load('model/NodePreflight.ets'));
+  Object.assign(shared, load('model/AppRouting.ets'));
   Object.assign(shared, load('model/NetworkPolicy.ets'));
   const notificationManager = {
     isNotificationEnabled: () => options.notificationEnabled ? options.notificationEnabled() : Promise.resolve(true),
@@ -145,11 +147,11 @@ function scenario(options = {}) {
     logNodeTraffic: async () => {}, readConnectionSnapshot: () => { calls.snapshot++; return options.snapshot ? options.snapshot() : Promise.resolve(snapshot); },
     diagnosticSummary: '', detectOutboundLoop: () => false };
   const connection = { protectProcessNet: async () => { if (options.protectProcessNet) await options.protectProcessNet(); }, protect: async fd => { calls.protect.push(fd); if (options.protect) await options.protect(fd); },
-    create: () => { calls.create++; return options.create ? options.create() : Promise.resolve(7000); },
+    create: config => { calls.create++; calls.createdConfigs.push(JSON.parse(JSON.stringify(config))); return options.create ? options.create() : Promise.resolve(7000); },
     destroy: async () => { calls.destroy++; if (options.destroy) await options.destroy(); } };
   let service;
   let authorizationCallback;
-  const vpnExtension = { createVpnConnection: () => connection,
+  const vpnExtension = { createVpnConnection: () => { calls.connectionConstruct++; return connection; },
     startVpnExtensionAbility: async want => { calls.vpnStarts.push(want); if (options.startVpnRequest) await options.startVpnRequest(want); },
     stopVpnExtensionAbility: async () => { calls.serviceStop++; if (options.autoDestroy !== false) service?.onDestroy(); },
     createVpnObserver: () => {
@@ -212,6 +214,86 @@ function test(name, body) { tests.push({ name, body }); }
 async function settleFailedService(s) {
   await s.service.initialization; await flush(); if (s.service.cleanup) await s.service.cleanup; await flush();
 }
+function appPolicy(appMode = 'all', appBundles = []) {
+  return { schemaVersion: 2, mode: 'global', bypassLan: false, direct: [], proxy: [], block: [],
+    dnsUrl: 'https://1.1.1.1/dns-query', appMode, appBundles };
+}
+for (const mode of ['all', 'exclude', 'include']) test('service uses native ' + mode + ' application scope with the same core policy snapshot', async () => {
+  const policy = appPolicy(mode, ['com.example.browser']);
+  policy.mode = 'rules'; policy.direct = ['example.com'];
+  const s = scenario({ readNetworkPolicy: () => policy }); await s.launch();
+  assert.equal(s.calls.policyRead, 1); assert.equal(s.calls.create, 1);
+  const config = s.calls.createdConfigs[0], corePolicy = s.calls.coreStartArgs[0][5];
+  assert.equal(corePolicy.appMode, mode); assert.deepEqual(Array.from(corePolicy.appBundles), ['com.example.browser']);
+  assert.equal(corePolicy.mode, 'rules'); assert.deepEqual(Array.from(corePolicy.direct), ['domain:example.com']);
+  assert.equal(corePolicy, s.service.connectionPolicy); assert.notEqual(corePolicy, policy);
+  assert.ok(s.service.connectionDetail().includes(s.shared.appRoutingLabel(mode, 1)));
+  assert.ok(s.service.connectionDetail().includes('纳入 VPN 的 IPv6 请求暂不转发'));
+  if (mode === 'include') {
+    assert.deepEqual(config.trustedApplications, ['com.example.harmonyvpnlab', 'com.example.browser']);
+    assert.equal(config.blockedApplications, undefined);
+  } else if (mode === 'exclude') {
+    assert.deepEqual(config.blockedApplications, ['com.example.browser']); assert.equal(config.trustedApplications, undefined);
+  } else { assert.equal(config.trustedApplications, undefined); assert.equal(config.blockedApplications, undefined); }
+  await s.service.requestStop(false); await flush();
+});
+test('legacy service policy is upgraded in memory before VPN creation', async () => {
+  const saved = appPolicy(); delete saved.appMode; delete saved.appBundles; saved.schemaVersion = 1;
+  const before = JSON.stringify(saved), s = scenario({ readNetworkPolicy: () => saved }); await s.launch();
+  assert.equal(s.service.connectionPolicy.schemaVersion, 2); assert.equal(s.service.connectionPolicy.appMode, 'all');
+  assert.equal(s.calls.createdConfigs[0].trustedApplications, undefined); assert.equal(JSON.stringify(saved), before);
+  await s.service.requestStop(false); await flush();
+});
+for (const [name, value] of [
+  ['empty include', appPolicy('include')], ['empty exclude', appPolicy('exclude')],
+  ['own exclusion', appPolicy('exclude', ['com.example.harmonyvpnlab'])],
+  ['invalid bundle', appPolicy('include', ['private/secret'])],
+  ['oversized list', appPolicy('include', Array(256).fill('com.example.browser'))],
+  ['unknown schema', { ...appPolicy(), schemaVersion: 9 }], ['missing policy', undefined]
+]) test(name + ' fails before creating a VPN connection or physical watcher', async () => {
+  const s = scenario({ readNetworkPolicy: () => value });
+  s.service.onCreate({ parameters: s.prepare() }); await settleFailedService(s);
+  assert.equal(s.calls.connectionConstruct, 0); assert.equal(s.calls.create, 0); assert.equal(s.calls.watcherStart, 0);
+  assert.equal(s.calls.coreStart, 0); assert.equal(s.status().failure.stage, 'configuration');
+  assert.equal(s.status().cleanupConfirmed, true); assert.equal(s.status().phase, 'destroyed');
+  assert.equal(s.calls.rawCloses.length, 0); assert(!JSON.stringify(s.status()).includes('secret'));
+});
+test('unreadable policy fails before TUN construction and preserves configuration failure', async () => {
+  const s = scenario({ readNetworkPolicy: () => { throw Error('private policy read error'); } });
+  s.service.onCreate({ parameters: s.prepare() }); await settleFailedService(s);
+  assert.equal(s.calls.connectionConstruct, 0); assert.equal(s.calls.create, 0); assert.equal(s.calls.coreStart, 0);
+  assert.equal(s.status().failure.stage, 'configuration'); assert.equal(s.status().cleanupConfirmed, true);
+});
+test('app test stays self-only and never reads broken daily application settings', async () => {
+  const s = scenario({ readNetworkPolicy: () => { assert.fail('temporary test must not read daily policy'); } });
+  s.service.onCreate({ parameters: s.prepare('run-one', 'starting', 'connection-app-test') });
+  await s.service.initialization; await flush();
+  assert.equal(s.calls.policyRead, 0); assert.equal(s.service.failure, '');
+  assert.deepEqual(s.calls.createdConfigs[0].trustedApplications, ['com.example.harmonyvpnlab']);
+  assert.equal(s.calls.createdConfigs[0].blockedApplications, undefined); assert.equal(s.calls.coreStartArgs[0][5], undefined);
+  await s.service.requestStop(false); await flush();
+});
+test('policy mutations while VPN creation is pending cannot drift the captured scope or core policy', async () => {
+  const gate = deferred(), saved = appPolicy('include', ['com.example.browser']);
+  saved.mode = 'rules'; saved.direct = ['example.com'];
+  const s = scenario({ readNetworkPolicy: () => saved, create: () => gate.promise });
+  s.service.onCreate({ parameters: s.prepare() }); await flush(); assert.equal(s.calls.create, 1);
+  saved.appMode = 'exclude'; saved.appBundles[0] = 'com.example.changed'; saved.direct[0] = 'changed.example.com';
+  saved.dnsUrl = 'https://8.8.8.8/dns-query';
+  gate.resolve(7000); await s.service.initialization; await flush();
+  const captured = s.calls.coreStartArgs[0][5];
+  assert.equal(captured.appMode, 'include'); assert.deepEqual(Array.from(captured.appBundles), ['com.example.browser']);
+  assert.deepEqual(Array.from(captured.direct), ['domain:example.com']); assert.equal(captured.dnsUrl, 'https://1.1.1.1/dns-query');
+  assert.deepEqual(s.calls.createdConfigs[0].trustedApplications, ['com.example.harmonyvpnlab', 'com.example.browser']);
+  assert.equal(s.calls.policyRead, 1);
+  assert.ok(s.service.connectionDetail().includes('仅代理所选应用（1）'));
+  assert.ok(!s.service.connectionDetail().includes('绕过所选应用'));
+  s.physical.current = new s.shared.PhysicalNetwork(101, 'cellular');
+  await s.service.refreshDesiredNetwork(); await s.service.runNetworkTransition(); await flush();
+  assert.equal(s.calls.coreResume, 1); assert.equal(s.calls.create, 1); assert.equal(s.calls.policyRead, 1);
+  assert.equal(s.service.connectionPolicy, captured); assert.equal(captured.appMode, 'include');
+  await s.service.requestStop(false); await flush();
+});
 for (const [name, options, stage] of [
   ['VPN process protection', { protectProcessNet: async () => { throw Error('private secret'); } }, 'vpn-init'],
   ['VPN creation', { create: async () => { throw Error('private secret'); } }, 'vpn-create'],
@@ -519,11 +601,17 @@ test('Home primary action preserves request and preview-core guards', async () =
 });
 
 test('Home network summary refreshes saved preferences without changing the session', async () => {
-  let policy = { mode: 'global', bypassLan: false }; const s = scenario({ readNetworkPolicy: () => policy });
+  let policy = appPolicy(); const s = scenario({ readNetworkPolicy: () => policy });
   s.activate(); const writes = s.calls.commandWrites.length;
-  s.home.onPageShow(); assert.equal(s.home.routingSummary, '全部代理');
-  policy = { mode: 'rules', bypassLan: true }; s.home.onPageShow();
-  assert.equal(s.home.routingSummary, '规则分流 · 绕过局域网'); assert.equal(s.calls.commandWrites.length, writes);
+  s.home.onPageShow(); assert.equal(s.home.routingSummary, '全部应用');
+  assert.equal(s.home.routingHint, '全部代理 · VPN 内 DNS 通过节点查询');
+  policy = { ...appPolicy('exclude', ['com.example.browser']), mode: 'rules', bypassLan: true }; s.home.onPageShow();
+  assert.equal(s.home.routingSummary, '绕过所选应用（1）');
+  assert.equal(s.home.routingHint, '规则分流 · 绕过局域网 · VPN 内 DNS 通过节点查询');
+  policy = appPolicy('include', ['com.example.browser', 'com.example.mail']); s.home.onPageShow();
+  assert.equal(s.home.routingSummary, '仅代理所选应用（2）');
+  assert.equal(s.home.routingHint, '全部代理 · VPN 内 DNS 通过节点查询');
+  assert.equal(s.calls.commandWrites.length, writes);
   assert.equal(s.calls.create, 0); assert.equal(s.calls.serviceStop, 0);
 });
 

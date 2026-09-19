@@ -36,6 +36,7 @@ const importCode = compile('model/NodeImport.ets');
 const bootstrapCode = compile('model/NodeBootstrap.ets');
 const preflightCode = compile('model/NodePreflight.ets');
 const failureCode = compile('model/ConnectionFailure.ets');
+const appRoutingCode = compile('model/AppRouting.ets');
 function execute(code, imports = {}, extra = {}) {
   const context = { exports: {}, require(name) { assert(Object.hasOwn(imports, name), name); return imports[name]; }, ...extra };
   vm.runInNewContext(code, context);
@@ -221,7 +222,8 @@ function homeHarness() {
     '../model/VpnAuthorization': { subscribeVpnAuthorization: () => 10, unsubscribeVpnAuthorization() {} },
     '../model/PhysicalNetwork': {}, '../model/MainNavigation': {},
     '../model/BuildCapabilities': { VPN_CORE_AVAILABLE: true },
-    '../model/NetworkPolicyStore': { readNetworkPolicy: () => ({}) },
+    '../model/NetworkPolicyStore': { readNetworkPolicy: () => ({ appMode: 'all', appBundles: [] }) },
+    '../model/AppRouting': execute(appRoutingCode),
     '../model/NetworkPolicy': { networkPolicyLabel: () => '全部代理' }, '../model/TransferRate': rates
   };
   imports['../model/ConnectionLifecycle'] = execute(lifecycleCode, {
