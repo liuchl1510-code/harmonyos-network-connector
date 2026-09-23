@@ -92,6 +92,7 @@ function scenario() {
     '@kit.BasicServicesKit': { systemDateTime: { TimeType: { STARTUP: 0 }, getUptime: () => s.clock } },
     '@kit.PerformanceAnalysisKit': { hilog: { info: (...args) => s.logs.push(args), error: () => {} } },
     '@kit.CoreFileKit': { fileIo }, './CaBundle': { prepareCaBundle: async () => '/synthetic/ca.pem' },
+    './RoutingAssets': { prepareRoutingAssets: async context => { assert.equal(context.filesDir, '/synthetic'); s.calls.push('assets'); } },
     '../model/NodeProfile': { readNodeProfile: () => { s.profileReads++; return { outboundJson: outbound }; } },
     '../model/NodeImport': { parseNode: value => ({ outboundJson: value }) }, '../model/ErrorInfo': { describeError: () => 'synthetic' },
     '../model/ConnectionConfig': config, '../model/ConnectionSnapshot': snapshot, '../model/NodeBootstrap': bootstrap,
@@ -126,6 +127,19 @@ test('routing and DNS freeze at start and survive recovery despite caller mutati
   assert.equal(s.configs[1].dns.servers[0].address, first.dns.servers[0].address);
   assert.deepEqual(s.configs[1].routing, first.routing);
   assert.equal(s.configs[1].inbounds[0].sniffing.routeOnly, true);
+  await s.probe.stop();
+});
+test('verified whitelist and DNS survive recovery without rereading assets or adopting caller edits', async () => {
+  const s = scenario(), p = s.newPolicy(); p.mode = 'whitelist'; p.dnsUrl = 'https://dns.example.test/dns-query';
+  await s.start(p); const first = s.configs[0];
+  assert.equal(count(s, 'assets'), 1); assert(s.calls.indexOf('assets') < s.calls.indexOf('ca'));
+  assert(first.routing.rules.some(rule => rule.domain?.includes('geosite:cn')));
+  p.mode = 'global'; p.dnsUrl = 'https://1.1.1.1/dns-query';
+  await s.probe.suspendConnection(); await s.resume();
+  assert.deepEqual(s.configs[1].routing, first.routing);
+  assert.deepEqual(s.configs[1].dns.servers, first.dns.servers);
+  assert.equal(count(s, 'assets'), 1); assert.equal(count(s, 'start'), 2);
+  assert.equal(s.configs[1].inbounds[0].sniffing.routeOnly, true); assert.equal(s.httpRequests, 0);
   await s.probe.stop();
 });
 test('three recoveries preserve Hev TUN ports credentials duration and cumulative traffic', async () => {

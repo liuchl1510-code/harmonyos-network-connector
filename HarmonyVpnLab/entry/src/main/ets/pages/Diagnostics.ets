@@ -1,6 +1,6 @@
 import { common } from '@kit.AbilityKit';
-import { DiagnosticEvent, readDiagnosticEvents } from '../model/DiagnosticJournal';
-import { readConnectionRecoveries } from '../model/ConnectionRecoveryStore';
+import { DiagnosticEvent, inspectDiagnosticEvents } from '../model/DiagnosticJournal';
+import { inspectConnectionRecoveries } from '../model/ConnectionRecoveryStore';
 import { readConnectionLifecycle } from '../model/ConnectionLifecycle';
 import { formContentWidth } from '../model/AdaptiveLayout';
 import { ConnectionFailure, failureFromDiagnosticEvent, failureStageLabel, failureProblem, failureSuggestion } from '../model/ConnectionFailure';
@@ -17,6 +17,8 @@ struct Diagnostics {
   @State serviceFailure: ConnectionFailure | undefined = undefined;
   @State cleanupFailure: ConnectionFailure | undefined = undefined;
   @State currentIssue: ConnectionFailure | undefined = undefined;
+  @State recordsUnavailable: boolean = false;
+  @State openingSummary: boolean = false;
 
   private context(): common.UIAbilityContext { return this.getUIContext().getHostContext() as common.UIAbilityContext; }
   onPageShow(): void { this.reload(); }
@@ -25,14 +27,27 @@ struct Diagnostics {
     const filesDir = this.context().filesDir;
     const events: DiagnosticEvent[] = [];
     const messages: string[] = [];
+    this.recordsUnavailable = false;
     try {
-      for (const event of readDiagnosticEvents(filesDir)) { events.push(event); }
-    } catch (_) { messages.push('服务诊断记录暂时无法读取，请稍后刷新。'); }
+      const journal = inspectDiagnosticEvents(filesDir);
+      for (const event of journal.events) { events.push(event); }
+      if (journal.status === 'invalid') {
+        this.recordsUnavailable = true; messages.push('服务诊断记录格式异常，原记录已保留。');
+      } else if (journal.status === 'unreadable') {
+        this.recordsUnavailable = true; messages.push('服务诊断记录暂时无法读取，请稍后刷新。');
+      }
+    } catch (_) { this.recordsUnavailable = true; messages.push('服务诊断记录暂时无法读取，请稍后刷新。'); }
     try {
-      for (const observation of readConnectionRecoveries(filesDir)) {
+      const recovery = inspectConnectionRecoveries(filesDir);
+      for (const observation of recovery.observations) {
         events.push(new DiagnosticEvent(observation.at, observation.runId, 'service-exit-observed', '', 0));
       }
-    } catch (_) { messages.push('恢复观察记录暂时无法读取，原记录已保留。'); }
+      if (recovery.status === 'invalid') {
+        this.recordsUnavailable = true; messages.push('恢复观察记录格式异常，原记录已保留。');
+      } else if (recovery.status === 'unreadable') {
+        this.recordsUnavailable = true; messages.push('恢复观察记录暂时无法读取，原记录已保留。');
+      }
+    } catch (_) { this.recordsUnavailable = true; messages.push('恢复观察记录暂时无法读取，原记录已保留。'); }
     this.events = events.sort((left: DiagnosticEvent, right: DiagnosticEvent) => right.at - left.at);
     this.message = messages.join(' ');
     try {
@@ -52,6 +67,14 @@ struct Diagnostics {
       this.connectionLabel = '状态暂不可用'; this.connectionHint = '请稍后刷新，或返回首页查看。';
       this.serviceFailure = undefined; this.cleanupFailure = undefined; this.currentIssue = undefined;
     }
+  }
+
+  private async openSummary(): Promise<void> {
+    if (this.openingSummary) { return; }
+    this.openingSummary = true;
+    try { await this.getUIContext().getRouter().pushUrl({ url: 'pages/DiagnosticSummary' }); }
+    catch (_) { this.message = '诊断摘要暂时无法打开，请重试。'; }
+    finally { this.openingSummary = false; }
   }
 
   private phaseLabel(phase: string): string {
@@ -159,6 +182,11 @@ struct Diagnostics {
             Button('刷新记录').id('refreshDiagnosticJournal').width('100%').constraintSize({ minHeight: 48 })
               .fontSize(16).fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
               .onClick(() => { this.reload(); });
+            Button('预览诊断摘要').id('openDiagnosticSummary').width('100%').constraintSize({ minHeight: 48 })
+              .fontSize(16).fontColor($r('app.color.on_accent')).backgroundColor($r('app.color.accent'))
+              .enabled(!this.openingSummary).onClick(() => { void this.openSummary(); });
+            Text('整理可分享的记录，先预览再复制或保存。').fontSize(13).lineHeight('21fp')
+              .fontColor($r('app.color.text_secondary')).width('100%');
           }.width('100%').padding(20).alignItems(HorizontalAlign.Start)
             .backgroundColor($r('app.color.surface')).borderRadius(20)
             .border({ width: 1, color: $r('app.color.border') });
@@ -180,9 +208,10 @@ struct Diagnostics {
           }
           if (this.events.length === 0) {
             Column({ space: 10 }) {
-              Text('还没有可展示的事件').fontSize(18).fontWeight(FontWeight.Medium)
+              Text(this.recordsUnavailable ? '记录暂不可用' : '暂无可展示的记录').fontSize(18).fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.text_primary'));
-              Text('连接、断开或检测延迟后，可点击“刷新记录”查看。')
+              Text(this.recordsUnavailable ? '无法完整读取记录，请刷新后重试；这不表示连接没有发生问题。' :
+                '连接、断开或检测延迟后，可点击“刷新记录”查看。记录为空不代表连接一定正常。')
                 .fontSize(14).fontColor($r('app.color.text_secondary'));
             }.id('diagnosticEmptyState').width('100%').padding(24).alignItems(HorizontalAlign.Start)
               .backgroundColor($r('app.color.surface')).borderRadius(20)

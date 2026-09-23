@@ -135,6 +135,13 @@ struct NetworkSettings {
     this.appMode = mode; this.draftChanged();
   }
 
+  private changeRoutingMode(mode: string): void {
+    this.refreshEditable();
+    if (!this.editable || this.confirmingLeave || this.leaving ||
+      !['global', 'whitelist', 'rules'].includes(mode)) { return; }
+    this.mode = mode; this.draftChanged();
+  }
+
   private appName(bundle: string): string {
     return COMMON_APP_CANDIDATES.find((app: AppCandidate) => app.bundleName === bundle)?.name ?? bundle;
   }
@@ -281,18 +288,39 @@ struct NetworkSettings {
           }.width('100%').padding(18).borderRadius(16).backgroundColor($r('app.color.surface'));
           Column({ space: 12 }) {
             Text('进入 VPN 后的流量规则').fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
-            Flex({ wrap: FlexWrap.Wrap }) {
-              Button(this.mode === 'global' ? '✓ 全部代理' : '全部代理').id('routingGlobal')
-                .constraintSize({ minHeight: 44, maxWidth: '100%' }).margin({ right: 8, bottom: 8 })
-                .fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
-                .enabled(this.editable && !this.confirmingLeave && !this.leaving).onClick(() => { this.mode = 'global'; this.draftChanged(); });
-              Button(this.mode === 'rules' ? '✓ 规则分流' : '规则分流').id('routingRules')
-                .constraintSize({ minHeight: 44, maxWidth: '100%' }).margin({ right: 8, bottom: 8 })
-                .fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
-                .enabled(this.editable && !this.confirmingLeave && !this.leaving).onClick(() => { this.mode = 'rules'; this.draftChanged(); });
+            Column({ space: 8 }) {
+              Button({ type: ButtonType.Normal }) {
+                Text(this.mode === 'global' ? '✓ 全部代理' : '全部代理').fontSize(16).width('100%')
+                  .fontColor(this.mode === 'global' ? $r('app.color.accent') : $r('app.color.text_primary'));
+              }.id('routingGlobal').width('100%').constraintSize({ minHeight: 48 }).padding(14).borderRadius(12)
+                .backgroundColor(this.mode === 'global' ? $r('app.color.accent_soft') : $r('app.color.surface_secondary'))
+                .accessibilityText('全部代理，' + (this.mode === 'global' ? '已选择' : '未选择'))
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving).onClick(() => { this.changeRoutingMode('global'); });
+              Button({ type: ButtonType.Normal }) {
+                Text(this.mode === 'whitelist' ? '✓ 白名单（绕过大陆）' : '白名单（绕过大陆）').fontSize(16).width('100%')
+                  .fontColor(this.mode === 'whitelist' ? $r('app.color.accent') : $r('app.color.text_primary'));
+              }.id('routingWhitelist').width('100%').constraintSize({ minHeight: 48 }).padding(14).borderRadius(12)
+                .backgroundColor(this.mode === 'whitelist' ? $r('app.color.accent_soft') : $r('app.color.surface_secondary'))
+                .accessibilityText('白名单（绕过大陆），' + (this.mode === 'whitelist' ? '已选择' : '未选择'))
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving).onClick(() => { this.changeRoutingMode('whitelist'); });
+              Button({ type: ButtonType.Normal }) {
+                Text(this.mode === 'rules' ? '✓ 自定义规则' : '自定义规则').fontSize(16).width('100%')
+                  .fontColor(this.mode === 'rules' ? $r('app.color.accent') : $r('app.color.text_primary'));
+              }.id('routingRules').width('100%').constraintSize({ minHeight: 48 }).padding(14).borderRadius(12)
+                .backgroundColor(this.mode === 'rules' ? $r('app.color.accent_soft') : $r('app.color.surface_secondary'))
+                .accessibilityText('自定义规则，' + (this.mode === 'rules' ? '已选择' : '未选择'))
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving).onClick(() => { this.changeRoutingMode('rules'); });
             }.width('100%');
-            Text('进入 VPN 的 IPv4 流量默认使用当前节点，IPv6 继续阻断。全部代理模式保留但不启用下面的域名/IP 分流规则。')
+            Text('分流只作用于上方应用范围内进入 VPN 的 IPv4 流量；IPv6 继续阻断。切换模式会保留已有的自定义规则。')
               .fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
+            if (this.mode === 'global') {
+              Text('所有进入 VPN 的流量通过当前节点，不启用白名单或自定义规则。')
+                .id('routingGlobalHint').fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
+            }
+            if (this.mode === 'whitelist') {
+              Text('按 v2rayN 内置白名单分流：中国大陆及局域网条目直连，其余代理；内置例外规则优先。此模式不启用自定义列表，DNS 仍使用下方的 HTTPS DNS 设置。')
+                .id('routingWhitelistHint').fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
+            }
             if (this.mode === 'rules') {
               Row({ space: 12 }) {
                 Text('绕过局域网').layoutWeight(1).fontColor($r('app.color.text_primary'));

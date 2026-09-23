@@ -93,6 +93,39 @@ add('valid save normalizes rules, resets dirty state and absorbs repeated clicks
   assert.equal(f.page.direct, 'domain:example.com\n192.0.2.0/24'); assert.match(f.page.message, /已保存/);
   const message = f.page.message; f.page.save(); assert.equal(f.state.writes, 1); assert.equal(f.page.message, message);
 });
+add('actual whitelist selection and exact undo preserve the clean global default', () => {
+  const f = fixture(); assert.equal(f.page.mode, 'global');
+  pageEvent(f, 'routingWhitelist', 'onClick'); assert.equal(f.page.mode, 'whitelist'); assert.equal(f.page.dirty, true);
+  pageEvent(f, 'routingGlobal', 'onClick'); assert.equal(f.page.mode, 'global'); assert.equal(f.page.dirty, false);
+  assert.equal(f.state.writes, 0);
+});
+for (const appMode of ['all', 'include', 'exclude']) {
+  add('whitelist save and reopening retain custom rules, DNS and ' + appMode + ' app scope', () => {
+    const value = appPolicy(appMode); value.mode = 'rules'; value.bypassLan = true;
+    value.direct = ['domain:direct.example.com']; value.proxy = ['domain:proxy.example.com'];
+    value.block = ['full:blocked.example.com']; value.dnsUrl = 'https://dns.example.com/query';
+    const f = fixture({ value }); pageEvent(f, 'routingWhitelist', 'onClick'); f.page.save();
+    assert.equal(f.state.writes, 1); assert.equal(f.page.dirty, false);
+    assert.deepEqual(clone(f.state.value), { ...clone(value), mode: 'whitelist' });
+    f.page.aboutToDisappear(); f.page.aboutToAppear(); assert.equal(f.page.mode, 'whitelist');
+    assert.equal(f.page.direct, value.direct.join('\n')); assert.equal(f.page.bypassLan, true);
+    pageEvent(f, 'routingRules', 'onClick'); f.page.save();
+    assert.equal(f.state.writes, 2); assert.deepEqual(clone(f.state.value), clone(value));
+  });
+}
+for (const id of ['routingGlobal', 'routingWhitelist', 'routingRules']) {
+  for (const denial of ['connection', 'confirmation', 'leaving', 'guard-error']) {
+    add('queued ' + id + ' click cannot change the draft during ' + denial, () => {
+      const f = fixture(); const previous = f.page.snapshot();
+      if (denial === 'connection') f.state.allowed = false;
+      if (denial === 'confirmation') f.page.confirmingLeave = true;
+      if (denial === 'leaving') f.page.leaving = true;
+      if (denial === 'guard-error') f.state.guardFailure = true;
+      pageEvent(f, id, 'onClick'); assert.equal(f.page.snapshot(), previous);
+      assert.equal(f.page.dirty, false); assert.equal(f.state.writes, 0); privateSafe(f.page.message);
+    });
+  }
+}
 for (const [field, value] of [['direct', 'https://invalid.example.com'], ['dnsUrl', 'http://dns.example.com/query']]) {
   add(field + ' validation failure preserves raw draft and old policy', () => {
     const f = fixture(), previous = clone(f.state.value); f.change(field, value); f.page.save();
@@ -410,7 +443,7 @@ function enabledBinding(idNode, ast) {
 add('actual NetworkSettings controls freeze during confirmation and footer stays outside scroll', () => {
   const { ast, ids } = parsePage('pages/NetworkSettings.ets');
   const state = { editable: true, dirty: true, needsRepair: false, confirmingLeave: false, leaving: false };
-  for (const id of ['routingGlobal', 'routingRules', 'bypassLan', 'routingDirect', 'routingProxy', 'routingBlock', 'dnsUrl', 'resetDns', 'saveNetworkSettings']) {
+  for (const id of ['routingGlobal', 'routingWhitelist', 'routingRules', 'bypassLan', 'routingDirect', 'routingProxy', 'routingBlock', 'dnsUrl', 'resetDns', 'saveNetworkSettings']) {
     const enabled = enabledBinding(ids.get(id), ast); assert.equal(enabled.call(state), true, id);
     for (const denied of [{ confirmingLeave: true }, { leaving: true }, { editable: false }]) assert.equal(enabled.call({ ...state, ...denied }), false, id);
   }
@@ -421,6 +454,24 @@ add('actual NetworkSettings controls freeze during confirmation and footer stays
   const saveParents = parents(ids.get('saveNetworkSettings')), messageParents = parents(ids.get('networkSettingsResult'));
   assert.equal(saveParents[0], messageParents[0]); assert(saveParents.every(node => node.expression.getText(ast) !== 'Scroll'));
   assert(ids.has('networkSettingsDirtyState')); assert(ids.has('backFromNetworkSettings'));
+});
+add('actual routing controls show fixed whitelist guidance without custom list or LAN override', () => {
+  const { ast, ids } = parsePage('pages/NetworkSettings.ets');
+  function visible(id, mode) {
+    assert(ids.has(id), id);
+    for (let node = ids.get(id).parent; node; node = node.parent) {
+      if (ts.isIfStatement(node) && !new Function('return ' + node.expression.getText(ast)).call({ mode })) return false;
+    }
+    return true;
+  }
+  for (const mode of ['global', 'whitelist', 'rules']) {
+    assert.equal(visible('routingGlobalHint', mode), mode === 'global');
+    assert.equal(visible('routingWhitelistHint', mode), mode === 'whitelist');
+    for (const id of ['bypassLan', 'routingDirect', 'routingProxy', 'routingBlock']) {
+      assert.equal(visible(id, mode), mode === 'rules', id + ' ' + mode);
+    }
+    assert.equal(visible('dnsUrl', mode), true, 'Existing HTTPS DNS remains shared');
+  }
 });
 add('actual app controls block mutations during connection, confirmation or navigation', () => {
   const { ast, ids, dynamicIds } = parsePage('pages/NetworkSettings.ets');

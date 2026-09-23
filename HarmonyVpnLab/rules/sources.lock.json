@@ -1,0 +1,141 @@
+{
+  "schemaVersion": 1,
+  "description": "Pinned v2rayN whitelist rules and byte-preserving GeoData subsets.",
+  "routing": {
+    "repository": "https://github.com/2dust/v2rayN",
+    "release": "7.24.9",
+    "commit": "521230c40d5c180bc0727cf4003907edfae5a3e0",
+    "source": {
+      "url": "https://raw.githubusercontent.com/2dust/v2rayN/521230c40d5c180bc0727cf4003907edfae5a3e0/v2rayN/ServiceLib/Sample/custom_routing_white",
+      "bytes": 1822,
+      "sha256": "ca2b9d02b2c1fdff704b54f3d557efd3fc3a289cfb77c53104877941006b0cd0"
+    },
+    "defaultDomainStrategy": "AsIs",
+    "defaultOutbound": "proxy",
+    "license": "GPL-3.0"
+  },
+  "geodata": {
+    "repository": "https://github.com/Loyalsoldier/v2ray-rules-dat",
+    "release": "202609222357",
+    "commit": "5c20d2eb5a65b171816949010ede67a27326cbe6",
+    "publishedAt": "2026-09-22T23:57:53Z",
+    "releaseUrl": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/tag/202609222357",
+    "sourceBuildWorkflow": "https://github.com/Loyalsoldier/v2ray-rules-dat/blob/5c20d2eb5a65b171816949010ede67a27326cbe6/.github/workflows/run.yml",
+    "transform": "Keep selected complete repeated protobuf field 1 messages byte-for-byte, in source order. Other categories are omitted; no selected record is modified.",
+    "scope": "This reproduces subsets from checksum-pinned upstream release artifacts. Upstream compilation uses moving data feeds; the artifact tag commit does not lock every upstream data input.",
+    "repositoryLicense": "GPL-3.0"
+  },
+  "assets": [
+    {
+      "name": "geoip.dat",
+      "source": {
+        "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/202609222357/geoip.dat",
+        "bytes": 16907278,
+        "sha256": "f3370cf391831bb01e1e662df88596164d136e7d9f81a91c00bae26587e02d72"
+      },
+      "output": {
+        "bytes": 139274,
+        "sha256": "a47866f5ea506b7b7f816c7f62e352567e4188fd276c1800dac2ab653415a43e"
+      },
+      "entries": [
+        {
+          "category": "CN",
+          "items": 9741,
+          "types": {
+            "IPv4": 6273,
+            "IPv6": 3468
+          },
+          "entrySha256": "147167d143ae3db3a65ef0cb2bad56d8bb5f5d43f2349f6b2315f5224a12f7d3"
+        },
+        {
+          "category": "PRIVATE",
+          "items": 18,
+          "types": {
+            "IPv4": 14,
+            "IPv6": 4
+          },
+          "entrySha256": "ac5f6df7cf67c2f19e42f7bacdecdff7660671eab164af91633399517af00b73"
+        }
+      ],
+      "license": "CC-BY-SA-4.0 (geoip data; MIT source notices retained)"
+    },
+    {
+      "name": "geosite.dat",
+      "source": {
+        "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/202609222357/geosite.dat",
+        "bytes": 11097262,
+        "sha256": "a25739e5a2bc800dadfad074c33c15b00a46d04f9b7399668bc418a9d5c88a0b"
+      },
+      "output": {
+        "bytes": 1994637,
+        "sha256": "269d13cde1a524973d43395c180452f1f0258be372105b28dde37c1fb8f161ae"
+      },
+      "entries": [
+        {
+          "category": "PRIVATE",
+          "items": 131,
+          "types": {
+            "full-domain": 12,
+            "root-domain": 118,
+            "regex": 1
+          },
+          "entrySha256": "b1e48b00b0904d048356c33149868f0720feca7962fd97e7039be338941abbb4"
+        },
+        {
+          "category": "GOOGLE",
+          "items": 1075,
+          "types": {
+            "full-domain": 234,
+            "root-domain": 839,
+            "regex": 2
+          },
+          "entrySha256": "da0abe0f22b1519d99b648ffee9ee246b8ea37140c35744a15c583b11227a3c6"
+        },
+        {
+          "category": "CN",
+          "items": 111179,
+          "types": {
+            "full-domain": 554,
+            "root-domain": 110617,
+            "regex": 8
+          },
+          "entrySha256": "156c68fdb90ead48eb02ec72446219d9c3e28ea4536f42b8a00f1f6cf9b13766"
+        }
+      ],
+      "license": "GPL-3.0 (v2ray-rules-dat compilation; MIT and dnsmasq-china-list source notices retained)"
+    }
+  ],
+  "dataSourceNotices": [
+    {
+      "repository": "https://github.com/Loyalsoldier/geoip",
+      "commit": "1503074d8aee4c623791210e90c04d586c86c8f7",
+      "licenseUrl": "https://raw.githubusercontent.com/Loyalsoldier/geoip/1503074d8aee4c623791210e90c04d586c86c8f7/LICENSE",
+      "licenseSha256": "5e436ff8ffbb77d8607220e9bce20c8915d860010feeb6c1ebef5a85688e9b39"
+    },
+    {
+      "repository": "https://github.com/Loyalsoldier/domain-list-custom",
+      "commit": "efacb51b8950ae673ebb6dcb9e7ecdd1decb1b6d",
+      "licenseUrl": "https://raw.githubusercontent.com/Loyalsoldier/domain-list-custom/efacb51b8950ae673ebb6dcb9e7ecdd1decb1b6d/LICENSE",
+      "licenseSha256": "35f18e0331a1ecd1835400c50e3b367c2ce09f6c13d91c4a0f3cb11f71d3bbc3"
+    },
+    {
+      "repository": "https://github.com/v2fly/domain-list-community",
+      "commit": "c1c2cf0d252871e8739747714df06e8d2671f72f",
+      "licenseUrl": "https://raw.githubusercontent.com/v2fly/domain-list-community/c1c2cf0d252871e8739747714df06e8d2671f72f/LICENSE",
+      "licenseSha256": "b9d84a22870d3f21c91a4c6e410c9cc51d00902f5233ad0c84011479244bf7d2"
+    },
+    {
+      "repository": "https://github.com/gaoyifan/china-operator-ip",
+      "commit": "b2b8edc0ddd9cf2bc638ec77587301bbf84b8db9",
+      "licenseUrl": "https://raw.githubusercontent.com/gaoyifan/china-operator-ip/b2b8edc0ddd9cf2bc638ec77587301bbf84b8db9/LICENSE",
+      "licenseSha256": "8f4d03a581484143945a9fac471c3b669d5aada68361fd1f25886c3ddbdd786a"
+    },
+    {
+      "repository": "https://github.com/felixonmars/dnsmasq-china-list",
+      "commit": "c55bc322c2ebcb0e0d78614ef44951be629862ed",
+      "licenseUrl": "https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/c55bc322c2ebcb0e0d78614ef44951be629862ed/LICENSE",
+      "licenseSha256": "f9e00539c44942d94e3c6d20f0c90e63e810ea181b10f16a252c93e4ea5cefd7"
+    }
+  ],
+  "noticeScope": "Data-source commit IDs pin the reproduced license notices, not the underlying inputs used by the upstream release build."
+}

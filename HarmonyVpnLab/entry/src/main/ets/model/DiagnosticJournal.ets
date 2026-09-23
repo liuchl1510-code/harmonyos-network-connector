@@ -31,6 +31,12 @@ export class DiagnosticEvent {
   }
 }
 
+export class DiagnosticJournalInspection {
+  status: string;
+  events: DiagnosticEvent[];
+  constructor(status: string, events: DiagnosticEvent[] = []) { this.status = status; this.events = events; }
+}
+
 function validEvent(event: DiagnosticEvent): boolean {
   if (event === null || typeof event !== 'object' || Array.isArray(event)) { return false; }
   const fields = Object.keys(event);
@@ -52,26 +58,34 @@ function byteLength(text: string): number {
 // writers. Callers must catch these fixed errors so diagnostics cannot block VPN
 // lifecycle/recovery. Missing or malformed files are empty; real read failures
 // throw rather than allowing an append to erase previously persisted evidence.
-export function readDiagnosticEvents(filesDir: string): DiagnosticEvent[] {
+export function inspectDiagnosticEvents(filesDir: string): DiagnosticJournalInspection {
   const path = `${filesDir}/${JOURNAL_NAME}`;
   let content: string;
   try {
-    if (!fs.accessSync(path)) { return []; }
+    if (!fs.accessSync(path)) { return new DiagnosticJournalInspection('missing'); }
     const stat = fs.statSync(path);
-    if (!stat.isFile() || stat.size < 0 || stat.size > MAX_BYTES) { return []; }
+    if (!stat.isFile() || stat.size < 0 || stat.size > MAX_BYTES) { return new DiagnosticJournalInspection('invalid'); }
     content = fs.readTextSync(path, { length: MAX_BYTES + 1 });
-  } catch (_) { throw new Error('DIAGNOSTIC_JOURNAL_READ_FAILED'); }
+  } catch (_) { return new DiagnosticJournalInspection('unreadable'); }
   try {
-    if (byteLength(content) > MAX_BYTES) { return []; }
+    if (byteLength(content) > MAX_BYTES) { return new DiagnosticJournalInspection('invalid'); }
     const events = JSON.parse(content) as DiagnosticEvent[];
-    if (!Array.isArray(events) || events.length > MAX_EVENTS) { return []; }
+    if (!Array.isArray(events) || events.length > MAX_EVENTS) { return new DiagnosticJournalInspection('invalid'); }
     const accepted: DiagnosticEvent[] = [];
     for (const event of events) {
-      if (!validEvent(event)) { return []; }
+      if (!validEvent(event)) { return new DiagnosticJournalInspection('invalid'); }
       accepted.push(new DiagnosticEvent(event.at, event.runId, event.code, event.kind, event.value));
     }
-    return accepted;
-  } catch (_) { return []; }
+    return new DiagnosticJournalInspection(accepted.length === 0 ? 'empty' : 'available', accepted);
+  } catch (_) { return new DiagnosticJournalInspection('invalid'); }
+}
+
+// Preserve the established service writer contract: malformed data is empty,
+// while an I/O error must stop append from overwriting unreadable evidence.
+export function readDiagnosticEvents(filesDir: string): DiagnosticEvent[] {
+  const result = inspectDiagnosticEvents(filesDir);
+  if (result.status === 'unreadable') { throw new Error('DIAGNOSTIC_JOURNAL_READ_FAILED'); }
+  return result.events;
 }
 
 export function appendDiagnosticEvent(filesDir: string, runId: string, code: string,

@@ -1,1 +1,1 @@
-{ "src": ["pages/Home", "pages/Nodes", "pages/Settings", "pages/About", "pages/Privacy", "pages/Subscriptions", "pages/Diagnostics", "pages/Index", "pages/NodeConfig", "pages/RuntimeSmoke", "pages/NetworkSettings", "pages/NodeEditor", "pages/NodeBackup"] }
+{ "src": ["pages/Home", "pages/Nodes", "pages/Settings", "pages/About", "pages/Privacy", "pages/Subscriptions", "pages/Diagnostics", "pages/DiagnosticSummary", "pages/Index", "pages/NodeConfig", "pages/RuntimeSmoke", "pages/NetworkSettings", "pages/NodeEditor", "pages/NodeBackup"] }

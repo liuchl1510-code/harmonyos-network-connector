@@ -2,6 +2,9 @@
 # Preserve bytes across checkouts rather than rewriting line endings.
 * -text whitespace=blank-at-eol,-blank-at-eof,space-before-tab,cr-at-eol
 
+# Protobuf rule databases must remain binary in diffs and merges as well.
+HarmonyVpnLab/entry/src/main/resources/rawfile/*.dat binary
+
 # Unified-diff context lines and verbatim upstream licenses may contain
 # intentional whitespace; validate patches with git apply and locked hashes.
 *.patch -whitespace

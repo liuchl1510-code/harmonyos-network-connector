@@ -111,10 +111,10 @@ export function buildConnectionConfig(outboundJson: string, socksPort: number,
   const hostsJSON = hostEntries.length > 0 ? `"hosts":{${hostEntries.join(',')}},` : '';
   const rules = policyRoutingRules(policy);
   const rulesJSON = rules.length > 0 ? rules.map((rule) => JSON.stringify(rule)).join(',') + ',' : '';
-  const extraOutbounds = policy.mode === 'rules' ?
+  const extraOutbounds = policy.mode !== 'global' ?
     ',{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"ForceIPv4"}},' +
     '{"tag":"rule-block","protocol":"blackhole","settings":{}}' : '';
-  const sniffingJSON = policy.mode === 'rules' ?
+  const sniffingJSON = policy.mode !== 'global' ?
     ',"sniffing":{"enabled":true,"destOverride":["http","tls"],"routeOnly":true}' : '';
   outbound.tag = 'nodeProxy';
   if (outbound.streamSettings?.realitySettings) {

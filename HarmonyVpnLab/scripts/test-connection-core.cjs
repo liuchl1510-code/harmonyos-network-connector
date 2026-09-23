@@ -192,6 +192,7 @@ function harness(options = {}) {
   const state = { calls: [], logs: [], files: new Map(), counts: { uplink: 0, downlink: 0 },
     protection: { requests: 0, succeeded: 0, failed: 0, timedOut: 0, active: 0 },
     forwarding: { hevRunning: true, hevExit: 0 }, startGate: null, startEntered: deferred(), fd: 1,
+    assetsGate: null, assetsEntered: deferred(),
     coreActive: false, httpRequests: 0, diagnosticTcpConnects: 0 };
   const outboundJson = JSON.stringify(samples[2][1]);
   const native = {
@@ -247,6 +248,12 @@ function harness(options = {}) {
       return { connect: async () => { state.diagnosticTcpConnects++; }, close: async () => {} };
     } }, http: { createHttp: () => { state.httpRequests++; throw new Error('Counters must not use HTTP metrics'); } } },
     './CaBundle': { prepareCaBundle: async () => '/synthetic/mozilla-ca.pem' },
+    './RoutingAssets': { prepareRoutingAssets: async context => {
+      assert.equal(context.filesDir, '/synthetic'); state.calls.push('assets-begin'); state.assetsEntered.resolve();
+      if (state.assetsGate) await state.assetsGate.promise;
+      if (options.failAt === 'assets') throw Error('private routing asset path');
+      state.calls.push('assets-ready');
+    } },
     '../model/NodeProfile': { readNodeProfile: () => ({ outboundJson }), nodeEndpoint: () => {
       if (!options.diagnosticNode) throw new Error('Unexpected probe-only endpoint path');
       return { address: '198.51.100.10', port: 443, protocol: 'vless', network: 'raw', security: 'reality' };
@@ -265,6 +272,48 @@ function harness(options = {}) {
 }
 
 async function main() {
+  for (const mode of ['global', 'rules']) {
+    const { core, state } = harness(); const policy = new policyModule.NetworkPolicy(); policy.mode = mode;
+    await core.startConnection(7, { filesDir: '/synthetic' }, async () => {}, undefined, undefined, policy);
+    assert(!state.calls.includes('assets-begin'), 'Existing modes must not depend on geographic assets');
+    await core.stop(); passed++; console.log('PASS ' + mode + ' does not read geographic assets');
+  }
+  {
+    const { core, state } = harness(); const policy = new policyModule.NetworkPolicy(); policy.mode = 'whitelist';
+    state.assetsGate = deferred();
+    const starting = core.startConnection(7, { filesDir: '/synthetic' }, async () => {}, undefined, undefined, policy);
+    await state.assetsEntered.promise;
+    assert.deepEqual(state.calls, ['assets-begin']); assert.equal(state.files.size, 0);
+    state.assetsGate.resolve(); await starting;
+    for (const operation of ['ca', 'version', 'runtime', 'protector', 'start']) {
+      assert(state.calls.indexOf('assets-ready') < state.calls.indexOf(operation), operation);
+    }
+    assert(state.config.routing.rules.some(rule => rule.domain?.includes('geosite:cn')));
+    assert.equal(state.httpRequests, 0); assert.equal(state.diagnosticTcpConnects, 0);
+    await core.stop(); passed++; console.log('PASS whitelist waits for verified assets before loading or starting Xray');
+  }
+  {
+    const { core, state } = harness({ failAt: 'assets' }); const policy = new policyModule.NetworkPolicy(); policy.mode = 'whitelist';
+    await assert.rejects(core.startConnection(7, { filesDir: '/synthetic' }, async () => {}, undefined, undefined, policy),
+      error => error instanceof failureModule.ConnectionFailureError && error.failure.stage === 'core-init' &&
+        !String(error).includes('private'));
+    await core.stop(); assert.deepEqual(state.calls, ['assets-begin']); assert.equal(state.files.size, 0);
+    assert.equal(state.coreActive, false); assert.equal(state.httpRequests, 0);
+    passed++; console.log('PASS asset failure aborts before Xray configuration or startup without disclosing its path');
+  }
+  {
+    const { core, state } = harness(); const policy = new policyModule.NetworkPolicy(); policy.mode = 'whitelist';
+    state.assetsGate = deferred();
+    const starting = core.startConnection(7, { filesDir: '/synthetic' }, async () => {}, undefined, undefined, policy);
+    const rejected = assert.rejects(starting, error => error instanceof failureModule.ConnectionFailureError);
+    await state.assetsEntered.promise;
+    const stopping = core.stop(); await Promise.resolve(); assert.deepEqual(state.calls, ['assets-begin']);
+    state.assetsGate.resolve(); await rejected; await stopping;
+    assert.deepEqual(state.calls, ['assets-begin', 'assets-ready']); assert.equal(state.files.size, 0);
+    assert.equal(state.coreActive, false); assert.equal(state.httpRequests, 0);
+    await assert.rejects(core.readConnectionSnapshot());
+    passed++; console.log('PASS cancellation during asset preparation cannot configure or start Xray afterwards');
+  }
   for (const [failAt, stage] of [['configuration','configuration'], ['ca','core-init'], ['version','core-init'],
     ['runtime','runtime-clock'], ['start','core-init'], ['stats','status'], ['hev-start','forwarding']]) {
     const { core, state } = harness({ failAt });

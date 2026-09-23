@@ -13,7 +13,7 @@ const sdk = path.join(process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei
 const ts = require(path.join(sdk, 'node_modules/typescript'));
 const parserOptions = ts.readConfigFile(path.join(sdk, 'tsconfig.json'), ts.sys.readFile).config.compilerOptions;
 const pages = ['Settings', 'NetworkSettings', 'NodeConfig', 'Subscriptions', 'NodeEditor', 'NodeBackup',
-  'About', 'Privacy', 'Diagnostics', 'Index', 'RuntimeSmoke'];
+  'About', 'Privacy', 'Diagnostics', 'DiagnosticSummary', 'Index', 'RuntimeSmoke'];
 const modelPath = path.join(root, 'entry/src/main/ets/model/AdaptiveLayout.ets');
 const modelSource = fs.readFileSync(modelPath, 'utf8');
 const modelCompiled = ts.transpileModule(modelSource, {

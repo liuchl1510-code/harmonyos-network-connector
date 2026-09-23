@@ -4,6 +4,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { common } from '@kit.AbilityKit';
 import { socket } from '@kit.NetworkKit';
 import { prepareCaBundle } from './CaBundle';
+import { prepareRoutingAssets } from './RoutingAssets';
 import { nodeEndpoint, readNodeProfile } from '../model/NodeProfile';
 import { describeError } from '../model/ErrorInfo';
 import { fileIo as fs } from '@kit.CoreFileKit';
@@ -254,6 +255,10 @@ export class CoreProbe {
       stage = 'configuration';
       buildConnectionConfig(this.connectionOutboundJson, ports.socksPort, ports.metricsPort, this.errorPath, bootstrap, this.connectionPolicy);
       stage = 'core-init';
+      if (this.connectionPolicy?.mode === 'whitelist') {
+        await prepareRoutingAssets(context);
+        this.requireConnectionEpoch(epoch);
+      }
       const logFile = fs.openSync(this.errorPath, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
       fs.closeSync(logFile);
       this.connectionLogOffset = 0;

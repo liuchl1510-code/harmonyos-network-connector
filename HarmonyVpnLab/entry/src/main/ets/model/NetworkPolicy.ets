@@ -19,6 +19,8 @@ export class RoutingRule {
   inboundTag: string[] = ['connection-in'];
   domain?: string[];
   ip?: string[];
+  port?: string;
+  network?: string;
   outboundTag: string;
   constructor(tag: string) { this.outboundTag = tag; }
 }
@@ -76,7 +78,7 @@ export function validateNetworkPolicy(value: NetworkPolicy): NetworkPolicy {
   const keys = ['schemaVersion', 'mode', 'bypassLan', 'direct', 'proxy', 'block', 'dnsUrl'];
   if (value.schemaVersion === 2) { keys.push('appMode', 'appBundles'); }
   if (Object.keys(value).length !== keys.length || Object.keys(value).some((key: string) => !keys.includes(key)) ||
-    ![1, 2].includes(value.schemaVersion) || !['global', 'rules'].includes(value.mode) || typeof value.bypassLan !== 'boolean') {
+    ![1, 2].includes(value.schemaVersion) || !['global', 'rules', 'whitelist'].includes(value.mode) || typeof value.bypassLan !== 'boolean') {
     throw new Error('网络设置格式或版本无效。');
   }
   const result = new NetworkPolicy();
@@ -112,6 +114,7 @@ function appendRules(result: RoutingRule[], entries: string[], tag: string): voi
 export function policyRoutingRules(policy: NetworkPolicy): RoutingRule[] {
   const checked = validateNetworkPolicy(policy);
   const rules: RoutingRule[] = [];
+  if (checked.mode === 'whitelist') { return whitelistRoutingRules(); }
   if (checked.mode !== 'rules') { return rules; }
   appendRules(rules, checked.block, 'rule-block');
   appendRules(rules, checked.proxy, 'nodeProxy');
@@ -123,5 +126,31 @@ export function policyRoutingRules(policy: NetworkPolicy): RoutingRule[] {
 }
 
 export function networkPolicyLabel(policy: NetworkPolicy): string {
+  if (policy.mode === 'whitelist') { return '白名单 · 绕过大陆'; }
   return policy.mode === 'global' ? '全部代理' : policy.bypassLan ? '规则分流 · 绕过局域网' : '规则分流';
+}
+
+// v2rayN 7.24.9, ServiceLib/Sample/custom_routing_white; see rules/LICENSE-v2rayN.
+// Commit 521230c40d5c180bc0727cf4003907edfae5a3e0. Preserve upstream order;
+// only scope to this SOCKS inbound and translate proxy/block outbound tags.
+// Geo categories are provided by the packaged, pinned Loyalsoldier data.
+function whitelistRoutingRules(): RoutingRule[] {
+  const quic = new RoutingRule('rule-block'); quic.port = '443'; quic.network = 'udp';
+  const google = new RoutingRule('nodeProxy'); google.domain = ['geosite:google'];
+  const privateIp = new RoutingRule('direct'); privateIp.ip = ['geoip:private'];
+  const privateDomain = new RoutingRule('direct'); privateDomain.domain = ['geosite:private'];
+  const dnsIp = new RoutingRule('direct');
+  dnsIp.ip = ['223.5.5.5', '223.6.6.6', '2400:3200::1', '2400:3200:baba::1',
+    '119.29.29.29', '1.12.12.12', '120.53.53.53', '2402:4e00::', '2402:4e00:1::',
+    '180.76.76.76', '2400:da00::6666', '114.114.114.114', '114.114.115.115',
+    '114.114.114.119', '114.114.115.119', '114.114.114.110', '114.114.115.110',
+    '180.184.1.1', '180.184.2.2', '101.226.4.6', '218.30.118.6', '123.125.81.6',
+    '140.207.198.6', '1.2.4.8', '210.2.4.8', '52.80.66.66', '117.50.22.22',
+    '2400:7fc0:849e:200::4', '2404:c2c0:85d8:901::4', '117.50.10.10', '52.80.52.52',
+    '2400:7fc0:849e:200::8', '2404:c2c0:85d8:901::8', '117.50.60.30', '52.80.60.30'];
+  const dnsDomain = new RoutingRule('direct');
+  dnsDomain.domain = ['domain:alidns.com', 'domain:doh.pub', 'domain:dot.pub', 'domain:360.cn', 'domain:onedns.net'];
+  const cnIp = new RoutingRule('direct'); cnIp.ip = ['geoip:cn'];
+  const cnDomain = new RoutingRule('direct'); cnDomain.domain = ['geosite:cn'];
+  return [quic, google, privateIp, privateDomain, dnsIp, dnsDomain, cnIp, cnDomain];
 }

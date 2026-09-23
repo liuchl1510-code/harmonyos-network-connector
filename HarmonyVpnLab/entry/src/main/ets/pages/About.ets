@@ -50,6 +50,11 @@ struct About {
           Divider().color($r('app.color.border'));
           this.dependency('Hev SOCKS5 Tunnel', '2.9.0', '虚拟网卡流量转发 · MIT License');
           Divider().color($r('app.color.border'));
+          this.dependency('v2rayN 白名单', '7.24.9', '内置分流规则 · GPL-3.0');
+          Divider().color($r('app.color.border'));
+          this.dependency('Loyalsoldier 规则数据', '202609222357',
+            '保留白名单所需完整分类；规则仓库 GPL-3.0，GeoIP 数据 CC-BY-SA-4.0，其他数据来源保留原许可。');
+          Divider().color($r('app.color.border'));
           Text('其他依赖').fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
           Text('libXray、Hev task system、Hev SOCKS5 core 与 libyaml 使用 MIT 许可证；Go 使用 BSD 许可证。lwIP 保留各源文件声明。核心还包含 GPL-3.0-or-later 的 sing、sing-shadowsocks，以及带特定链接例外的 LGPLv3 ratelimit。其他依赖遵循各自许可证。')
             .fontSize(14).lineHeight('23fp').fontColor($r('app.color.text_secondary'));

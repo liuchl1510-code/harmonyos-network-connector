@@ -30,6 +30,17 @@ class RecoveryFile {
   constructor(observations: ConnectionRecoveryObservation[]) { this.observations = observations; }
 }
 
+export class ConnectionRecoveryInspection {
+  status: string;
+  observations: ConnectionRecoveryObservation[];
+  // A size/type failure historically throws READ_FAILED, not INVALID_FILE.
+  // Preserve that distinction for the existing writer without exposing errors.
+  readFailed: boolean;
+  constructor(status: string, observations: ConnectionRecoveryObservation[] = [], readFailed: boolean = false) {
+    this.status = status; this.observations = observations; this.readFailed = readFailed;
+  }
+}
+
 function valid(record: ConnectionRecoveryObservation): boolean {
   if (record === null || typeof record !== 'object' || Array.isArray(record)) { return false; }
   const fields = Object.keys(record);
@@ -44,15 +55,15 @@ function sameObservation(left: ConnectionRecoveryObservation, right: ConnectionR
   return left.runId === right.runId && left.servicePid === right.servicePid && left.serviceStatusAt === right.serviceStatusAt;
 }
 
-export function readConnectionRecoveries(filesDir: string): ConnectionRecoveryObservation[] {
+export function inspectConnectionRecoveries(filesDir: string): ConnectionRecoveryInspection {
   const path = `${filesDir}/${FILE_NAME}`;
   let content: string;
   try {
-    if (!fs.accessSync(path)) { return []; }
+    if (!fs.accessSync(path)) { return new ConnectionRecoveryInspection('missing'); }
     const stat = fs.statSync(path);
-    if (!stat.isFile() || stat.size < 0 || stat.size > MAX_BYTES) { throw new Error('size'); }
+    if (!stat.isFile() || stat.size < 0 || stat.size > MAX_BYTES) { return new ConnectionRecoveryInspection('invalid', [], true); }
     content = fs.readTextSync(path, { length: MAX_BYTES + 1 });
-  } catch (_) { throw new Error('CONNECTION_RECOVERY_READ_FAILED'); }
+  } catch (_) { return new ConnectionRecoveryInspection('unreadable', [], true); }
   try {
     if (new util.TextEncoder().encodeInto(content).length > MAX_BYTES) { throw new Error('size'); }
     const file = JSON.parse(content) as RecoveryFile;
@@ -64,8 +75,15 @@ export function readConnectionRecoveries(filesDir: string): ConnectionRecoveryOb
       if (!valid(entry) || accepted.some((previous: ConnectionRecoveryObservation) => sameObservation(previous, entry))) { throw new Error('record'); }
       accepted.push(new ConnectionRecoveryObservation(entry.at, entry.runId, entry.kind, entry.servicePid, entry.serviceStatusAt));
     }
-    return accepted;
-  } catch (_) { throw new Error('CONNECTION_RECOVERY_INVALID_FILE'); }
+    return new ConnectionRecoveryInspection(accepted.length === 0 ? 'empty' : 'available', accepted);
+  } catch (_) { return new ConnectionRecoveryInspection('invalid'); }
+}
+
+export function readConnectionRecoveries(filesDir: string): ConnectionRecoveryObservation[] {
+  const result = inspectConnectionRecoveries(filesDir);
+  if (result.readFailed) { throw new Error('CONNECTION_RECOVERY_READ_FAILED'); }
+  if (result.status === 'invalid') { throw new Error('CONNECTION_RECOVERY_INVALID_FILE'); }
+  return result.observations;
 }
 
 function observationFor(assessment: ConnectionLifecycleAssessment): ConnectionRecoveryObservation | undefined {
