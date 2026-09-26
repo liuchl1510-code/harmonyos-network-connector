@@ -2,6 +2,7 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { ConnectionSnapshot } from './ConnectionSnapshot';
 import { ConnectionFailure, validConnectionFailure } from './ConnectionFailure';
+import { DnsFaultRequest, validDnsFaultRequestShape } from './DnsFaultTest';
 
 export const CONNECTION_UI_EPOCH: string = util.generateRandomUUID();
 
@@ -34,6 +35,7 @@ export class ConnectionCommand {
   action: string;
   createdAt: number;
   ownerEpoch: string;
+  dnsFault?: DnsFaultRequest;
   constructor(runId: string, action: string, ownerEpoch: string = CONNECTION_UI_EPOCH) {
     this.runId = runId;
     this.action = action;
@@ -52,6 +54,7 @@ export function readConnectionCommand(filesDir: string): ConnectionCommand | und
     const value = JSON.parse(fs.readTextSync(`${filesDir}/connection-command.json`)) as ConnectionCommand;
     if (typeof value.runId !== 'string' || !['start', 'stop', 'reconnect'].includes(value.action) ||
       typeof value.createdAt !== 'number' || !Number.isFinite(value.createdAt)) { return undefined; }
+    if (value.dnsFault !== undefined && (value.action !== 'start' || !validDnsFaultRequestShape(value.dnsFault))) { return undefined; }
     return value;
   } catch (_) { return undefined; }
 }
@@ -68,6 +71,9 @@ export class ConnectionStatus {
   failure?: ConnectionFailure;
   cleanupFailure?: ConnectionFailure;
   currentIssue?: ConnectionFailure;
+  effectiveMode?: string;
+  effectiveDnsMode?: string;
+  dnsFault?: DnsFaultRequest;
   constructor(runId: string, phase: string, snapshot?: ConnectionSnapshot, cleanupConfirmed: boolean = false, servicePid: number = 0,
     networkKind: string = '', reconnectCount: number = 0) {
     this.runId = runId;
@@ -97,6 +103,9 @@ export function readConnectionStatus(filesDir: string): ConnectionStatus | undef
     if (value.failure !== undefined && !validConnectionFailure(value.failure)) { value.failure = undefined; }
     if (value.cleanupFailure !== undefined && !validConnectionFailure(value.cleanupFailure)) { value.cleanupFailure = undefined; }
     if (value.currentIssue !== undefined && !validConnectionFailure(value.currentIssue)) { value.currentIssue = undefined; }
+    if (value.effectiveMode !== undefined && !['global', 'whitelist', 'rules'].includes(value.effectiveMode)) { value.effectiveMode = undefined; }
+    if (value.effectiveDnsMode !== undefined && !['proxy', 'split'].includes(value.effectiveDnsMode)) { value.effectiveDnsMode = undefined; }
+    if (value.dnsFault !== undefined && !validDnsFaultRequestShape(value.dnsFault)) { value.dnsFault = undefined; }
     if (value.networkKind !== undefined && !['', 'wifi', 'cellular', 'ethernet', 'other'].includes(value.networkKind)) { return undefined; }
     if (value.reconnectCount !== undefined && (!Number.isSafeInteger(value.reconnectCount) || value.reconnectCount < 0)) { return undefined; }
     if (value.snapshot && (typeof value.snapshot.uplink !== 'number' || !Number.isFinite(value.snapshot.uplink) ||

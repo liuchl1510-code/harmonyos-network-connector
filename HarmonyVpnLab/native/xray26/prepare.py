@@ -4,6 +4,7 @@ import difflib
 import hashlib
 import json
 import re
+import runpy
 import shutil
 import sys
 
@@ -34,6 +35,8 @@ shutil.copytree(core,core_stage,dirs_exist_ok=True,copy_function=shutil.copyfile
 patch=''.join(difflib.unified_diff(original.splitlines(keepends=True),patched.splitlines(keepends=True),fromfile='a/'+relative.as_posix(),tofile='b/'+relative.as_posix()))
 assert (recipe/'patches/0001-socket-controller-fail-closed.patch').read_text(encoding='utf-8')==patch, 'Authored patch differs from audited core edit'
 evidence={'file':'native/xray26/patches/0001-socket-controller-fail-closed.patch','sha256':hashlib.sha256(patch.encode()).hexdigest(),'originalSourceSha256LF':hashlib.sha256(original.encode()).hexdigest(),'patchedSourceSha256LF':hashlib.sha256(patched.encode()).hexdigest(),'matches':2,'moduleCacheUnmodified':(core/relative).read_text(encoding='utf-8')==original,'upstreamStartupAlreadySingleStart':True,'oldStartupPatchApplied':False,'nativeTunFdExported':False}
+pool_apply=runpy.run_path(str(recipe/'dns-pool/apply_patch.py'))['apply_pool_patch']
+evidence['dohTransportPool']=pool_apply(core,core_stage,recipe)
 (core_stage/'harmony-patch-evidence.json').write_text(json.dumps(evidence,indent=2)+'\n',encoding='utf-8')
 
 tests=(recipe/'validation/socket_protect_test.go.template').read_text(encoding='utf-8')
@@ -56,4 +59,4 @@ test_dir=stage/'harmony_socket_validation'
 test_dir.mkdir(exist_ok=True)
 (test_dir/'socket_protect_test.go').write_text(tests,encoding='utf-8',newline='\n')
 assert (recipe/'validation/socket_protect_26_test.go').read_text(encoding='utf-8')==tests, 'Authored serial-controller tests changed'
-print('Prepared true 26.6.1: upstream single-start retained, 9 ABI shim with per-instance stats, two fail-closed controller edits.')
+print('Prepared true 26.6.1: upstream single-start retained, 9 ABI shim, fail-closed controllers and instance-scoped DoH transport pool.')

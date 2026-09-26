@@ -77,6 +77,7 @@ export class CoreProbe {
   private connectionSuspended: boolean = false;
   private connectionOutboundJson: string = '';
   private connectionPolicy?: NetworkPolicy;
+  private connectionDnsFault: string = '';
   private connectionSocksPort: number = 0;
   private connectionAccumulatedUp: number = 0;
   private connectionAccumulatedDown: number = 0;
@@ -216,9 +217,9 @@ export class CoreProbe {
   // heartbeat scheduling and session duration; this path performs no node probe.
   async startConnection(fd: number, context: common.Context,
     protectSocket: (fd: number) => Promise<void>, bootstrap?: NodeBootstrap,
-    sessionOutboundJson?: string, policy?: NetworkPolicy): Promise<void> {
+    sessionOutboundJson?: string, policy?: NetworkPolicy, dnsFault: string = ''): Promise<void> {
     if (this.connectionStartTask !== undefined) { throw new Error('连接核心正在启动'); }
-    const task = this.startConnectionInternal(fd, context, protectSocket, bootstrap, sessionOutboundJson, policy);
+    const task = this.startConnectionInternal(fd, context, protectSocket, bootstrap, sessionOutboundJson, policy, dnsFault);
     this.connectionStartTask = task;
     try { await task; }
     finally {
@@ -228,7 +229,7 @@ export class CoreProbe {
 
   private async startConnectionInternal(fd: number, context: common.Context,
     protectSocket: (fd: number) => Promise<void>, bootstrap?: NodeBootstrap,
-    sessionOutboundJson?: string, policy?: NetworkPolicy): Promise<void> {
+    sessionOutboundJson?: string, policy?: NetworkPolicy, dnsFault: string = ''): Promise<void> {
     let stage = 'core-init';
     try {
       if (this.connectionFinalStop || this.xrayAttempted || this.hevAttempted || this.fixtureAttempted || this.protectorInstalled) {
@@ -243,6 +244,8 @@ export class CoreProbe {
       }
       this.connectionOutboundJson = parseNode(outboundJson).outboundJson;
       this.connectionPolicy = policy === undefined ? undefined : validateNetworkPolicy(policy);
+      if (dnsFault !== '' && !context.applicationInfo.debug) { throw new Error('DNS_FAULT_DEBUG_ONLY'); }
+      this.connectionDnsFault = dnsFault;
       this.connectionMode = true;
       this.connectionActive = false;
       const epoch = ++this.connectionEpoch;
@@ -253,7 +256,7 @@ export class CoreProbe {
       this.errorPath = `${context.filesDir}/xray-connection-diagnostic.log`;
       // Validate the frozen node/bootstrap before loading any process-lived code.
       stage = 'configuration';
-      buildConnectionConfig(this.connectionOutboundJson, ports.socksPort, ports.metricsPort, this.errorPath, bootstrap, this.connectionPolicy);
+      buildConnectionConfig(this.connectionOutboundJson, ports.socksPort, ports.metricsPort, this.errorPath, bootstrap, this.connectionPolicy, this.connectionDnsFault);
       stage = 'core-init';
       if (this.connectionPolicy?.mode === 'whitelist') {
         await prepareRoutingAssets(context);
@@ -297,7 +300,7 @@ export class CoreProbe {
       this.requireConnectionEpoch(epoch);
       stage = 'configuration';
       const config = buildConnectionConfig(this.connectionOutboundJson, this.connectionSocksPort,
-        this.metricsPort, this.errorPath, bootstrap, this.connectionPolicy);
+        this.metricsPort, this.errorPath, bootstrap, this.connectionPolicy, this.connectionDnsFault);
       const request = JSON.stringify(new XrayStartRequest(context.filesDir, config));
       const encoded = new util.Base64Helper().encodeToStringSync(new util.TextEncoder().encodeInto(request));
       stage = 'core-init';

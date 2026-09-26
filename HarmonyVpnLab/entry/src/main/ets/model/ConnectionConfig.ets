@@ -1,6 +1,6 @@
 // Pure configuration construction, also used by offline synthetic acceptance.
 import { NodeBootstrap, isBootstrapIpv4Address, normalizeBootstrapHost } from './NodeBootstrap';
-import { NetworkPolicy, validateNetworkPolicy, policyRoutingRules } from './NetworkPolicy';
+import { NetworkPolicy, validateNetworkPolicy, policyRoutingRules, isSplitDnsActive } from './NetworkPolicy';
 
 export const CONNECTION_DNS_ADDRESS: string = '198.18.0.1';
 export const CONNECTION_DOH_URL: string = 'https://1.1.1.1/dns-query';
@@ -72,8 +72,12 @@ function checkConnectionBootstrapOptions(stream: ConnectionStream | undefined): 
 }
 
 export function buildConnectionConfig(outboundJson: string, socksPort: number,
-  metricsPort: number, errorPath: string, bootstrap?: NodeBootstrap, networkPolicy?: NetworkPolicy): string {
+  metricsPort: number, errorPath: string, bootstrap?: NodeBootstrap, networkPolicy?: NetworkPolicy, dnsFault: string = ''): string {
   const policy = validateNetworkPolicy(networkPolicy ?? new NetworkPolicy());
+  if (dnsFault !== '' && (!['baseline', 'http404', 'timeout'].includes(dnsFault) || !isSplitDnsActive(policy) ||
+    policy.directDnsUrl !== (dnsFault === 'http404' ? 'https://223.5.5.5/harmony-vpn-dns-invalid-path' : 'https://223.5.5.5/dns-query'))) {
+    throw new Error('DNS_FAULT_CONFIG_INVALID');
+  }
   if (!Number.isInteger(socksPort) || !Number.isInteger(metricsPort) || socksPort < 1 || socksPort > 65535 ||
     metricsPort < 1 || metricsPort > 65535 || socksPort === metricsPort) {
     throw new Error('连接核心端口配置无效');
@@ -109,6 +113,18 @@ export function buildConnectionConfig(outboundJson: string, socksPort: number,
     outbound.streamSettings.sockopt.domainStrategy = 'ForceIPv4';
   }
   const hostsJSON = hostEntries.length > 0 ? `"hosts":{${hostEntries.join(',')}},` : '';
+  const splitDns = isSplitDnsActive(policy);
+  const directFaultOptions = dnsFault === 'timeout' ? '"timeoutMs":1,"disableCache":true,' : '';
+  const proxyServer = `{"address":${JSON.stringify(policy.dnsUrl)},"domains":["regexp:.*"],"skipFallback":true,"queryStrategy":"UseIPv4"}`;
+  // Fixed core 26.6.1 chooses matching servers in configuration order.
+  // finalQuery truncates the candidate list: a failed Google query cannot leak
+  // into the broader CN match, and direct failures cannot switch to proxy DNS.
+  const dnsServers = splitDns ?
+    `{"address":${JSON.stringify(policy.dnsUrl)},"domains":["geosite:google"],"tag":"dns-via-node","skipFallback":true,"finalQuery":true,"queryStrategy":"UseIPv4"},` +
+    `{"address":${JSON.stringify(policy.directDnsUrl)},${directFaultOptions}"domains":["geosite:private","domain:alidns.com","domain:doh.pub","domain:dot.pub","domain:360.cn","domain:onedns.net","geosite:cn"],` +
+    `"tag":"dns-via-direct","skipFallback":true,"finalQuery":true,"queryStrategy":"UseIPv4"},` +
+    `{"address":${JSON.stringify(policy.dnsUrl)},"domains":["regexp:.*"],"tag":"dns-via-node","skipFallback":true,"finalQuery":true,"queryStrategy":"UseIPv4"}` : proxyServer;
+  const directDnsRule = splitDns ? '{"type":"field","inboundTag":["dns-via-direct"],"outboundTag":"direct"},' : '';
   const rules = policyRoutingRules(policy);
   const rulesJSON = rules.length > 0 ? rules.map((rule) => JSON.stringify(rule)).join(',') + ',' : '';
   const extraOutbounds = policy.mode !== 'global' ?
@@ -121,17 +137,17 @@ export function buildConnectionConfig(outboundJson: string, socksPort: number,
     outbound.streamSettings.realitySettings.show = false;
   }
   // The ordinary HTTPS scheme invokes Xray's routing dispatcher. +local would
-  // bypass it and is deliberately absent. A match-all server rule and the sole
-  // proxy rule keep DNS selection independent of system DNS/hosts. Xray's DoH
-  // dispatcher uses SkipDNSResolve, so a URL hostname is sent to the remote node.
+  // bypass it and is deliberately absent. Explicit server matches and routing
+  // tags keep selection independent of system DNS/hosts. Xray's DoH
+  // dispatcher uses SkipDNSResolve, so a proxy URL hostname is sent to the remote
+  // node. Optional direct DoH uses a validated IPv4 URL and its own routing tag.
   // This IPv4 client serves A records, empty AAAA and empty non-IP replies.
   // No DNS 'direct' rule is present, so non-IP questions cannot create a local
   // UDP/TCP fallback connection from the DNS outbound.
   return `{"log":{"loglevel":"info","access":"none","error":${JSON.stringify(errorPath)}},` +
     `"stats":{},"policy":{"system":{"statsOutboundUplink":true,"statsOutboundDownlink":true}},` +
     `"dns":{"tag":"dns-via-node","queryStrategy":"UseIPv4","useSystemHosts":false,${hostsJSON}` +
-    `"disableFallback":true,"disableFallbackIfMatch":true,"servers":[{` +
-    `"address":${JSON.stringify(policy.dnsUrl)},"domains":["regexp:.*"],"skipFallback":true,"queryStrategy":"UseIPv4"}]},` +
+    `"disableFallback":true,"disableFallbackIfMatch":true,${splitDns ? '"enableParallelQuery":false,' : ''}"servers":[${dnsServers}]},` +
     `"inbounds":[{"tag":"connection-in","listen":"127.0.0.1","port":${socksPort},` +
     `"protocol":"socks","settings":{"auth":"noauth","udp":true}${sniffingJSON}}],` +
     `"outbounds":[${JSON.stringify(outbound)},` +
@@ -142,6 +158,7 @@ export function buildConnectionConfig(outboundJson: string, socksPort: number,
     `{"tag":"block-virtual","protocol":"blackhole","settings":{}}${extraOutbounds}],` +
     `"routing":{"domainStrategy":"AsIs","rules":[` +
     `{"type":"field","ip":["::/0"],"outboundTag":"block-ipv6"},` +
+    directDnsRule +
     `{"type":"field","inboundTag":["dns-via-node"],"outboundTag":"nodeProxy"},` +
     `{"type":"field","inboundTag":["connection-in"],"network":"tcp,udp","port":"53","outboundTag":"dns-out"},` +
     `{"type":"field","inboundTag":["connection-in"],"ip":["198.18.0.0/30"],"outboundTag":"block-virtual"},` +

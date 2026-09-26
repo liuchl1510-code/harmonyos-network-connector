@@ -1,5 +1,5 @@
 {
-  "artifactSha256": "0cfda2bd92a12cdbd5bcd9cf516ca17344023c93cb3a6659747af0ceecd974bc",
+  "artifactSha256": "950b715d7a307b8cb7533002bf98304579ffb5fd075724aca3ccbbfe84fea062",
   "dependencies": [
     {
       "module": "github.com/andybalholm/brotli",

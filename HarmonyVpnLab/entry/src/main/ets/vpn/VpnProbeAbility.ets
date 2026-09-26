@@ -21,6 +21,7 @@ import { LatencyProof, readLatencyRequest, readLatencyProof } from '../model/Lat
 import { appendDiagnosticEvent } from '../model/DiagnosticJournal';
 import { readNetworkPolicy } from '../model/NetworkPolicyStore';
 import { NetworkPolicy, validateNetworkPolicy } from '../model/NetworkPolicy';
+import { DnsFaultRequest, validDnsFaultAdmission, createDnsFaultPolicy } from '../model/DnsFaultTest';
 import { appRoutingLabel, appRoutingScope } from '../model/AppRouting';
 import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
 import { ConnectionFailure, ConnectionFailureError, makeConnectionFailure, connectionFailureFromError,
@@ -70,6 +71,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
   private appliedNetworkKey: string = '';
   private connectionNode?: ImportedNode;
   private connectionPolicy?: NetworkPolicy;
+  private dnsFault?: DnsFaultRequest;
   private preparedBootstrap?: NodeBootstrap;
   private preparedEpoch: number = -1;
   private connectionPhase: string = 'starting';
@@ -109,6 +111,16 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
       if (!command || command.runId !== this.runId || command.action !== 'start') {
         this.cancelled = true;
         this.stopRequested = true;
+      }
+      if (command?.dnsFault !== undefined) {
+        const commandAge = Date.now() - command.createdAt;
+        if (!this.context.applicationInfo.debug || this.testKind !== 'connection-app-test' ||
+          typeof command.ownerEpoch !== 'string' || command.ownerEpoch.length === 0 || commandAge < 0 || commandAge > 20000 ||
+          !validDnsFaultAdmission(command.dnsFault, Date.now())) {
+          this.cancelled = true; this.stopRequested = true;
+        } else {
+          this.dnsFault = new DnsFaultRequest(command.dnsFault.kind, command.dnsFault.token, command.dnsFault.createdAt);
+        }
       }
       this.persistConnectionStatus('starting');
     }
@@ -207,11 +219,12 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
       if (this.checkPersistentCancellation() || this.stopRequested) {
         return;
       }
-      if (this.testKind === 'connection') {
+      if (this.testKind === 'connection' || this.dnsFault !== undefined) {
         stage = 'configuration';
         // One owned snapshot drives both VPN scope and core policy, including retries.
         // Invalid preferences must fail before any VPN connection is created.
         this.connectionPolicy = validateNetworkPolicy(readNetworkPolicy(this.context.filesDir));
+        if (this.dnsFault) { this.connectionPolicy = createDnsFaultPolicy(this.connectionPolicy, this.dnsFault.kind); }
       }
       stage = 'vpn-init';
       this.publish('starting', isConnectionKind(this.testKind)
@@ -352,7 +365,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
       if (isConnectionKind(this.testKind)) {
         this.lastStatusAt = 0;
         if (this.testKind !== 'connection' && this.testKind !== 'node-latency') {
-          this.timerId = setTimeout(() => { this.timerId = -1; void this.requestStop(false); }, 90000);
+          this.timerId = setTimeout(() => { this.timerId = -1; void this.requestStop(false); }, this.dnsFault?.kind === 'baseline' ? 300000 : 90000);
         }
         return;
       }
@@ -508,7 +521,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
         this.coreProbe = new CoreProbe();
         stage = 'core-init';
         await this.coreProbe.startConnection(this.tunFd, this.context, (fd: number) => this.protectSocket(fd), bootstrap,
-          this.connectionNode?.outboundJson, this.connectionPolicy);
+          this.connectionNode?.outboundJson, this.connectionPolicy, this.dnsFault?.kind ?? '');
       }
       if (this.stopRequested || epoch !== this.networkEpoch) { return; }
       this.appliedNetworkKey = target.key; this.retryAt = 0; this.retryCount = 0;
@@ -748,6 +761,9 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
     value.failure = this.connectionFailure;
     value.cleanupFailure = this.cleanupFailure;
     value.currentIssue = this.currentIssue;
+    value.effectiveMode = this.connectionPolicy?.mode ?? 'global';
+    value.effectiveDnsMode = this.connectionPolicy?.dnsMode ?? 'proxy';
+    value.dnsFault = this.dnsFault;
     writeConnectionStatus(this.context.filesDir, value);
   }
 
@@ -757,7 +773,7 @@ export default class VpnProbeAbility extends VpnExtensionAbility {
       ? appRoutingLabel(this.connectionPolicy?.appMode ?? 'all', this.connectionPolicy?.appBundles.length ?? 0) : '全设备验证';
     const network = this.desiredNetwork?.kind === 'wifi' ? 'Wi-Fi' : this.desiredNetwork?.kind === 'cellular' ? '移动数据' : '物理网络';
     return `应用范围：${scope}。IPv4 代理与代理 DNS 已启动，当前使用${network}，纳入 VPN 的 IPv6 请求暂不转发。` +
-      (this.testKind === 'connection' ? '' : '本次验证到 90 秒会自动断开。');
+      (this.testKind === 'connection' ? '' : this.dnsFault?.kind === 'baseline' ? '本次验证到 5 分钟会自动断开。' : '本次验证到 90 秒会自动断开。');
   }
 
   private journal(code: string, kind: string = '', value: number = 0): void {

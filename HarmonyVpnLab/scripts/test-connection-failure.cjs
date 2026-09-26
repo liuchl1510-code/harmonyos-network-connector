@@ -22,7 +22,7 @@ const control = load(names[1], key => {
 const cases = [], test = (name, run) => { run(); cases.push({ name, passed: true }); };
 const plain = value => JSON.parse(JSON.stringify(value));
 const basic = () => ({ runId: '1780000000000', phase: 'destroying', updatedAt: 1780000001000, servicePid: 1234, cleanupConfirmed: false });
-for (const stage of ['configuration','authorization','start-request','vpn-init','vpn-create','endpoint-dns','network','core-init','runtime-clock','forwarding','status','cleanup','proxy-dns','https','response']) {
+for (const stage of ['configuration','authorization','start-request','vpn-init','vpn-create','endpoint-dns','network','core-init','runtime-clock','forwarding','status','cleanup','proxy-dns','https','response','direct-dns']) {
   test('authored stage has bounded record and fixed user-facing text: ' + stage, () => {
     const value = failure.makeConnectionFailure(stage); assert(failure.validConnectionFailure(value));
     assert.deepEqual(Object.keys(value).sort(), ['at', 'reason', 'stage']); assert.equal(value.reason, 'failed');
@@ -83,6 +83,17 @@ test('proxy and physical DNS suggestions preserve distinct control paths', () =>
   assert.match(failure.failureProblem(failure.makeConnectionFailure('proxy-dns')), /不等同于 DNS 配置错误/);
   assert.match(failure.failureSuggestion(failure.makeConnectionFailure('proxy-dns')), /先核对节点.*再检查 DoH/);
   assert.match(failure.failureSuggestion(failure.makeConnectionFailure('endpoint-dns')), /不由应用内 DoH 设置控制/);
+});
+test('direct DNS failure does not imply a node failure or expose endpoint text', () => {
+  assert.match(failure.failureProblem(failure.makeConnectionFailure('direct-dns')), /不代表代理节点连接失败/);
+  assert.match(failure.failureSuggestion(failure.makeConnectionFailure('direct-dns')), /直连 DoH.*不经过代理节点/);
+  assert.match(failure.failureProblem(failure.makeConnectionFailure('direct-dns', 'timeout')), /直连 DNS 检查超时/);
+  assert.match(failure.failureProblem(failure.makeConnectionFailure('proxy-dns', 'timeout')), /经节点 DNS 检查超时/);
+  for (const stage of ['direct-dns', 'proxy-dns']) {
+    assert.match(failure.failureProblem(failure.makeConnectionFailure(stage, 'invalid-response')), /格式校验/);
+    const result = failure.connectionFailureFromError({ code: 2300060, message: 'private DoH TLS token' }, stage);
+    assert.equal(result.stage, stage); assert.equal(result.reason, 'failed'); assert(!JSON.stringify(result).includes('private'));
+  }
 });
 test('stable reason indices encode and decode only whitelisted event values', () => {
   for (const [index, reason] of ['failed','timeout','connection','tls','invalid-response','unavailable'].entries()) {

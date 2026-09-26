@@ -1,0 +1,944 @@
+package dns
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httptrace"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/xtls/xray-core/common/buf"
+	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/core"
+	dnsfeature "github.com/xtls/xray-core/features/dns"
+	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport"
+	"golang.org/x/net/dns/dnsmessage"
+	"golang.org/x/net/http2"
+)
+
+const harmonyDoHTestDeadline = 4 * time.Second
+
+// A non-nil dispatcher selects the production remote constructor, but all
+// successful I/O below replaces its dial with a trusted loopback-only TLS dial.
+// Accidentally calling the dispatcher is a hard failure, never external I/O.
+type harmonyDoHNoDispatch struct{}
+
+func (harmonyDoHNoDispatch) Type() interface{} { return routing.DispatcherType() }
+func (harmonyDoHNoDispatch) Start() error      { return nil }
+func (harmonyDoHNoDispatch) Close() error      { return nil }
+func (harmonyDoHNoDispatch) Dispatch(context.Context, xnet.Destination) (*transport.Link, error) {
+	return nil, errors.New("unexpected real dispatcher in loopback fixture")
+}
+func (harmonyDoHNoDispatch) DispatchLink(context.Context, xnet.Destination, *transport.Link) error {
+	return errors.New("unexpected real dispatcher in loopback fixture")
+}
+
+type harmonyDoHDispatcher struct {
+	harmonyDoHNoDispatch
+	dispatch func(context.Context, xnet.Destination) (*transport.Link, error)
+}
+
+func (d harmonyDoHDispatcher) Dispatch(ctx context.Context, dest xnet.Destination) (*transport.Link, error) {
+	return d.dispatch(ctx, dest)
+}
+
+type harmonyDoHPipeReader struct {
+	buf.Reader
+	conn   net.Conn
+	closes atomic.Int32
+}
+
+func (r *harmonyDoHPipeReader) Close() error { r.closes.Add(1); return r.conn.Close() }
+
+type harmonyDoHPipeWriter struct {
+	buf.Writer
+	conn   net.Conn
+	closes atomic.Int32
+}
+
+func (w *harmonyDoHPipeWriter) Close() error { w.closes.Add(1); return w.conn.Close() }
+
+// Dispatcher links own one underlying connection through two independently
+// closable halves. Context cancellation is a third closer. Preserve the first
+// real Close result while ensuring these owners close the raw socket once.
+type harmonyDoHOwnedConn struct {
+	net.Conn
+	once sync.Once
+	err  error
+}
+
+func (c *harmonyDoHOwnedConn) Close() error {
+	c.once.Do(func() { c.err = c.Conn.Close() })
+	return c.err
+}
+
+func harmonyDoHPipeLink(conn net.Conn) (*transport.Link, *harmonyDoHPipeReader, *harmonyDoHPipeWriter) {
+	if _, ok := conn.(*harmonyDoHOwnedConn); !ok {
+		conn = &harmonyDoHOwnedConn{Conn: conn}
+	}
+	r := &harmonyDoHPipeReader{Reader: buf.NewReader(conn), conn: conn}
+	w := &harmonyDoHPipeWriter{Writer: buf.NewWriter(conn), conn: conn}
+	return &transport.Link{Reader: r, Writer: w}, r, w
+}
+
+func harmonyDoHDispatchConstructor(t *testing.T, dispatcher routing.Dispatcher) *DoHNameServer {
+	t.Helper()
+	u, _ := url.Parse("h2c://127.0.0.1:4443/dns-query")
+	s := NewDoHNameServer(u, dispatcher, true, false, false, 0, nil)
+	t.Cleanup(func() { _ = s.transport.Close(); _ = s.cacheController.cacheCleanup.Close() })
+	return s
+}
+
+func harmonyDoHCoreContext() context.Context {
+	return context.WithValue(context.Background(), core.XrayKey(1), &core.Instance{})
+}
+
+func harmonyDoHReceive[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(harmonyDoHTestDeadline):
+		t.Fatal("bounded asynchronous operation did not complete")
+		var zero T
+		return zero
+	}
+}
+
+func harmonyDoHServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	accepted := new(atomic.Int32)
+	server := httptest.NewUnstartedServer(handler)
+	server.EnableHTTP2 = true
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			accepted.Add(1)
+		}
+	}
+	server.StartTLS()
+	t.Cleanup(func() { server.CloseClientConnections(); server.Close() })
+	return server, accepted
+}
+
+func harmonyDoHConstructor(t *testing.T, endpoint string, remote, h2c, disableCache bool) *DoHNameServer {
+	t.Helper()
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dispatcher routing.Dispatcher
+	if remote {
+		dispatcher = harmonyDoHNoDispatch{}
+	}
+	s := NewDoHNameServer(u, dispatcher, h2c, disableCache, false, 0, nil)
+	t.Cleanup(func() { _ = s.cacheController.cacheCleanup.Close(); _ = s.transport.Close() })
+	return s
+}
+
+// Track the raw TCP socket before the handshake, using a separate pool lifetime
+// context so a scope Close can interrupt even a TLS peer that sends no bytes.
+func harmonyDoHTrustedDial(t *dohTransport, server *httptest.Server, roots *x509.CertPool, serverName string) {
+	t.h2.DialTLSContext = func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+		dialCtx, cancel := withDoHCancellation(ctx, t.ctx)
+		defer cancel()
+		raw, err := (&net.Dialer{Timeout: harmonyDoHTestDeadline}).DialContext(dialCtx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		tracked, err := t.track(raw)
+		if err != nil {
+			return nil, err
+		}
+		conn := tls.Client(tracked, &tls.Config{RootCAs: roots, ServerName: serverName, NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
+		if err := conn.HandshakeContext(dialCtx); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return conn, nil
+	}
+}
+
+func harmonyDoHTrust(t *testing.T, transport *dohTransport, server *httptest.Server) {
+	t.Helper()
+	cert := server.Certificate()
+	if cert == nil {
+		t.Fatal("missing loopback server certificate")
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harmonyDoHTrustedDial(transport, server, pool, u.Hostname())
+}
+
+func harmonyDoHPost(ctx context.Context, server *DoHNameServer, payload string) error {
+	response, err := server.dohHTTPSContext(ctx, []byte(payload))
+	if err == nil && string(response) != payload {
+		return errors.New("HTTP2 response body differs")
+	}
+	return err
+}
+
+func harmonyDoHPostBounded(server *DoHNameServer, payload string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), harmonyDoHTestDeadline)
+	defer cancel()
+	return harmonyDoHPost(ctx, server, payload)
+}
+
+func harmonyDoHEcho(w http.ResponseWriter, r *http.Request) {
+	if r.ProtoMajor != 2 || r.Method != http.MethodPost {
+		http.Error(w, "requires HTTP2 POST", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+	_, _ = io.Copy(w, r.Body)
+}
+
+func harmonyDoHAssertEmpty(t *testing.T, owner *dohTransport) {
+	t.Helper()
+	owner.mu.Lock()
+	count := len(owner.conns)
+	owner.mu.Unlock()
+	if count != 0 {
+		t.Fatalf("closed pool still owns %d sockets", count)
+	}
+}
+
+func TestHarmonyDoHTransport(t *testing.T) {
+	t.Run("scope-equivalence-and-isolation", func(t *testing.T) {
+		scope := newDoHTransportScope()
+		t.Cleanup(func() { _ = scope.Close() })
+		a := harmonyDoHConstructor(t, "https://127.0.0.1:4443/dns-query", true, false, false)
+		b := harmonyDoHConstructor(t, "https://127.0.0.1:4443/dns-query", true, false, true)
+		originalB := b.transport
+		scope.adopt(a, "dns-via-node")
+		scope.adopt(b, "dns-via-node")
+		if a.transport != b.transport || a.httpClient.Transport != b.httpClient.Transport {
+			t.Fatal("equivalent HTTPS URLs and tags did not share a transport")
+		}
+		if a.httpClient == b.httpClient || a.cacheController == b.cacheController {
+			t.Fatal("pool sharing also shared independent client or DNS cache")
+		}
+		if a.IsDisableCache() || !b.IsDisableCache() {
+			t.Fatal("per-nameserver cache policy was changed")
+		}
+		if originalB.ctx.Err() == nil {
+			t.Fatal("unused newly constructed transport was not closed")
+		}
+		for _, fixture := range []struct {
+			name, endpoint, tag string
+			remote, h2c         bool
+		}{
+			{"different-tag", a.dohURL, "dns-via-direct", true, false},
+			{"different-path", "https://127.0.0.1:4443/other-query", "dns-via-node", true, false},
+			{"different-query", "https://127.0.0.1:4443/dns-query?profile=2", "dns-via-node", true, false},
+			{"local", a.dohURL, "dns-via-node", false, false},
+			{"remote-h2c", "h2c://127.0.0.1:4443/dns-query", "dns-via-node", true, true},
+			{"local-h2c", "h2c+local://127.0.0.1:4443/dns-query", "dns-via-node", false, true},
+		} {
+			t.Run(fixture.name, func(t *testing.T) {
+				candidate := harmonyDoHConstructor(t, fixture.endpoint, fixture.remote, fixture.h2c, false)
+				scope.adopt(candidate, fixture.tag)
+				if candidate.transport == a.transport {
+					t.Fatal("ineligible DNS transports were shared")
+				}
+			})
+		}
+		otherScope := newDoHTransportScope()
+		t.Cleanup(func() { _ = otherScope.Close() })
+		other := harmonyDoHConstructor(t, a.dohURL, true, false, false)
+		otherScope.adopt(other, "dns-via-node")
+		if other.transport == a.transport {
+			t.Fatal("distinct DNS feature instances share sockets")
+		}
+		if err := scope.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := scope.Close(); err != nil {
+			t.Fatal("scope Close was not idempotent:", err)
+		}
+		late := harmonyDoHConstructor(t, a.dohURL, true, false, false)
+		scope.adopt(late, "dns-via-node")
+		if late.transport.ctx.Err() == nil {
+			t.Fatal("adopting into a closed scope leaves an open owner")
+		}
+	})
+
+	t.Run("wire-DNS-independent-caches-single-TLS-accept", func(t *testing.T) {
+		queries := new(atomic.Int32)
+		server, accepts := harmonyDoHServer(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.ProtoMajor != 2 || r.Header.Get("Content-Type") != "application/dns-message" {
+				http.Error(w, "invalid DoH", 400)
+				return
+			}
+			wire, err := io.ReadAll(io.LimitReader(r.Body, 65536))
+			_ = r.Body.Close()
+			if err != nil {
+				http.Error(w, "body", 400)
+				return
+			}
+			var message dnsmessage.Message
+			if err := message.Unpack(wire); err != nil || len(message.Questions) != 1 || message.Questions[0].Type != dnsmessage.TypeA {
+				http.Error(w, "question", 400)
+				return
+			}
+			queries.Add(1)
+			question := message.Questions[0]
+			response := dnsmessage.Message{Header: dnsmessage.Header{ID: message.ID, Response: true, RecursionAvailable: true}, Questions: message.Questions, Answers: []dnsmessage.Resource{{Header: dnsmessage.ResourceHeader{Name: question.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 120}, Body: &dnsmessage.AResource{A: [4]byte{192, 0, 2, 42}}}}}
+			wire, err = response.Pack()
+			if err != nil {
+				http.Error(w, "pack", 500)
+				return
+			}
+			w.Header().Set("Content-Type", "application/dns-message")
+			_, _ = w.Write(wire)
+		})
+		scope := newDoHTransportScope()
+		t.Cleanup(func() { _ = scope.Close() })
+		a := harmonyDoHConstructor(t, server.URL+"/dns-query", true, false, false)
+		b := harmonyDoHConstructor(t, server.URL+"/dns-query", true, false, false)
+		scope.adopt(a, "dns-via-node")
+		scope.adopt(b, "dns-via-node")
+		harmonyDoHTrust(t, a.transport, server)
+		for _, client := range []*DoHNameServer{a, b, a, b} {
+			ctx, cancel := context.WithTimeout(context.Background(), harmonyDoHTestDeadline)
+			ips, ttl, err := client.QueryIP(ctx, "independent.example", dnsfeature.IPOption{IPv4Enable: true})
+			cancel()
+			if err != nil || len(ips) != 1 || !ips[0].Equal(net.IPv4(192, 0, 2, 42)) || ttl == 0 {
+				t.Fatalf("invalid DNS result: ips=%v ttl=%d err=%v", ips, ttl, err)
+			}
+		}
+		if queries.Load() != 2 {
+			t.Fatalf("expected one independent upstream query per DNS cache, got %d", queries.Load())
+		}
+		if accepts.Load() != 1 {
+			t.Fatalf("two independent DNS clients needed %d accepted TLS sockets", accepts.Load())
+		}
+		if err := scope.Close(); err != nil {
+			t.Fatal(err)
+		}
+		harmonyDoHAssertEmpty(t, a.transport)
+	})
+
+	t.Run("warm-canceled-stream-does-not-cancel-other-client", func(t *testing.T) {
+		started := make(chan struct{}, 1)
+		server, accepts := harmonyDoHServer(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/cancel" {
+				started <- struct{}{}
+				<-r.Context().Done()
+				return
+			}
+			harmonyDoHEcho(w, r)
+		})
+		scope := newDoHTransportScope()
+		t.Cleanup(func() { _ = scope.Close() })
+		a := harmonyDoHConstructor(t, server.URL+"/echo", true, false, false)
+		b := harmonyDoHConstructor(t, server.URL+"/echo", true, false, false)
+		scope.adopt(a, "dns-via-node")
+		scope.adopt(b, "dns-via-node")
+		harmonyDoHTrust(t, a.transport, server)
+		if err := harmonyDoHPostBounded(a, "warm"); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), harmonyDoHTestDeadline)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/cancel", bytes.NewReader([]byte("cancel")))
+		result := make(chan error, 1)
+		go func() {
+			response, err := a.httpClient.Do(req)
+			if response != nil {
+				_ = response.Body.Close()
+			}
+			result <- err
+		}()
+		harmonyDoHReceive(t, started)
+		if err := harmonyDoHPostBounded(b, "other-active-stream"); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		if err := harmonyDoHReceive(t, result); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled stream result: %v", err)
+		}
+		if err := harmonyDoHPostBounded(b, "reuse-after-cancel"); err != nil {
+			t.Fatal(err)
+		}
+		if accepts.Load() != 1 {
+			t.Fatalf("warm cancellation discarded shared HTTP2 socket, accepts=%d", accepts.Load())
+		}
+	})
+
+	t.Run("cold-canceled-dial-can-be-retried", func(t *testing.T) {
+		server, accepts := harmonyDoHServer(t, harmonyDoHEcho)
+		scope := newDoHTransportScope()
+		t.Cleanup(func() { _ = scope.Close() })
+		a := harmonyDoHConstructor(t, server.URL+"/echo", true, false, false)
+		b := harmonyDoHConstructor(t, server.URL+"/echo", true, false, false)
+		scope.adopt(a, "dns-via-node")
+		scope.adopt(b, "dns-via-node")
+		harmonyDoHTrust(t, a.transport, server)
+		originalDial := a.transport.h2.DialTLSContext
+		entered, release := make(chan struct{}, 1), make(chan struct{})
+		var calls atomic.Int32
+		a.transport.h2.DialTLSContext = func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+			if calls.Add(1) == 1 {
+				entered <- struct{}{}
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(harmonyDoHTestDeadline):
+					return nil, errors.New("cold-dial test barrier timeout")
+				}
+			}
+			return originalDial(ctx, network, addr, cfg)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), harmonyDoHTestDeadline)
+		defer cancel()
+		first := make(chan error, 1)
+		go func() { first <- harmonyDoHPost(ctx, a, "cold-canceled") }()
+		harmonyDoHReceive(t, entered)
+		cancel()
+		if err := harmonyDoHReceive(t, first); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cold canceled request result: %v", err)
+		}
+		close(release)
+		if err := harmonyDoHPostBounded(b, "retry"); err != nil {
+			t.Fatal("other DNS client cannot retry canceled initial dial:", err)
+		}
+		count := accepts.Load()
+		if err := harmonyDoHPostBounded(a, "after-retry"); err != nil {
+			t.Fatal(err)
+		}
+		if accepts.Load() != count {
+			t.Fatal("successful retry did not leave a reusable HTTP2 connection")
+		}
+	})
+
+	t.Run("close-active-body-reject-new-request-and-new-instance", func(t *testing.T) {
+		bodyStarted := make(chan struct{}, 1)
+		server, accepts := harmonyDoHServer(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/blocked-body" {
+				w.WriteHeader(200)
+				w.(http.Flusher).Flush()
+				bodyStarted <- struct{}{}
+				<-r.Context().Done()
+				return
+			}
+			harmonyDoHEcho(w, r)
+		})
+		owner := newDoHTransport()
+		t.Cleanup(func() { _ = owner.Close() })
+		harmonyDoHTrust(t, owner, server)
+		ctx, cancel := context.WithTimeout(context.Background(), harmonyDoHTestDeadline)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/blocked-body", nil)
+		response, err := owner.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		harmonyDoHReceive(t, bodyStarted)
+		read := make(chan error, 1)
+		go func() { _, err := io.ReadAll(response.Body); _ = response.Body.Close(); read <- err }()
+		if err := owner.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := harmonyDoHReceive(t, read); err == nil {
+			t.Fatal("active incomplete body succeeded after pool Close")
+		}
+		if err := owner.Close(); err != nil {
+			t.Fatal("repeat Close:", err)
+		}
+		harmonyDoHAssertEmpty(t, owner)
+		if _, err := owner.RoundTrip(req); !errors.Is(err, errDoHTransportClosed) {
+			t.Fatalf("closed transport accepts new request: %v", err)
+		}
+		fresh := harmonyDoHConstructor(t, server.URL+"/echo", true, false, false)
+		harmonyDoHTrust(t, fresh.transport, server)
+		if err := harmonyDoHPostBounded(fresh, "new-instance"); err != nil {
+			t.Fatal(err)
+		}
+		if accepts.Load() != 2 {
+			t.Fatalf("new instance reused a closed instance connection, accepts=%d", accepts.Load())
+		}
+	})
+
+	t.Run("close-interrupts-TLS-handshake", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = listener.Close() })
+		accepted := make(chan net.Conn, 1)
+		go func() {
+			conn, err := listener.Accept()
+			if err == nil {
+				accepted <- conn
+			}
+		}()
+		owner := newDoHTransport()
+		t.Cleanup(func() { _ = owner.Close() })
+		trackedReady := make(chan struct{}, 1)
+		owner.h2.DialTLSContext = func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			dialCtx, cancel := withDoHCancellation(ctx, owner.ctx)
+			defer cancel()
+			raw, err := (&net.Dialer{Timeout: harmonyDoHTestDeadline}).DialContext(dialCtx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			tracked, err := owner.track(raw)
+			if err != nil {
+				return nil, err
+			}
+			trackedReady <- struct{}{}
+			conn := tls.Client(tracked, &tls.Config{ServerName: "localhost", NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
+			if err := conn.HandshakeContext(dialCtx); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			return conn, nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), harmonyDoHTestDeadline)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, "POST", "https://"+listener.Addr().String()+"/dns-query", nil)
+		result := make(chan error, 1)
+		go func() {
+			response, err := owner.RoundTrip(req)
+			if response != nil {
+				_ = response.Body.Close()
+			}
+			result <- err
+		}()
+		peer := harmonyDoHReceive(t, accepted)
+		t.Cleanup(func() { _ = peer.Close() })
+		harmonyDoHReceive(t, trackedReady)
+		if err := owner.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := harmonyDoHReceive(t, result); err == nil {
+			t.Fatal("handshake succeeded without TLS server bytes")
+		}
+		harmonyDoHAssertEmpty(t, owner)
+	})
+
+	t.Run("late-successful-dial-is-closed", func(t *testing.T) {
+		owner := newDoHTransport()
+		if err := owner.Close(); err != nil {
+			t.Fatal(err)
+		}
+		left, right := net.Pipe()
+		defer right.Close()
+		if _, err := owner.track(left); !errors.Is(err, errDoHTransportClosed) {
+			t.Fatalf("late registration result: %v", err)
+		}
+		_ = right.SetReadDeadline(time.Now().Add(harmonyDoHTestDeadline))
+		var value [1]byte
+		if _, err := right.Read(value[:]); !errors.Is(err, io.EOF) {
+			t.Fatalf("late raw connection was not closed: %v", err)
+		}
+		harmonyDoHAssertEmpty(t, owner)
+	})
+
+	t.Run("trusted-TLS-rejects-wrong-hostname-and-untrusted-root", func(t *testing.T) {
+		server, _ := harmonyDoHServer(t, harmonyDoHEcho)
+		for _, fixture := range []struct {
+			name, serverName string
+			trusted          bool
+		}{
+			{"wrong-hostname", "mismatch.invalid", true}, {"untrusted-root", "127.0.0.1", false},
+		} {
+			t.Run(fixture.name, func(t *testing.T) {
+				client := harmonyDoHConstructor(t, server.URL+"/echo", true, false, false)
+				roots := x509.NewCertPool()
+				if fixture.trusted {
+					roots.AddCert(server.Certificate())
+				}
+				harmonyDoHTrustedDial(client.transport, server, roots, fixture.serverName)
+				err := harmonyDoHPostBounded(client, "TLS-negative")
+				if err == nil || !strings.Contains(err.Error(), "certificate") {
+					t.Fatalf("expected certificate verification error, got %v", err)
+				}
+				if err := client.transport.Close(); err != nil {
+					t.Fatal(err)
+				}
+				harmonyDoHAssertEmpty(t, client.transport)
+			})
+		}
+	})
+
+	t.Run("production-constructor-rejects-untrusted-TLS", func(t *testing.T) {
+		server, _ := harmonyDoHServer(t, harmonyDoHEcho)
+		client := harmonyDoHConstructor(t, server.URL+"/dns-query", false, false, false)
+		// No injected dial: this is the production local constructor's verified
+		// uTLS path. httptest's private certificate is absent from system trust.
+		err := harmonyDoHPostBounded(client, "untrusted-production")
+		if err == nil || !strings.Contains(err.Error(), "certificate") {
+			t.Fatalf("production TLS validation did not reject untrusted certificate: %v", err)
+		}
+		if err := client.transport.Close(); err != nil {
+			t.Fatal(err)
+		}
+		harmonyDoHAssertEmpty(t, client.transport)
+	})
+
+	t.Run("production-dispatch-context-survives-successful-dial", func(t *testing.T) {
+		left, peer := net.Pipe()
+		t.Cleanup(func() { _ = left.Close(); _ = peer.Close() })
+		link, reader, writer := harmonyDoHPipeLink(left)
+		var dispatched context.Context
+		client := harmonyDoHDispatchConstructor(t, harmonyDoHDispatcher{dispatch: func(ctx context.Context, _ xnet.Destination) (*transport.Link, error) {
+			dispatched = ctx
+			return link, nil
+		}})
+		ctx, cancel := context.WithCancel(harmonyDoHCoreContext())
+		defer cancel()
+		conn, err := client.transport.h2.DialTLSContext(ctx, "tcp", "127.0.0.1:4443", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dispatched == nil || dispatched.Err() != nil {
+			t.Fatal("successful dial canceled its retained dispatcher context")
+		}
+		cancel()
+		// This is deterministic: a canceled caller's AfterFunc must already have
+		// been detached before the successful dial returns, not scheduled later.
+		if dispatched.Err() != nil {
+			t.Fatal("caller cancellation propagated into an established connection")
+		}
+		write := make(chan error, 1)
+		go func() { _, err := conn.Write([]byte("alive")); write <- err }()
+		_ = peer.SetReadDeadline(time.Now().Add(harmonyDoHTestDeadline))
+		value := make([]byte, 5)
+		if _, err := io.ReadFull(peer, value); err != nil || string(value) != "alive" {
+			t.Fatalf("retained dispatch connection is not usable: %q %v", value, err)
+		}
+		if err := harmonyDoHReceive(t, write); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.transport.Close(); err != nil {
+			t.Fatal(err)
+		}
+		harmonyDoHReceive(t, dispatched.Done())
+		if reader.closes.Load() == 0 || writer.closes.Load() == 0 {
+			t.Fatal("pool Close did not close both dispatcher link halves")
+		}
+		if _, err := peer.Read(value); !errors.Is(err, io.EOF) {
+			t.Fatalf("dispatcher connection remains live after Close: %v", err)
+		}
+		harmonyDoHAssertEmpty(t, client.transport)
+	})
+
+	t.Run("production-delayed-dispatch-after-close-releases-late-link", func(t *testing.T) {
+		left, peer := net.Pipe()
+		t.Cleanup(func() { _ = left.Close(); _ = peer.Close() })
+		link, reader, writer := harmonyDoHPipeLink(left)
+		entered := make(chan context.Context, 1)
+		release := make(chan struct{})
+		client := harmonyDoHDispatchConstructor(t, harmonyDoHDispatcher{dispatch: func(ctx context.Context, _ xnet.Destination) (*transport.Link, error) {
+			entered <- ctx
+			select {
+			case <-release:
+				return link, nil
+			case <-time.After(harmonyDoHTestDeadline):
+				return nil, errors.New("delayed dispatch fixture timeout")
+			}
+		}})
+		result := make(chan error, 1)
+		go func() {
+			conn, err := client.transport.h2.DialTLSContext(harmonyDoHCoreContext(), "tcp", "127.0.0.1:4443", nil)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			result <- err
+		}()
+		dispatched := harmonyDoHReceive(t, entered)
+		if err := client.transport.Close(); err != nil {
+			t.Fatal(err)
+		}
+		harmonyDoHReceive(t, dispatched.Done())
+		close(release)
+		if err := harmonyDoHReceive(t, result); err == nil {
+			t.Fatal("late dispatch succeeded after owning pool closed")
+		}
+		if reader.closes.Load() == 0 || writer.closes.Load() == 0 {
+			t.Fatal("late successful dispatch leaked a link half")
+		}
+		_ = peer.SetReadDeadline(time.Now().Add(harmonyDoHTestDeadline))
+		var value [1]byte
+		if _, err := peer.Read(value[:]); !errors.Is(err, io.EOF) {
+			t.Fatalf("late dispatch raw socket was not closed: %v", err)
+		}
+		harmonyDoHAssertEmpty(t, client.transport)
+	})
+
+	t.Run("production-dispatch-link-plus-error-closes-both-halves", func(t *testing.T) {
+		left, peer := net.Pipe()
+		t.Cleanup(func() { _ = left.Close(); _ = peer.Close() })
+		link, reader, writer := harmonyDoHPipeLink(left)
+		sentinel := errors.New("dispatcher returned a partial link")
+		var dispatched context.Context
+		client := harmonyDoHDispatchConstructor(t, harmonyDoHDispatcher{dispatch: func(ctx context.Context, _ xnet.Destination) (*transport.Link, error) {
+			dispatched = ctx
+			return link, sentinel
+		}})
+		conn, err := client.transport.h2.DialTLSContext(harmonyDoHCoreContext(), "tcp", "127.0.0.1:4443", nil)
+		if conn != nil || !errors.Is(err, sentinel) {
+			t.Fatalf("partial dispatch response was accepted: conn=%v err=%v", conn, err)
+		}
+		if dispatched == nil || dispatched.Err() == nil {
+			t.Fatal("failed dispatcher context was not canceled")
+		}
+		if reader.closes.Load() == 0 || writer.closes.Load() == 0 {
+			t.Fatal("partial dispatch failure leaked link halves")
+		}
+		_ = peer.SetReadDeadline(time.Now().Add(harmonyDoHTestDeadline))
+		var value [1]byte
+		if _, err := peer.Read(value[:]); !errors.Is(err, io.EOF) {
+			t.Fatalf("partial dispatch raw socket was not closed: %v", err)
+		}
+		harmonyDoHAssertEmpty(t, client.transport)
+	})
+
+	t.Run("production-pending-dial-caller-cancel-closes-late-link", func(t *testing.T) {
+		left, peer := net.Pipe()
+		t.Cleanup(func() { _ = left.Close(); _ = peer.Close() })
+		link, reader, writer := harmonyDoHPipeLink(left)
+		entered := make(chan context.Context, 1)
+		release := make(chan struct{})
+		client := harmonyDoHDispatchConstructor(t, harmonyDoHDispatcher{dispatch: func(ctx context.Context, _ xnet.Destination) (*transport.Link, error) {
+			entered <- ctx
+			select {
+			case <-release:
+				return link, nil
+			case <-time.After(harmonyDoHTestDeadline):
+				return nil, errors.New("canceled dispatch fixture timeout")
+			}
+		}})
+		ctx, cancel := context.WithCancel(harmonyDoHCoreContext())
+		defer cancel()
+		result := make(chan error, 1)
+		go func() {
+			conn, err := client.transport.h2.DialTLSContext(ctx, "tcp", "127.0.0.1:4443", nil)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			result <- err
+		}()
+		dispatched := harmonyDoHReceive(t, entered)
+		cancel()
+		harmonyDoHReceive(t, dispatched.Done())
+		close(release)
+		if err := harmonyDoHReceive(t, result); !errors.Is(err, context.Canceled) {
+			t.Fatalf("caller-canceled pending dial result: %v", err)
+		}
+		if reader.closes.Load() == 0 || writer.closes.Load() == 0 {
+			t.Fatal("caller-canceled pending dispatch leaked a link half")
+		}
+		if client.transport.ctx.Err() != nil {
+			t.Fatal("one caller cancellation destroyed the entire pool lifetime")
+		}
+		_ = peer.SetReadDeadline(time.Now().Add(harmonyDoHTestDeadline))
+		var value [1]byte
+		if _, err := peer.Read(value[:]); !errors.Is(err, io.EOF) {
+			t.Fatalf("caller-canceled late raw socket was not closed: %v", err)
+		}
+		harmonyDoHAssertEmpty(t, client.transport)
+	})
+
+	t.Run("production-h2c-wire-DNS-third-query-keeps-dispatch-context", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		serverDone := make(chan struct{}, 1)
+		accepts, queries, dispatches := new(atomic.Int32), new(atomic.Int32), new(atomic.Int32)
+		var serverMu sync.Mutex
+		var accepted net.Conn
+		t.Cleanup(func() {
+			_ = listener.Close()
+			serverMu.Lock()
+			if accepted != nil {
+				_ = accepted.Close()
+			}
+			serverMu.Unlock()
+			harmonyDoHReceive(t, serverDone)
+		})
+		// This deliberately tests the production h2c constructor's real dispatch
+		// lifecycle, not TLS verification or h2c sharing (h2c is never pooled).
+		go func() {
+			defer func() { serverDone <- struct{}{} }()
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			serverMu.Lock()
+			accepted = conn
+			serverMu.Unlock()
+			accepts.Add(1)
+			defer conn.Close()
+			(&http2.Server{}).ServeConn(conn, &http2.ServeConnOpts{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.ProtoMajor != 2 || r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/dns-message" {
+					http.Error(w, "invalid DoH", 400)
+					return
+				}
+				wire, err := io.ReadAll(io.LimitReader(r.Body, 65536))
+				_ = r.Body.Close()
+				var request dnsmessage.Message
+				if err != nil || request.Unpack(wire) != nil || len(request.Questions) != 1 || request.Questions[0].Type != dnsmessage.TypeA {
+					http.Error(w, "invalid question", 400)
+					return
+				}
+				queries.Add(1)
+				question := request.Questions[0]
+				response := dnsmessage.Message{Header: dnsmessage.Header{ID: request.ID, Response: true, RecursionAvailable: true}, Questions: request.Questions, Answers: []dnsmessage.Resource{{Header: dnsmessage.ResourceHeader{Name: question.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 120}, Body: &dnsmessage.AResource{A: [4]byte{192, 0, 2, 43}}}}}
+				wire, err = response.Pack()
+				if err != nil {
+					http.Error(w, "invalid response", 500)
+					return
+				}
+				w.Header().Set("Content-Type", "application/dns-message")
+				_, _ = w.Write(wire)
+			})})
+		}()
+		connectionCanceled := make(chan struct{}, 1)
+		var retainedMu sync.Mutex
+		var retained context.Context
+		client := harmonyDoHDispatchConstructor(t, harmonyDoHDispatcher{dispatch: func(ctx context.Context, _ xnet.Destination) (*transport.Link, error) {
+			dispatches.Add(1)
+			raw, err := (&net.Dialer{Timeout: harmonyDoHTestDeadline}).DialContext(ctx, "tcp", listener.Addr().String())
+			if err != nil {
+				return nil, err
+			}
+			conn := &harmonyDoHOwnedConn{Conn: raw}
+			retainedMu.Lock()
+			retained = ctx
+			retainedMu.Unlock()
+			context.AfterFunc(ctx, func() {
+				_ = conn.Close()
+				select {
+				case connectionCanceled <- struct{}{}:
+				default:
+				}
+			})
+			link, _, _ := harmonyDoHPipeLink(conn)
+			return link, nil
+		}})
+		for _, domain := range []string{"first.example", "second.example", "third.example"} {
+			ctx, cancel := context.WithTimeout(harmonyDoHCoreContext(), harmonyDoHTestDeadline)
+			ips, ttl, err := client.QueryIP(ctx, domain, dnsfeature.IPOption{IPv4Enable: true})
+			cancel()
+			if err != nil || len(ips) != 1 || !ips[0].Equal(net.IPv4(192, 0, 2, 43)) || ttl == 0 {
+				t.Fatalf("production dispatcher wire DNS failed: %s ips=%v ttl=%d err=%v", domain, ips, ttl, err)
+			}
+			retainedMu.Lock()
+			active := retained != nil && retained.Err() == nil
+			retainedMu.Unlock()
+			if !active {
+				t.Fatal("completed query canceled the connection dispatcher context")
+			}
+		}
+		if queries.Load() != 3 || accepts.Load() != 1 || dispatches.Load() != 1 {
+			t.Fatalf("three independent DNS queries did not retain one real dispatched connection: queries=%d accepts=%d dispatches=%d", queries.Load(), accepts.Load(), dispatches.Load())
+		}
+		if err := client.transport.Close(); err != nil {
+			t.Fatal(err)
+		}
+		harmonyDoHReceive(t, connectionCanceled)
+		harmonyDoHAssertEmpty(t, client.transport)
+	})
+
+	t.Run("overlapping-cold-request-survives-other-request-cancel", func(t *testing.T) {
+		server, accepts := harmonyDoHServer(t, harmonyDoHEcho)
+		scope := newDoHTransportScope()
+		t.Cleanup(func() { _ = scope.Close() })
+		a := harmonyDoHConstructor(t, server.URL+"/echo", true, false, false)
+		b := harmonyDoHConstructor(t, server.URL+"/echo", true, false, false)
+		scope.adopt(a, "dns-via-node")
+		scope.adopt(b, "dns-via-node")
+		harmonyDoHTrust(t, a.transport, server)
+		originalDial := a.transport.h2.DialTLSContext
+		entered, release := make(chan struct{}, 1), make(chan struct{})
+		var releaseOnce sync.Once
+		t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+		var dials atomic.Int32
+		a.transport.h2.DialTLSContext = func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+			if dials.Add(1) == 1 {
+				entered <- struct{}{}
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(harmonyDoHTestDeadline):
+					return nil, errors.New("overlap cold-dial barrier timeout")
+				}
+			}
+			return originalDial(ctx, network, addr, cfg)
+		}
+		firstCtx, cancelFirst := context.WithTimeout(context.Background(), harmonyDoHTestDeadline)
+		defer cancelFirst()
+		first := make(chan error, 1)
+		go func() { first <- harmonyDoHPost(firstCtx, a, "first-canceled") }()
+		harmonyDoHReceive(t, entered)
+		secondCtx, cancelSecond := context.WithTimeout(context.Background(), harmonyDoHTestDeadline)
+		defer cancelSecond()
+		getConn := make(chan struct{}, 1)
+		var gotConn atomic.Int32
+		secondCtx = httptrace.WithClientTrace(secondCtx, &httptrace.ClientTrace{
+			GetConn: func(string) {
+				select {
+				case getConn <- struct{}{}:
+				default:
+				}
+			},
+			GotConn: func(httptrace.GotConnInfo) { gotConn.Add(1) },
+		})
+		second := make(chan error, 1)
+		go func() { second <- harmonyDoHPost(secondCtx, b, "overlapping-survivor") }()
+		harmonyDoHReceive(t, getConn)
+		// GetConn proves the second request has entered connection acquisition
+		// while the first cold dial is blocked. It does not expose HTTP2's private
+		// waiter list; no claim about its exact internal scheduling is needed.
+		if gotConn.Load() != 0 || accepts.Load() != 0 {
+			t.Fatal("cold acquisition barrier unexpectedly already owns a socket")
+		}
+		select {
+		case err := <-second:
+			t.Fatalf("second request finished before cold dial release: %v", err)
+		default:
+		}
+		cancelFirst()
+		if err := harmonyDoHReceive(t, first); !errors.Is(err, context.Canceled) {
+			t.Fatalf("overlapping first canceled request result: %v", err)
+		}
+		if secondCtx.Err() != nil || a.transport.ctx.Err() != nil {
+			t.Fatal("canceling one caller poisoned the other request or pool lifetime")
+		}
+		releaseOnce.Do(func() { close(release) })
+		if err := harmonyDoHReceive(t, second); err != nil {
+			t.Fatal("overlapping second cold request failed:", err)
+		}
+		if accepts.Load() != 1 || gotConn.Load() != 1 {
+			t.Fatalf("surviving request did not use one accepted TLS connection: accepts=%d GotConn=%d", accepts.Load(), gotConn.Load())
+		}
+		if err := harmonyDoHPostBounded(a, "reuse-after-overlap"); err != nil {
+			t.Fatal(err)
+		}
+		if accepts.Load() != 1 {
+			t.Fatal("third request reopened a surviving HTTP2 socket")
+		}
+		t.Logf("overlapping cold requests: DialTLS attempts=%d, accepted TLS sockets=%d; GetConn is an acquisition barrier, not an internal waiter-list observation", dials.Load(), accepts.Load())
+	})
+}

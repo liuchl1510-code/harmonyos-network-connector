@@ -11,7 +11,7 @@ const devEco = process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco
 const ts = require(path.join(devEco, 'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
 const names = ['model/ConnectionFailure.ets', 'model/ConnectionControl.ets', 'model/ConnectionSnapshot.ets', 'model/ConnectionNotification.ets', 'model/TransferRate.ets',
   'model/ProbeState.ets', 'model/ConnectionLifecycle.ets', 'model/DockConnectionAction.ets', 'model/NodeEditGuard.ets', 'model/NodeBootstrap.ets', 'model/NodeIssue.ets',
-  'model/NodeImport.ets', 'model/NodePreflight.ets', 'model/AppRouting.ets', 'model/NetworkPolicy.ets', 'model/VpnAuthorization.ets', 'vpn/VpnProbeAbility.ets', 'pages/Home.ets', 'pages/Index.ets'];
+  'model/NodeImport.ets', 'model/NodePreflight.ets', 'model/AppRouting.ets', 'model/NetworkPolicy.ets', 'model/DnsFaultTest.ets', 'model/VpnAuthorization.ets', 'vpn/VpnProbeAbility.ets', 'pages/Home.ets', 'pages/Index.ets'];
 const sources = new Map(names.map(name => [name, fs.readFileSync(path.join(root, 'entry/src/main/ets', name), 'utf8')]));
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 async function flush() { for (let i = 0; i < 35; i++) await Promise.resolve(); }
@@ -25,7 +25,7 @@ function scenario(options = {}) {
     observerCreate: 0, observerOn: 0, observerOff: 0, coreConstruct: 0, coreSuspend: 0, coreResume: 0,
     coreStartArgs: [], coreResumeArgs: [], snapshot: 0, protect: [], networkRead: 0, dns: [], watcherStart: 0, watcherStop: 0,
     commandWrites: [], resourceReads: [], recoveryObservations: [], vpnStarts: [], journal: [], policyRead: 0, connectionConstruct: 0,
-    createdConfigs: [] };
+    createdConfigs: [], proxyDnsChecks: 0, directDnsChecks: 0, httpDestroyed: 0 };
   class PhysicalNetwork {
     constructor(netId = 100, kind = 'wifi', key = `${netId}/${kind}/synthetic`) { Object.assign(this, { netId, kind, key }); }
   }
@@ -59,12 +59,13 @@ function scenario(options = {}) {
   };
   class FakeDate extends Date { static now() { return clock.now; } }
   const silent = { info() {}, error() {}, warn() {} };
-  const context = { filesDir: '/synthetic-vpn', openLink: async () => {} };
+  const context = { filesDir: '/synthetic-vpn', openLink: async () => {}, applicationInfo: { debug: options.debug === true } };
   const shared = { VPN_CORE_AVAILABLE: !options.preview, deviceInfo: { sdkApiVersion: options.sdkApiVersion ?? 26 }, fs: fakeFs, Date: FakeDate, systemDateTime: { TimeType: { STARTUP: 0 }, getUptime: () => clock.now }, hilog: silent, describeError: () => 'synthetic-error',
     AppStorage: {
       get: key => appStorage.get(key),
       set(key, value) { if (!appStorage.has(key)) return false; appStorage.set(key, value); return true; },
-      setOrCreate(key, value) { appStorage.set(key, value); return true; }
+      setOrCreate(key, value) { appStorage.set(key, value); return true; },
+      delete(key) { return appStorage.delete(key); }
     },
     $r(name) { calls.resourceReads.push(name); return { id: name }; },
     util: { generateRandomUUID: () => 'synthetic-' + uuid++, TextEncoder: class { encodeInto(s) { return new TextEncoder().encode(s); } } },
@@ -93,7 +94,8 @@ function scenario(options = {}) {
     readTransferResult: () => ({ status: 'pending', runId: '' }),
     appendDiagnosticEvent: (...args) => { calls.journal.push(args.slice(1)); },
     connectionExitMarker: () => 'synthetic-exit',
-    checkProxyDns: () => options.checkProxyDns ? options.checkProxyDns() : Promise.resolve(),
+    checkProxyDns: current => { calls.proxyDnsChecks++; return options.checkProxyDns ? options.checkProxyDns(current) : Promise.resolve(); },
+    checkDirectDns: current => { calls.directDnsChecks++; return options.checkDirectDns ? options.checkDirectDns(current) : Promise.resolve(); },
     probeIpv6Datagram: () => {
       calls.ipv6Datagrams++;
       return options.probeIpv6Datagram ? options.probeIpv6Datagram() : Promise.resolve(false);
@@ -115,12 +117,6 @@ function scenario(options = {}) {
   Object.assign(shared, load('model/ConnectionSnapshot.ets'));
   Object.assign(shared, load('model/ConnectionFailure.ets'));
   Object.assign(shared, load('model/TransferRate.ets'));
-  Object.assign(shared, load('model/ConnectionControl.ets'));
-  const writeConnectionCommand = shared.writeConnectionCommand;
-  shared.writeConnectionCommand = (filesDir, command) => {
-    calls.commandWrites.push({ ...command });
-    return writeConnectionCommand(filesDir, command);
-  };
   Object.assign(shared, load('model/ProbeState.ets'));
   Object.assign(shared, load('model/NodeBootstrap.ets'));
   Object.assign(shared, load('model/NodeIssue.ets'));
@@ -128,6 +124,13 @@ function scenario(options = {}) {
   Object.assign(shared, load('model/NodePreflight.ets'));
   Object.assign(shared, load('model/AppRouting.ets'));
   Object.assign(shared, load('model/NetworkPolicy.ets'));
+  Object.assign(shared, load('model/DnsFaultTest.ets'));
+  Object.assign(shared, load('model/ConnectionControl.ets'));
+  const writeConnectionCommand = shared.writeConnectionCommand;
+  shared.writeConnectionCommand = (filesDir, command) => {
+    calls.commandWrites.push({ ...command });
+    return writeConnectionCommand(filesDir, command);
+  };
   const notificationManager = {
     isNotificationEnabled: () => options.notificationEnabled ? options.notificationEnabled() : Promise.resolve(true),
     requestEnableNotification: async () => {},
@@ -164,7 +167,7 @@ function scenario(options = {}) {
   if (options.missingObserver) delete vpnExtension.createVpnObserver;
   const http = { RequestMethod: { GET: 0 }, HttpDataType: { STRING: 0 }, createHttp: () => ({
     request: () => { calls.transfer++; return options.httpRequest ? options.httpRequest() : Promise.resolve({ responseCode: 200, result: 'h=www.cloudflare.com\nip=synthetic\n' }); },
-    destroy() {} }) };
+    destroy() { calls.httpDestroyed++; } }) };
   Object.assign(shared, { vpnExtension, http,
     VpnExtensionAbility: class { constructor() { this.context = context; } }, CoreProbe: class { constructor() { calls.coreConstruct++; return core; } },
     native: { inspectFd: () => 'synthetic fd OK', inspectTunAddresses: () => 'synthetic TUN addresses', currentProcessId: () => 4242 },
@@ -220,6 +223,85 @@ function scenario(options = {}) {
 const tests = [];
 function test(name, body) { tests.push({ name, body }); }
 
+function useSplitReceipt(s) {
+  const status = s.status(); status.effectiveMode = 'whitelist'; status.effectiveDnsMode = 'split';
+  s.shared.writeConnectionStatus(s.context.filesDir, status);
+}
+
+test('effective split DNS checks both paths and HTTPS without changing service state or user policy', async () => {
+  const s = scenario(); s.activate(); useSplitReceipt(s); s.home.refresh();
+  const writes=s.calls.commandWrites.length; await s.home.checkConnection();
+  assert.equal(s.calls.directDnsChecks,1); assert.equal(s.calls.proxyDnsChecks,1); assert.equal(s.calls.transfer,1);
+  assert.equal(s.home.directDnsResult,'直连 DNS：通过'); assert.equal(s.home.proxyDnsResult,'经节点 DNS：通过');
+  assert.equal(s.home.checkResult,'直连 DNS、经节点 DNS 与域名 HTTPS 检查通过。');
+  assert.equal(s.status().phase,'active'); assert.equal(s.status().failure,undefined); assert.equal(s.calls.commandWrites.length,writes);
+});
+for(const reason of ['timeout','invalid-response','failed']) test('direct DNS '+reason+' still checks proxy DNS and HTTPS', async()=>{
+  let s; s=scenario({checkDirectDns:async()=>{throw new s.shared.ConnectionFailureError('direct-dns',reason)}});
+  s.activate();useSplitReceipt(s);s.home.refresh();await s.home.checkConnection();
+  assert.equal(s.calls.proxyDnsChecks,1);assert.equal(s.calls.transfer,1);assert.equal(s.home.checkFailure.stage,'direct-dns');
+  assert.equal(s.home.checkFailure.reason,reason);assert.equal(s.home.checkResult,'经节点 DNS 与域名 HTTPS 检查通过，直连 DNS 需要检查。');
+  assert.equal(s.status().phase,'active');assert.equal(s.status().failure,undefined);assert.equal(s.calls.httpDestroyed,1);
+});
+test('proxy DNS failure is separate from successful direct DNS and prevents the HTTPS request',async()=>{
+  let s;s=scenario({checkProxyDns:async()=>{throw new s.shared.ConnectionFailureError('proxy-dns','timeout')}});
+  s.activate();useSplitReceipt(s);s.home.refresh();await s.home.checkConnection();
+  assert.equal(s.home.directDnsResult,'直连 DNS：通过');assert.equal(s.home.proxyDnsResult,'经节点 DNS：未完成（超时）');
+  assert.equal(s.home.checkFailure.stage,'proxy-dns');assert.equal(s.calls.transfer,0);assert.equal(s.status().phase,'active');
+});
+test('both DNS failures retain both path classifications without diagnosing node authentication',async()=>{
+  let s;s=scenario({checkDirectDns:async()=>{throw new s.shared.ConnectionFailureError('direct-dns','failed')},checkProxyDns:async()=>{throw new s.shared.ConnectionFailureError('proxy-dns','failed')}});
+  s.activate();useSplitReceipt(s);s.home.refresh();await s.home.checkConnection();
+  assert.equal(s.home.directDnsFailure.stage,'direct-dns');assert.equal(s.home.checkFailure.stage,'proxy-dns');assert.equal(s.calls.transfer,0);
+  assert.equal(s.status().failure,undefined);assert(!s.home.checkResult.includes('认证失败'));
+});
+test('hiding the page during direct DNS cancels the owner and prevents proxy and HTTPS followups',async()=>{
+  const gate=deferred();let current;const s=scenario({checkDirectDns:c=>{current=c;return gate.promise}});
+  s.activate();useSplitReceipt(s);s.home.refresh();const check=s.home.checkConnection();await flush();assert.equal(current(),true);
+  s.home.onPageHide();assert.equal(current(),false);gate.resolve();await check;
+  assert.equal(s.calls.proxyDnsChecks,0);assert.equal(s.calls.transfer,0);assert.equal(s.calls.httpDestroyed,1);
+  assert.equal(s.home.directDnsFailure,undefined);assert.equal(s.status().phase,'active');
+});
+test('a fresh waiting-network or recovery counter clears all older DNS failures',async()=>{
+  let s;s=scenario({checkDirectDns:async()=>{throw new s.shared.ConnectionFailureError('direct-dns','timeout')}});
+  s.activate();useSplitReceipt(s);s.home.refresh();await s.home.checkConnection();assert(s.home.directDnsFailure);
+  writeServicePhase(s,'waiting-network');s.home.refresh();assert.equal(s.home.directDnsFailure,undefined);assert.equal(s.home.checkFailure,undefined);
+  assert.equal(s.home.directDnsResult,'');assert.equal(s.home.proxyDnsResult,'');
+  writeServicePhase(s,'active',1);s.home.refresh();assert.equal(s.home.checkFailure,undefined);
+});
+for(const kind of ['baseline','http404','timeout']) test('debug '+kind+' admits one in-memory application-only fault policy',async()=>{
+  const saved=appPolicy(),before=JSON.stringify(saved),s=scenario({debug:true,readNetworkPolicy:()=>saved});const launch=s.prepare('fault-run','starting','connection-app-test');
+  const command=s.command();command.dnsFault=new s.shared.DnsFaultRequest(kind,'FaultToken123');s.shared.writeConnectionCommand(s.context.filesDir,command);
+  s.service.onCreate({parameters:launch});await s.service.initialization;await flush();
+  assert.equal(s.status().phase,'active');assert.equal(s.status().effectiveMode,'whitelist');assert.equal(s.status().effectiveDnsMode,'split');
+  assert.equal(s.status().dnsFault.kind,kind);assert.equal(s.calls.coreStartArgs[0][6],kind);
+  assert.deepEqual(s.calls.createdConfigs[0].trustedApplications,['com.example.harmonyvpnlab']);assert.equal(JSON.stringify(saved),before);
+  assert.equal(s.timers.get(s.service.timerId).ms,kind==='baseline'?300000:90000);
+  await s.service.requestStop(false);await flush();
+});
+for(const [name,options,age,kind] of [['release',{debug:false},0,'connection-app-test'],['expired',{debug:true},30001,'connection-app-test'],['normal-kind',{debug:true},0,'connection']]) {
+ test('fault admission rejects '+name+' before allocating VPN or physical watcher',async()=>{
+  const s=scenario(options),launch=s.prepare('bad-fault','starting',kind),command=s.command();
+  command.dnsFault=new s.shared.DnsFaultRequest('http404','FaultToken123',s.clock.now-age);s.shared.writeConnectionCommand(s.context.filesDir,command);
+  s.service.onCreate({parameters:launch});await settleFailedService(s);
+  assert.equal(s.calls.create,0);assert.equal(s.calls.watcherStart,0);assert.equal(s.calls.coreStart,0);
+ });
+}
+test('Home consumes an admitted debug request only on the application test button',async()=>{
+  const s=scenario({debug:true});s.home.hasNode=true;s.shared.AppStorage.setOrCreate('pendingDnsFaultRequest',new s.shared.DnsFaultRequest('http404','FaultToken123'));
+  await s.home.connect('connection-app-test');assert.equal(s.calls.vpnStarts.length,1);assert.equal(s.command().dnsFault.kind,'http404');
+  assert.equal(s.shared.AppStorage.get('pendingDnsFaultRequest'),undefined);
+});
+test('Home ordinary connection leaves test request out of the start command',async()=>{
+  const s=scenario({debug:true});s.home.hasNode=true;s.shared.AppStorage.setOrCreate('pendingDnsFaultRequest',new s.shared.DnsFaultRequest('timeout','FaultToken123'));
+  await s.home.connect();assert.equal(s.calls.vpnStarts.length,1);assert.equal(s.command().dnsFault,undefined);
+});
+test('Home refuses an expired test request without starting a normal fallback connection',async()=>{
+  const s=scenario({debug:true});s.home.hasNode=true;s.shared.AppStorage.setOrCreate('pendingDnsFaultRequest',new s.shared.DnsFaultRequest('http404','FaultToken123',s.clock.now-30001));
+  await s.home.connect('connection-app-test');assert.equal(s.calls.vpnStarts.length,0);assert.equal(s.calls.commandWrites.length,0);
+  assert.equal(s.shared.AppStorage.get('pendingDnsFaultRequest'),undefined);
+});
+
 async function settleFailedService(s) {
   await s.service.initialization; await flush(); if (s.service.cleanup) await s.service.cleanup; await flush();
 }
@@ -249,7 +331,7 @@ for (const mode of ['all', 'exclude', 'include']) test('service uses native ' + 
 test('legacy service policy is upgraded in memory before VPN creation', async () => {
   const saved = appPolicy(); delete saved.appMode; delete saved.appBundles; saved.schemaVersion = 1;
   const before = JSON.stringify(saved), s = scenario({ readNetworkPolicy: () => saved }); await s.launch();
-  assert.equal(s.service.connectionPolicy.schemaVersion, 2); assert.equal(s.service.connectionPolicy.appMode, 'all');
+  assert.equal(s.service.connectionPolicy.schemaVersion, 3); assert.equal(s.service.connectionPolicy.appMode, 'all');
   assert.equal(s.calls.createdConfigs[0].trustedApplications, undefined); assert.equal(JSON.stringify(saved), before);
   await s.service.requestStop(false); await flush();
 });
@@ -775,7 +857,7 @@ test('Home developer view cycles retain the active session and authorization sub
     assert.equal(s.home.onBackPress(), false);
     s.home.onPageShow(); assert.equal(s.home.developerTools, false, 'consumed developer flag must not reopen the view');
     assert.equal(s.home.authorizationSubscription, subscription); assert.equal(s.timers.size, 1);
-    assert.equal(s.home.checkGeneration, generation);
+    assert.equal(s.home.checkGeneration, generation + i + 1);
     assert.equal(s.calls.commandWrites.length, writes, 'view changes must not write any connection command');
     assert.equal(s.command().action, 'start'); assert.equal(s.calls.serviceStop, 0);
     assert.equal(s.calls.coreStop, 0); assert.equal(s.calls.destroy, 0);
@@ -783,18 +865,19 @@ test('Home developer view cycles retain the active session and authorization sub
   }
 });
 
-test('Home developer view changes preserve an in-flight connection check', async () => {
+test('Home page hiding cancels an in-flight check without stopping the active session', async () => {
   const gate = deferred(), s = scenario({ httpRequest: () => gate.promise });
   s.activate(); s.home.aboutToAppear(); await flush();
   const pending = s.home.checkConnection(); await flush(); assert.equal(s.calls.transfer, 1);
   const generation = s.home.checkGeneration, subscription = s.home.authorizationSubscription;
   const writes = s.calls.commandWrites.length;
   s.home.onPageHide(); s.shared.AppStorage.setOrCreate('openDeveloperTools', true); s.home.onPageShow();
-  assert.equal(s.home.developerTools, true); assert.equal(s.home.checking, true);
-  assert.equal(s.home.onBackPress(), true); assert.equal(s.home.checking, true);
-  assert.equal(s.home.checkGeneration, generation); assert.equal(s.home.authorizationSubscription, subscription);
+  assert.equal(s.home.developerTools, true); assert.equal(s.home.checking, false);
+  assert.equal(s.home.onBackPress(), true); assert.equal(s.home.checking, false);
+  assert.equal(s.home.checkGeneration, generation + 1); assert.equal(s.home.authorizationSubscription, subscription);
   gate.resolve({ responseCode: 200, result: 'h=www.cloudflare.com\nip=synthetic\n' }); await pending;
-  assert.equal(s.home.checkResult, '代理 DNS 与域名 HTTPS 检查通过。'); assert.equal(s.home.checking, false);
+  assert.notEqual(s.home.checkResult, '代理 DNS 与域名 HTTPS 检查通过。'); assert.equal(s.home.checking, false);
+  assert.equal(s.calls.httpDestroyed, 1, 'the cancelled HTTP request is destroyed exactly once');
   assert.equal(s.calls.commandWrites.length, writes); assert.equal(s.calls.serviceStop, 0);
   assert.equal(s.calls.observerCreate, 1); assert.equal(s.calls.observerOn, 1); assert.equal(s.calls.observerOff, 0);
 });

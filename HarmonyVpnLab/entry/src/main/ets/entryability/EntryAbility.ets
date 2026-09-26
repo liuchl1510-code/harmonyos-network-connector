@@ -6,6 +6,9 @@ import { applyAppearance, readAppearance } from '../model/Appearance';
 import { normalizedWindowWidth } from '../model/AdaptiveLayout';
 import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
 import { deviceInfo } from '@kit.BasicServicesKit';
+import { validDnsBenchmark } from '../model/DnsBenchmark';
+import { DnsFaultRequest, validDnsFaultAdmission } from '../model/DnsFaultTest';
+import { readConnectionLifecycle } from '../model/ConnectionLifecycle';
 
 interface SmokeResult {
   passed: boolean;
@@ -23,11 +26,15 @@ export default class EntryAbility extends UIAbility {
   private resizeListener?: (size: window.Size) => void;
   private avoidAreaListener?: (options: window.AvoidAreaOptions) => void;
   private windowSizeTest: string = '';
+  private dnsBenchmarkRequested: boolean = false;
+  private dnsFaultTokens: string[] = [];
 
   onCreate(want: Want): void {
     AppStorage.setOrCreate('windowWidthVp', 360);
     AppStorage.setOrCreate('statusBarHeightVp', 0);
     this.readUiFontTest(want);
+    this.dnsBenchmarkRequested = this.readDnsBenchmark(want);
+    this.readDnsFault(want);
     const mode = want.parameters?.['runtimeSmoke'];
     if (mode === 'fixtures' || mode === 'go') {
       // Debug-only command, run in a fresh UI process. The Xray VPN extension
@@ -43,6 +50,39 @@ export default class EntryAbility extends UIAbility {
   onNewWant(want: Want): void {
     this.readUiFontTest(want);
     if (this.contentReady) { this.applyUiFontTest(); }
+    if (this.readDnsFault(want) && this.contentReady && this.mainWindow) {
+      void this.mainWindow.getUIContext().getRouter().replaceUrl({ url: 'pages/Home' })
+        .catch(() => { hilog.warn(0x0000, 'HarmonyVpnLab', 'DNS_FAULT_PAGE_UNAVAILABLE'); });
+    }
+    if (this.readDnsBenchmark(want) && this.contentReady && this.mainWindow) {
+      // Keep this UI process and its connection owner epoch. Never force-stop
+      // an existing VPN just to run an independent read-only measurement.
+      void this.mainWindow.getUIContext().getRouter().replaceUrl({ url: 'pages/DnsBenchmark' })
+        .catch(() => { hilog.warn(0x0000, 'HarmonyVpnLab', 'DNS_BENCHMARK_PAGE_UNAVAILABLE'); });
+    }
+  }
+
+  private readDnsBenchmark(want: Want): boolean {
+    const target = want.parameters?.['dnsBenchmark'];
+    const token = want.parameters?.['dnsBenchmarkToken'];
+    if (!this.context.applicationInfo.debug || !VPN_CORE_AVAILABLE || typeof target !== 'string' ||
+      typeof token !== 'string' || !validDnsBenchmark(target, token)) { return false; }
+    AppStorage.setOrCreate('dnsBenchmarkTarget', target);
+    AppStorage.setOrCreate('dnsBenchmarkToken', token);
+    return true;
+  }
+
+  private readDnsFault(want: Want): boolean {
+    const kind = want.parameters?.['dnsFault']; const token = want.parameters?.['dnsFaultToken'];
+    if (!this.context.applicationInfo.debug || !VPN_CORE_AVAILABLE || typeof kind !== 'string' || typeof token !== 'string') { return false; }
+    const request = new DnsFaultRequest(kind, token);
+    if (!validDnsFaultAdmission(request, Date.now()) || this.dnsFaultTokens.includes(token) || this.dnsFaultTokens.length >= 128) { return false; }
+    try { if (!readConnectionLifecycle(this.context.filesDir).closed) { return false; } }
+    catch (_) { return false; }
+    this.dnsFaultTokens.push(token);
+    AppStorage.setOrCreate('pendingDnsFaultRequest', request);
+    AppStorage.setOrCreate('openDeveloperTools', true);
+    return true;
   }
 
   private readUiFontTest(want: Want): void {
@@ -112,7 +152,8 @@ export default class EntryAbility extends UIAbility {
     this.mainWindow = windowStage.getMainWindowSync();
     // The diagnostic page never loads Index.refreshState, which could resume
     // an earlier HTTP test and interfere with this isolated runtime check.
-    const page: string = this.runtimeMode.length > 0 ? 'pages/RuntimeSmoke' : 'pages/Home';
+    const page: string = this.runtimeMode.length > 0 ? 'pages/RuntimeSmoke' :
+      this.dnsBenchmarkRequested ? 'pages/DnsBenchmark' : 'pages/Home';
     windowStage.loadContent(page, (err) => {
       if (err.code) {
         hilog.error(0x0000, 'HarmonyVpnLab', 'UI_LOAD_FAILED %{public}s', JSON.stringify(err));

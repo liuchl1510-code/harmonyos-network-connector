@@ -1,5 +1,5 @@
 const STAGES: string[] = ['configuration', 'authorization', 'start-request', 'vpn-init', 'vpn-create', 'endpoint-dns',
-  'network', 'core-init', 'runtime-clock', 'forwarding', 'status', 'cleanup', 'proxy-dns', 'https', 'response'];
+  'network', 'core-init', 'runtime-clock', 'forwarding', 'status', 'cleanup', 'proxy-dns', 'https', 'response', 'direct-dns'];
 // Persisted diagnostic values use these stable indices. Never reorder them.
 const REASONS: string[] = ['failed', 'timeout', 'connection', 'tls', 'invalid-response', 'unavailable'];
 const DIAGNOSTIC_PREFIX = 'operation-failed-';
@@ -81,6 +81,7 @@ export function failureStageLabel(stage: string): string {
     case 'status': return '运行状态检查';
     case 'cleanup': return '资源清理';
     case 'proxy-dns': return '代理 DNS 检查';
+    case 'direct-dns': return '直连 DNS 检查';
     case 'https': return '域名 HTTPS 检查';
     case 'response': return '测试站点响应检查';
     default: return '连接检查';
@@ -94,7 +95,16 @@ export function failureProblem(failure: ConnectionFailure): string {
     if (failure.reason === 'connection') { return 'HTTP 客户端未能建立连接，不能据此确定节点认证参数是否有误。'; }
     if (failure.reason === 'tls') { return 'HTTPS 客户端证书验证未通过，不能据此确定节点握手的具体原因。'; }
   }
-  if (failure.stage === 'proxy-dns') { return '代理 DNS 检查未通过；这只说明本次检查未完成，不等同于 DNS 配置错误。'; }
+  if (failure.stage === 'proxy-dns') {
+    if (failure.reason === 'timeout') { return '经节点 DNS 检查超时，尚不能确定是解析服务、节点路径还是当前网络的问题。'; }
+    if (failure.reason === 'invalid-response') { return '代理 DNS 检查收到的响应未通过格式校验，不能据此确定节点参数是否有误。'; }
+    return '代理 DNS 检查未通过；这只说明本次检查未完成，不等同于 DNS 配置错误。';
+  }
+  if (failure.stage === 'direct-dns') {
+    if (failure.reason === 'invalid-response') { return '直连 DNS 检查收到的响应未通过格式校验；这不代表代理节点连接失败。'; }
+    return failure.reason === 'timeout' ? '直连 DNS 检查超时，尚不能确定是解析服务还是当前网络的问题。' :
+      '直连 DNS 检查未完成；这不代表代理节点连接失败。';
+  }
   if (failure.stage === 'response') { return '测试站点的响应不符合本次检查要求。'; }
   if (failure.stage === 'cleanup') { return '部分资源清理尚未确认，不能把这一结果当作已完成清理。'; }
   if (failure.stage === 'runtime-clock') { return '核心时间检查未通过，尚未开始本轮核心启动。'; }
@@ -110,6 +120,7 @@ export function failureSuggestion(failure: ConnectionFailure): string {
     case 'endpoint-dns': return '先检查当前网络和节点服务器域名；该步骤使用物理网络解析，不由应用内 DoH 设置控制。';
     case 'network': return '检查当前网络是否可用，等待网络稳定后重试。';
     case 'proxy-dns': return '先核对节点在当前网络能否连接，再检查 DoH 服务可用性。';
+    case 'direct-dns': return '检查直连 DoH 地址和当前网络，再重试检查；该查询不经过代理节点。';
     case 'https': case 'response': return '确认同一节点和当前网络可用后重试；测试站点不可用也可能导致检查失败。';
     case 'runtime-clock': return '重新打开应用再试；若反复出现，请保留该阶段提示用于排查核心运行时。';
     case 'cleanup': return '等待服务结束或使用恢复清理；确认结束后再建立新连接。';

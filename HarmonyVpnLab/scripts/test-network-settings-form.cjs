@@ -73,7 +73,8 @@ function fixture(options = {}) {
 function privateSafe(value) { assert(!JSON.stringify(value).includes('synthetic-private')); }
 const cases = [], add = (name, run) => cases.push({ name, run });
 const changes = { mode: 'rules', bypassLan: true, direct: 'direct.example.com', proxy: 'proxy.example.com',
-  block: 'full:blocked.example.com', dnsUrl: 'https://dns.example.com/dns-query' };
+  block: 'full:blocked.example.com', dnsUrl: 'https://dns.example.com/dns-query',
+  dnsMode: 'split', directDnsUrl: 'https://1.1.1.1/dns-query' };
 for (const [field, value] of Object.entries(changes)) add(field + ' detects changes and exact undo becomes clean', () => {
   const f = fixture(), initial = f.page[field]; f.change(field, value); assert.equal(f.page.dirty, true);
   f.change(field, initial); assert.equal(f.page.dirty, false); assert.equal(f.state.writes, 0);
@@ -126,6 +127,99 @@ for (const id of ['routingGlobal', 'routingWhitelist', 'routingRules']) {
     });
   }
 }
+add('actual DNS mode selection is default-off and exact undo leaves a clean draft', () => {
+  const f = fixture(); assert.equal(f.page.dnsMode, 'proxy');
+  assert.equal(f.page.directDnsUrl, 'https://223.5.5.5/dns-query');
+  assert.match(f.page.dnsModeHint(), /默认.*经节点.*未开启/);
+  pageEvent(f, 'dnsModeSplit', 'onClick'); assert.equal(f.page.dnsMode, 'split'); assert.equal(f.page.dirty, true);
+  assert.match(f.page.dnsModeHint(), /已保留.*不是白名单.*经节点/);
+  pageEvent(f, 'dnsModeProxy', 'onClick'); assert.equal(f.page.dnsMode, 'proxy'); assert.equal(f.page.dirty, false);
+  assert.equal(f.state.writes, 0);
+});
+add('split save and reopening retain both DNS URLs, app scope and custom rules', () => {
+  const value = appPolicy('include'); value.mode = 'rules'; value.bypassLan = true;
+  value.direct = ['domain:direct.example.com']; value.proxy = ['domain:proxy.example.com'];
+  value.block = ['full:blocked.example.com']; value.dnsUrl = 'https://dns.example.com/query';
+  const f = fixture({ value }); pageEvent(f, 'routingWhitelist', 'onClick'); pageEvent(f, 'dnsModeSplit', 'onClick');
+  pageEvent(f, 'directDnsUrl', 'onChange', '  https://1.1.1.1:443/dns-query  '); f.page.save();
+  const saved = { ...clone(value), mode: 'whitelist', dnsMode: 'split', directDnsUrl: 'https://1.1.1.1:443/dns-query' };
+  assert.equal(f.state.writes, 1); assert.equal(f.page.dirty, false); assert.deepEqual(clone(f.state.value), saved);
+  f.page.aboutToDisappear(); f.page.aboutToAppear(); assert.equal(f.page.dnsMode, 'split');
+  assert.equal(f.page.directDnsUrl, saved.directDnsUrl); assert.equal(f.page.dnsUrl, saved.dnsUrl);
+  assert.match(f.page.dnsModeHint(), /下次连接.*Google.*其余域名经节点/);
+  pageEvent(f, 'dnsModeProxy', 'onClick'); f.page.save();
+  assert.deepEqual(clone(f.state.value), { ...saved, dnsMode: 'proxy' });
+  pageEvent(f, 'dnsModeSplit', 'onClick'); f.page.save(); assert.deepEqual(clone(f.state.value), saved);
+});
+for (const mode of ['global', 'rules']) {
+  add('split preference and direct URL survive inactive ' + mode + ' and restoring whitelist', () => {
+    const value = appPolicy(); value.mode = 'whitelist'; value.dnsMode = 'split';
+    value.directDnsUrl = 'https://1.1.1.1/dns-query';
+    const f = fixture({ value }); f.page.changeRoutingMode(mode); f.page.save();
+    assert.deepEqual(clone(f.state.value), { ...clone(value), mode });
+    assert.match(f.page.dnsModeHint(), /已保留.*不是白名单.*经节点/);
+    f.page.aboutToDisappear(); f.page.aboutToAppear(); assert.equal(f.page.dnsMode, 'split');
+    assert.equal(f.page.directDnsUrl, value.directDnsUrl);
+    pageEvent(f, 'routingWhitelist', 'onClick'); f.page.save();
+    assert.deepEqual(clone(f.state.value), clone(value));
+  });
+}
+for (const [id, field, original, replacement] of [
+  ['resetDns', 'dnsUrl', 'https://1.1.1.1/dns-query', 'https://dns.example.com/query'],
+  ['resetDirectDns', 'directDnsUrl', 'https://223.5.5.5/dns-query', 'https://1.1.1.1/dns-query']
+]) {
+  add('actual ' + id + ' resets only its own URL and allows exact undo', () => {
+    const value = appPolicy(); value.dnsMode = 'split'; value[field] = replacement;
+    const f = fixture({ value }); const other = field === 'dnsUrl' ? 'directDnsUrl' : 'dnsUrl';
+    pageEvent(f, id, 'onClick'); assert.equal(f.page[field], original); assert.equal(f.page[other], value[other]);
+    assert.equal(f.page.dirty, true); pageEvent(f, id, 'onClick'); assert.equal(f.page.dirty, true);
+    pageEvent(f, field, 'onChange', replacement); assert.equal(f.page.dirty, false); assert.equal(f.state.writes, 0);
+  });
+}
+for (const id of ['dnsModeProxy', 'dnsModeSplit', 'resetDns', 'resetDirectDns']) {
+  for (const denial of ['connection', 'confirmation', 'leaving', 'guard-error']) {
+    add('queued ' + id + ' click cannot mutate a draft during ' + denial, () => {
+      const value = appPolicy(); value.dnsMode = id === 'dnsModeProxy' ? 'split' : 'proxy';
+      value.dnsUrl = 'https://dns.example.com/query'; value.directDnsUrl = 'https://1.1.1.1/dns-query';
+      const f = fixture({ value }); const previous = f.page.snapshot();
+      if (denial === 'connection') f.state.allowed = false;
+      if (denial === 'confirmation') f.page.confirmingLeave = true;
+      if (denial === 'leaving') f.page.leaving = true;
+      if (denial === 'guard-error') f.state.guardFailure = true;
+      pageEvent(f, id, 'onClick'); assert.equal(f.page.snapshot(), previous);
+      assert.equal(f.page.dirty, false); assert.equal(f.state.writes, 0);
+    });
+  }
+}
+for (const invalid of ['http://223.5.5.5/dns-query', 'https://dns.example.com/query',
+  'https://[2001:db8::1]/dns-query', 'https://user:secret@223.5.5.5/query', 'https://223.5.5.5/query#part',
+  'https://127.0.0.1/query', 'https://198.18.0.1/query']) {
+  for (const mode of ['proxy', 'split']) add('direct DNS ' + mode + ' rejects ' + invalid + ' without replacing saved preferences', () => {
+    const f = fixture(); const previous = clone(f.state.value);
+    f.page.changeDnsMode(mode); pageEvent(f, 'directDnsUrl', 'onChange', invalid); f.page.save();
+    assert.equal(f.page.directDnsUrl, invalid); assert.equal(f.page.dirty, true); assert.equal(f.state.writes, 0);
+    assert.deepEqual(clone(f.state.value), previous); assert.match(f.page.message, /DNS.*(?:地址|格式)/);
+    assert(!f.page.message.includes(invalid)); assert(!f.page.message.includes('secret'));
+  });
+}
+add('DNS-only edits participate in leave confirmation and are preserved when discard is declined', async () => {
+  const f = fixture(); pageEvent(f, 'dnsModeSplit', 'onClick');
+  pageEvent(f, 'directDnsUrl', 'onChange', 'https://1.1.1.1/dns-query'); const previous = f.page.snapshot();
+  const pending = f.page.requestBack(); assert.equal(f.state.dialogs.length, 1);
+  f.state.dialogs[0].resolve({ index: 0 }); await pending;
+  assert.equal(f.page.snapshot(), previous); assert.equal(f.page.dirty, true); assert.equal(f.state.writes, 0);
+});
+add('switching off split retains an invalid direct URL for correction before save', () => {
+  const f = fixture(); const original = clone(f.state.value);
+  pageEvent(f, 'dnsModeSplit', 'onClick'); pageEvent(f, 'directDnsUrl', 'onChange', 'https://dns.example.com/query');
+  pageEvent(f, 'dnsModeProxy', 'onClick'); f.page.save();
+  assert.equal(f.page.dnsMode, 'proxy'); assert.equal(f.page.directDnsUrl, 'https://dns.example.com/query');
+  assert.match(f.page.message, /直连 DNS.*IPv4/); assert.equal(f.state.writes, 0);
+  assert.deepEqual(clone(f.state.value), original);
+  pageEvent(f, 'directDnsUrl', 'onChange', 'https://1.1.1.1/dns-query'); f.page.save();
+  assert.equal(f.state.writes, 1); assert.equal(f.state.value.dnsMode, 'proxy');
+  assert.equal(f.state.value.directDnsUrl, 'https://1.1.1.1/dns-query'); assert.equal(f.page.dirty, false);
+});
 for (const [field, value] of [['direct', 'https://invalid.example.com'], ['dnsUrl', 'http://dns.example.com/query']]) {
   add(field + ' validation failure preserves raw draft and old policy', () => {
     const f = fixture(), previous = clone(f.state.value); f.change(field, value); f.page.save();
@@ -290,10 +384,13 @@ for (const mode of ['exclude', 'include']) {
     assert.deepEqual(clone(f.state.value.appBundles), [exampleApp, 'com.example.other']);
   });
 }
-add('legacy schema loads as all apps without writing or discarding existing rules', () => {
-  const value = clone(appPolicy()); value.schemaVersion = 1; delete value.appMode; delete value.appBundles;
+for (const version of [1, 2]) add('legacy schema ' + version + ' loads proxy DNS without writing or discarding existing rules', () => {
+  const value = clone(appPolicy()); value.schemaVersion = version; delete value.dnsMode; delete value.directDnsUrl;
+  if (version === 1) { delete value.appMode; delete value.appBundles; }
   value.mode = 'rules'; value.direct = ['domain:example.com'];
-  const f = fixture({ value }); assert.equal(f.page.appMode, 'all'); assert.deepEqual(clone(f.page.appBundles), []);
+  const f = fixture({ value }); assert.equal(f.page.appMode, version === 1 ? 'all' : 'exclude');
+  assert.deepEqual(clone(f.page.appBundles), version === 1 ? [] : [exampleApp]);
+  assert.equal(f.page.dnsMode, 'proxy'); assert.equal(f.page.directDnsUrl, 'https://223.5.5.5/dns-query');
   assert.equal(f.page.direct, 'domain:example.com'); assert.equal(f.page.dirty, false); assert.equal(f.state.writes, 0);
 });
 add('remove and readd preset restores clean state independently of array order', () => {
@@ -443,7 +540,8 @@ function enabledBinding(idNode, ast) {
 add('actual NetworkSettings controls freeze during confirmation and footer stays outside scroll', () => {
   const { ast, ids } = parsePage('pages/NetworkSettings.ets');
   const state = { editable: true, dirty: true, needsRepair: false, confirmingLeave: false, leaving: false };
-  for (const id of ['routingGlobal', 'routingWhitelist', 'routingRules', 'bypassLan', 'routingDirect', 'routingProxy', 'routingBlock', 'dnsUrl', 'resetDns', 'saveNetworkSettings']) {
+  for (const id of ['routingGlobal', 'routingWhitelist', 'routingRules', 'bypassLan', 'routingDirect', 'routingProxy', 'routingBlock',
+    'dnsModeProxy', 'dnsModeSplit', 'dnsUrl', 'resetDns', 'directDnsUrl', 'resetDirectDns', 'saveNetworkSettings']) {
     const enabled = enabledBinding(ids.get(id), ast); assert.equal(enabled.call(state), true, id);
     for (const denied of [{ confirmingLeave: true }, { leaving: true }, { editable: false }]) assert.equal(enabled.call({ ...state, ...denied }), false, id);
   }
@@ -471,6 +569,29 @@ add('actual routing controls show fixed whitelist guidance without custom list o
       assert.equal(visible(id, mode), mode === 'rules', id + ' ' + mode);
     }
     assert.equal(visible('dnsUrl', mode), true, 'Existing HTTPS DNS remains shared');
+  }
+});
+add('actual DNS controls expose split or customized direct URLs in every routing mode for correction', () => {
+  const { ast, ids } = parsePage('pages/NetworkSettings.ets');
+  function visible(id, mode, dnsMode, directDnsUrl) {
+    assert(ids.has(id), id);
+    for (let node = ids.get(id).parent; node; node = node.parent) {
+      if (ts.isIfStatement(node) && !new Function('return ' + node.expression.getText(ast)).call({ mode, dnsMode, directDnsUrl })) return false;
+    }
+    return true;
+  }
+  for (const mode of ['global', 'whitelist', 'rules']) for (const dnsMode of ['proxy', 'split']) {
+    for (const directDnsUrl of ['https://223.5.5.5/dns-query', 'https://1.1.1.1/dns-query', 'https://invalid.example.com/query']) {
+      const showsDirect = dnsMode === 'split' || directDnsUrl !== 'https://223.5.5.5/dns-query';
+      for (const id of ['dnsModeProxy', 'dnsModeSplit', 'dnsModeHint', 'dnsUrl', 'resetDns']) {
+        assert.equal(visible(id, mode, dnsMode, directDnsUrl), true, id + ' ' + mode + ' ' + dnsMode);
+      }
+      for (const id of ['directDnsUrl', 'resetDirectDns', 'directDnsHint', 'dnsSplitFailureHint']) {
+        assert.equal(visible(id, mode, dnsMode, directDnsUrl), showsDirect, id + ' ' + mode + ' ' + dnsMode);
+      }
+      assert.equal(visible('directDnsInactiveHint', mode, dnsMode, directDnsUrl),
+        showsDirect && (mode !== 'whitelist' || dnsMode !== 'split'));
+    }
   }
 });
 add('actual app controls block mutations during connection, confirmation or navigation', () => {

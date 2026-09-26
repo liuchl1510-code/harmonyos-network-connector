@@ -438,7 +438,7 @@ struct NodeConfig {
                   .fontSize(15).fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
                   .enabled(this.editable && !this.scanning && !this.confirmingLeave && !this.leaving && this.replacementAddress.trim().length > 0)
                   .onClick(() => { this.updateAddress(); });
-                Text('支持 IPv4 地址或域名。连接前解析域名，应用 DNS 通过节点，IPv6 流量暂时阻断。')
+                Text('支持 IPv4 地址或域名。连接前解析节点域名，应用 DNS 按网络设置查询，IPv6 流量暂时阻断。')
                   .fontSize(13).fontColor($r('app.color.text_secondary'));
               }
             }.width('100%').padding(20).alignItems(HorizontalAlign.Start)

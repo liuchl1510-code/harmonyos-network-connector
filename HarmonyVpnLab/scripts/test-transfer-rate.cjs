@@ -225,7 +225,7 @@ function homeHarness() {
     '../model/BuildCapabilities': { VPN_CORE_AVAILABLE: true },
     '../model/NetworkPolicyStore': { readNetworkPolicy: () => ({ appMode: 'all', appBundles: [] }) },
     '../model/AppRouting': execute(appRoutingCode),
-    '../model/NetworkPolicy': { networkPolicyLabel: () => '全部代理' }, '../model/TransferRate': rates
+    '../model/NetworkPolicy': { networkPolicyLabel: () => '全部代理', isSplitDnsActive: () => false }, '../model/TransferRate': rates
   };
   imports['../model/ConnectionLifecycle'] = execute(lifecycleCode, {
     'libvpnbridge.so': imports['libvpnbridge.so'], './ProbeState': imports['../model/ProbeState'],

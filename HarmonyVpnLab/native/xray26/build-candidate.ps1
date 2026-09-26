@@ -36,6 +36,22 @@ try {
     $env:GOPROXY='off';$env:GOSUMDB='off'
     & $PythonPath (Join-Path $taskRecipe 'prepare.py') $taskStage $taskCore.Dir $taskCoreStage $taskRecipe
     if($LASTEXITCODE -ne 0){throw 'Audited new-core source preparation failed'}
+    # Run the real patched HTTP2 transport and lifecycle fixture. Hide upstream
+    # test-only modules rather than downloading unrelated test dependencies.
+    $taskDoHOverlayMap=@{}
+    Get-ChildItem -LiteralPath (Join-Path $taskCoreStage 'app\dns') -Filter '*_test.go' -File | ForEach-Object { $taskDoHOverlayMap[$_.FullName]='' }
+    $taskDoHFixture=Join-Path $taskRecipe 'validation\doh_transport_test.go.template'
+    $taskDoHFixtureHash=(Get-FileHash -LiteralPath $taskDoHFixture -Algorithm SHA256).Hash.ToLowerInvariant()
+    $taskDoHOverlayMap[(Join-Path $taskCoreStage 'app\dns\harmony_doh_transport_test.go')]=$taskDoHFixture
+    $taskDoHOverlay=Join-Path $BuildRoot 'doh-test-overlay.json'
+    @{Replace=$taskDoHOverlayMap} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $taskDoHOverlay -Encoding utf8NoBOM
+    Push-Location $taskCoreStage
+    try {
+        $taskDoHTests=(& $taskGo test '-mod=readonly' '-buildvcs=false' '-overlay' $taskDoHOverlay './app/dns' '-run' '^TestHarmonyDoHTransport$' '-count=1' '-timeout' '90s' '-v' 2>&1) -join "`n"
+        $taskDoHTests | Set-Content -LiteralPath (Join-Path $taskOutput 'doh-transport-tests.txt') -Encoding utf8NoBOM
+        if($LASTEXITCODE -ne 0 -or $taskDoHTests -notmatch '(?m)^--- PASS: TestHarmonyDoHTransport '){throw 'DoH transport/lifecycle fixture failed'}
+        if((Get-FileHash -LiteralPath $taskDoHFixture -Algorithm SHA256).Hash.ToLowerInvariant() -ne $taskDoHFixtureHash){throw 'DoH fixture changed during verification'}
+    } finally {Pop-Location}
     Copy-Item -LiteralPath (Join-Path $taskRecipe 'libxray.exports') -Destination $BuildRoot
     Push-Location $taskStage
     try {
@@ -89,6 +105,8 @@ try {
         connectionStats=@{restartCyclesPassed=3;missingCoreRejected=$true;missingCounterRejected=$true;readsCurrentInstance=$true;httpUsed=$false;expvarModified=$false;originalQueryStatsUnchanged=$true;sourceSha256=(Get-FileHash -Algorithm SHA256 (Join-Path $taskRecipe 'connection_stats.go.template')).Hash.ToLowerInvariant();testSourceSha256=(Get-FileHash -Algorithm SHA256 (Join-Path $taskRecipe 'validation\connection_stats_test.go.template')).Hash.ToLowerInvariant();testOutputPath=(Join-Path $taskOutput 'connection-stats-tests.txt')}
     }
     $taskEvidence=Join-Path $taskOutput 'build-verification.json';$taskRecord | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8NoBOM -LiteralPath $taskEvidence
+    $taskRecord.dohTransportPool=@{passed=$true;fixtureSHA256=$taskDoHFixtureHash;testsLog=(Join-Path $taskOutput 'doh-transport-tests.txt');patch=(Get-Content -Raw (Join-Path $taskCoreStage 'harmony-patch-evidence.json') | ConvertFrom-Json).dohTransportPool;raceRun=$false;devicesContacted=$false}
+    $taskRecord | ConvertTo-Json -Depth 10 | Set-Content -Encoding utf8NoBOM -LiteralPath $taskEvidence
     & $PythonPath (Join-Path $taskRecipe 'collect_licenses.py') --verification $taskEvidence --module-cache $env:GOMODCACHE --output (Join-Path $taskOutput 'licenses\dependencies')
     if($LASTEXITCODE -ne 0){throw 'New core dependency license inventory incomplete'}
     New-Item -ItemType Directory -Force -Path (Join-Path $taskOutput 'licenses') | Out-Null

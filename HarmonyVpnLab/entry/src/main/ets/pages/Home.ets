@@ -7,7 +7,7 @@ import { readNodeProfile } from '../model/NodeProfile';
 import { describeError } from '../model/ErrorInfo';
 import { CONNECTION_UI_EPOCH, ConnectionCommand, isConnectionKind, readConnectionCommand, writeConnectionCommand } from '../model/ConnectionControl';
 import { formatBytes, prepareConnectionNotifications } from '../model/ConnectionNotification';
-import { checkProxyDns, connectionExitMarker, probeIpv6Datagram } from '../model/ConnectionDiagnostics';
+import { checkProxyDns, checkDirectDns, connectionExitMarker, probeIpv6Datagram } from '../model/ConnectionDiagnostics';
 import { subscribeVpnAuthorization, unsubscribeVpnAuthorization } from '../model/VpnAuthorization';
 import { readPhysicalNetwork, resolvePhysicalIpv4 } from '../model/PhysicalNetwork';
 import { AppTabBar } from '../components/AppTabBar';
@@ -17,7 +17,7 @@ import { AppSideNav } from '../components/AppSideNav';
 import { useSideNavigation, primaryContentWidth, formContentWidth, homeUsesColumns } from '../model/AdaptiveLayout';
 import { VPN_CORE_AVAILABLE } from '../model/BuildCapabilities';
 import { readNetworkPolicy } from '../model/NetworkPolicyStore';
-import { networkPolicyLabel } from '../model/NetworkPolicy';
+import { isSplitDnsActive, networkPolicyLabel } from '../model/NetworkPolicy';
 import { appRoutingLabel } from '../model/AppRouting';
 import { TransferRateTracker, formatTransferRate } from '../model/TransferRate';
 import { readConnectionLifecycle } from '../model/ConnectionLifecycle';
@@ -28,6 +28,7 @@ import { checkNodeForConnection } from '../model/NodePreflight';
 import { ConnectionFailure, makeConnectionFailure, connectionFailureFromError, failureProblem } from '../model/ConnectionFailure';
 import { FailureNotice } from '../components/FailureNotice';
 import { consumeDockConnectionAction } from '../model/DockConnectionAction';
+import { DnsFaultRequest, validDnsFaultAdmission } from '../model/DnsFaultTest';
 
 @Entry
 @Component
@@ -54,6 +55,10 @@ struct Home {
   @State exitMarker: string = '';
   @State checking: boolean = false;
   @State checkResult: string = '连接后可检查域名 HTTPS。';
+  @State directDnsResult: string = '';
+  @State proxyDnsResult: string = '';
+  @State directDnsFailure: ConnectionFailure | undefined = undefined;
+  @State dnsFaultHint: string = '';
   @State notificationsEnabled: boolean = true;
   @State networkKind: string = '';
   @State reconnectCount: number = 0;
@@ -73,6 +78,7 @@ struct Home {
   private poll: number = -1;
   private authorizationSubscription: number = -1;
   private checkGeneration: number = 0;
+  private checkRequest: http.HttpRequest | undefined = undefined;
   private startGeneration: number = 0;
   private rateTracker: TransferRateTracker = new TransferRateTracker();
 
@@ -106,6 +112,7 @@ struct Home {
   }
 
   aboutToDisappear(): void {
+    this.cancelCheck();
     this.resetTransferRate();
     if (this.poll >= 0) { clearInterval(this.poll); this.poll = -1; }
     unsubscribeVpnAuthorization(this.authorizationSubscription);
@@ -124,6 +131,7 @@ struct Home {
   }
 
   onPageHide(): void {
+    this.cancelCheck();
     this.resetTransferRate();
     if (this.poll >= 0) { clearInterval(this.poll); this.poll = -1; }
   }
@@ -202,7 +210,7 @@ struct Home {
     try {
       const policy = readNetworkPolicy(this.context().filesDir);
       this.routingSummary = appRoutingLabel(policy.appMode, policy.appBundles.length);
-      this.routingHint = networkPolicyLabel(policy) + ' · VPN 内 DNS 通过节点查询';
+      this.routingHint = networkPolicyLabel(policy) + (isSplitDnsActive(policy) ? ' · 部分域名直接查询' : ' · VPN 内 DNS 通过节点查询');
     } catch (_) {
       this.routingSummary = '网络设置需要检查';
       this.routingHint = '打开设置并重新保存后再连接';
@@ -241,6 +249,9 @@ struct Home {
   private refresh(): void {
     const filesDir = this.context().filesDir;
     this.now = Date.now();
+    const fault = AppStorage.get<DnsFaultRequest>('pendingDnsFaultRequest');
+    this.dnsFaultHint = this.context().applicationInfo?.debug && fault && validDnsFaultAdmission(fault, this.now)
+      ? (fault.kind === 'http404' ? '本次验证：直连 DNS HTTP 404（最多 90 秒）' : fault.kind === 'timeout' ? '本次验证：直连 DNS 极短超时（最多 90 秒）' : '本次验证：正常分流 DNS（最多 5 分钟）') : '';
     const assessment = readConnectionLifecycle(filesDir, this.now);
     const state = assessment.state, command = assessment.command, status = assessment.status;
     if (this.runId !== state.runId) { this.startFailure = undefined; this.checkFailure = undefined; }
@@ -251,7 +262,7 @@ struct Home {
       try { recordConnectionRecovery(filesDir, assessment); } catch (_) { /* Diagnostic storage cannot block recovery. */ }
     }
     if ((this.phase === 'active' && assessment.phase !== 'active') || this.runId !== state.runId) {
-      this.checkGeneration++; this.checking = false; this.exitMarker = ''; this.checkResult = '网络状态已变化，请重新检查连接。';
+      this.cancelCheck(); this.checkResult = '网络状态已变化，请重新检查连接。';
     }
     this.runId = state.runId;
     this.phase = assessment.phase;
@@ -283,7 +294,7 @@ struct Home {
       return;
     }
     if (status?.runId === state.runId && (status.reconnectCount ?? 0) !== this.reconnectCount) {
-      this.checkGeneration++; this.checking = false; this.exitMarker = '';
+      this.cancelCheck();
       this.checkResult = '网络状态已变化，请重新检查连接。';
     }
     this.networkKind = status?.runId === state.runId ? (status.networkKind ?? '') : '';
@@ -308,6 +319,14 @@ struct Home {
     this.rateAvailable = false;
     this.uplinkRate = '—';
     this.downlinkRate = '—';
+  }
+
+  private cancelCheck(): void {
+    this.checkGeneration++; this.checking = false; this.exitMarker = '';
+    this.checkFailure = undefined; this.directDnsFailure = undefined;
+    this.directDnsResult = ''; this.proxyDnsResult = '';
+    try { this.checkRequest?.destroy(); } catch (_) {}
+    this.checkRequest = undefined;
   }
 
   private busy(): boolean { return ['starting', 'active', 'recovering', 'waiting-network', 'stopping', 'stop_requested', 'unknown', 'diagnostic'].includes(this.phase); }
@@ -363,7 +382,18 @@ struct Home {
       const runId = Date.now().toString();
       startedRunId = runId;
       this.startFailure = undefined; this.checkFailure = undefined;
-      writeConnectionCommand(this.context().filesDir, new ConnectionCommand(runId, 'start'));
+      const startCommand = new ConnectionCommand(runId, 'start');
+      if (kind === 'connection-app-test') {
+        const fault = AppStorage.get<DnsFaultRequest>('pendingDnsFaultRequest');
+        if (fault !== undefined) {
+          AppStorage.delete('pendingDnsFaultRequest'); this.dnsFaultHint = '';
+          if (!this.context().applicationInfo.debug || !validDnsFaultAdmission(fault, Date.now())) {
+            this.detail = 'DNS 故障验证请求已过期或不可用，请重新准备。'; return;
+          }
+          startCommand.dnsFault = new DnsFaultRequest(fault.kind, fault.token, fault.createdAt);
+        }
+      }
+      writeConnectionCommand(this.context().filesDir, startCommand);
       writeProbeState(this.context().filesDir, new ProbeState('starting', '正在建立 VPN 和代理 DNS。', runId, kind));
       this.runId = runId;
       this.checking = false;
@@ -431,8 +461,7 @@ struct Home {
       command.runId !== this.runId || command.action === 'stop') { this.refresh(); return; }
     try {
       writeConnectionCommand(this.context().filesDir, new ConnectionCommand(this.runId, 'reconnect', command.ownerEpoch));
-      this.checkGeneration++; this.checking = false; this.phase = 'recovering';
-      this.checkFailure = undefined;
+      this.cancelCheck(); this.phase = 'recovering';
       this.resetTransferRate();
       this.checkResult = '正在请求重连。'; this.exitMarker = '';
     } catch (_) { this.detail = '重新连接请求未保存，请重试。'; }
@@ -469,16 +498,44 @@ struct Home {
     if (this.phase !== 'active' || this.checking) { return; }
     this.checking = true;
     this.checkFailure = undefined;
+    this.directDnsFailure = undefined; this.directDnsResult = ''; this.proxyDnsResult = '';
     this.checkResult = ipv6 ? '正在检查 IPv6 拒绝路径…' : '正在检查 DNS 和 HTTPS…';
     const runId = this.runId;
     const generation = this.checkGeneration;
+    const current = (): boolean => this.checkStillCurrent(runId, generation);
     let request: http.HttpRequest | undefined = undefined;
     let failureStage: string = 'https';
     try {
       request = http.createHttp();
+      this.checkRequest = request;
       failureStage = ipv6 ? 'https' : 'proxy-dns';
       if (!ipv6) {
-        await checkProxyDns();
+        const life = readConnectionLifecycle(this.context().filesDir);
+        const split = life.status?.runId === runId && life.status.effectiveMode === 'whitelist' && life.status.effectiveDnsMode === 'split';
+        if (split) {
+          this.directDnsResult = '直连 DNS：检查中…';
+          try {
+            await checkDirectDns(current);
+            if (!current()) { return; }
+            this.directDnsResult = '直连 DNS：通过';
+          } catch (error) {
+            if (!current()) { return; }
+            this.directDnsFailure = connectionFailureFromError(error, 'direct-dns');
+            this.directDnsResult = '直连 DNS：未完成' + (this.directDnsFailure.reason === 'timeout' ? '（超时）' : '');
+          }
+        }
+        if (!current()) { return; }
+        this.proxyDnsResult = '经节点 DNS：检查中…';
+        try {
+          await checkProxyDns(current);
+          if (!current()) { return; }
+          this.proxyDnsResult = '经节点 DNS：通过';
+        } catch (error) {
+          if (!current()) { return; }
+          this.checkFailure = connectionFailureFromError(error, 'proxy-dns');
+          this.proxyDnsResult = '经节点 DNS：未完成' + (this.checkFailure.reason === 'timeout' ? '（超时）' : '');
+          this.checkResult = failureProblem(this.checkFailure); return;
+        }
         hilog.info(0x0000, 'HarmonyVpnLab', 'CONNECTION_DNS_A_AND_AAAA_POLICY_OK runId=%{public}s', runId);
       } else {
         try {
@@ -510,7 +567,9 @@ struct Home {
         if (!this.checkStillCurrent(runId, generation)) { return; }
         const exitLine = response.result.split('\n').find((line: string) => line.startsWith('ip='));
         this.exitMarker = exitLine ? connectionExitMarker(exitLine.substring(3), runId) : '';
-        this.checkResult = '代理 DNS 与域名 HTTPS 检查通过。';
+        this.checkFailure = this.directDnsFailure;
+        this.checkResult = this.directDnsFailure ? '经节点 DNS 与域名 HTTPS 检查通过，直连 DNS 需要检查。' :
+          (this.directDnsResult === '直连 DNS：通过' ? '直连 DNS、经节点 DNS 与域名 HTTPS 检查通过。' : '代理 DNS 与域名 HTTPS 检查通过。');
         hilog.info(0x0000, 'HarmonyVpnLab', 'CONNECTION_DOMAIN_HTTPS_OK runId=%{public}s bytes=%{public}d', runId, response.result.length);
       } else { throw new Error('测试站点响应不符合预期'); }
     } catch (error) {
@@ -524,8 +583,11 @@ struct Home {
       hilog.info(0x0000, 'HarmonyVpnLab', ipv6 ? 'CONNECTION_IPV6_REQUEST_FAILED runId=%{public}s' : 'CONNECTION_DOMAIN_HTTPS_FAILED runId=%{public}s', runId);
       if (ipv6) { hilog.info(0x0000, 'HarmonyVpnLab', 'CONNECTION_IPV6_HTTP_ERROR %{public}s', describeError(error)); }
     } finally {
-      try { request?.destroy(); }
-      finally { if (this.runId === runId && generation === this.checkGeneration) { this.checking = false; } }
+      if (this.checkRequest === request) {
+        try { request?.destroy(); } catch (_) {}
+        this.checkRequest = undefined;
+      }
+      if (this.runId === runId && generation === this.checkGeneration) { this.checking = false; }
     }
   }
 
@@ -623,7 +685,7 @@ struct Home {
 
   @Builder
   private connectionFootnote() {
-    Text(VPN_CORE_AVAILABLE ? 'IPv4 代理 · DNS 通过节点 · IPv6 暂时阻断' : '界面预览不改变设备网络')
+    Text(VPN_CORE_AVAILABLE ? 'IPv4 代理 · HTTPS DNS · IPv6 暂时阻断' : '界面预览不改变设备网络')
       .fontSize(12).fontColor($r('app.color.text_secondary')).textAlign(TextAlign.Center).width('100%');
   }
 
@@ -800,6 +862,12 @@ struct Home {
       }.width('100%');
       Text(this.checkResult).id('connectionCheckResult').width('100%')
         .fontSize(13).fontColor($r('app.color.text_secondary'));
+      if (this.directDnsResult) { Text(this.directDnsResult).id('directDnsCheckResult').fontSize(13).fontColor($r('app.color.text_secondary')).width('100%'); }
+      if (this.proxyDnsResult) { Text(this.proxyDnsResult).id('proxyDnsCheckResult').fontSize(13).fontColor($r('app.color.text_secondary')).width('100%'); }
+      if (this.directDnsFailure && this.checkFailure?.stage !== 'direct-dns') {
+        FailureNotice({ title: '直连 DNS 检查未完成', stage: this.directDnsFailure.stage,
+          reason: this.directDnsFailure.reason, idPrefix: 'directDnsCheckFailure' });
+      }
       if (this.checkFailure) {
         FailureNotice({ title: '本次联网检查未完成', stage: this.checkFailure.stage,
           reason: this.checkFailure.reason, idPrefix: 'connectionCheckFailure' });
@@ -811,6 +879,13 @@ struct Home {
   developerContent() {
     Text('以下工具用于排查连接问题。短时验证会创建 VPN，结束后自动断开。')
       .fontSize(14).fontColor($r('app.color.text_secondary'));
+    if (this.dnsFaultHint) {
+      Text(this.dnsFaultHint + '。只作用于本次本应用验证，结束后恢复日常设置。')
+        .id('dnsFaultTestHint').fontSize(14).fontColor($r('app.color.warning')).width('100%');
+      Button('开始受控 DNS 验证').id('startDnsFaultTest').width('100%')
+        .enabled(!this.busy() && this.hasNode && this.closed && !this.requesting)
+        .onClick(() => { this.connect('connection-app-test'); });
+    }
     this.connectionCheckCard();
     Column({ space: 12 }) {
       Text('短时连接验证').fontSize(17).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));

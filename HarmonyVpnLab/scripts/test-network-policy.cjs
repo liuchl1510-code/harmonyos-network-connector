@@ -37,11 +37,12 @@ test('bounded schema and lists, no silent unknown fields', () => {
     { ...new policy.NetworkPolicy(), direct: [17] }, { ...new policy.NetworkPolicy(), mode: 'unknown' },
     { ...new policy.NetworkPolicy(), block: Array(301).fill('example.com') }]) assert.throws(() => policy.validateNetworkPolicy(value));
 });
-test('legacy policy migrates to schema two only in memory', () => {
+test('legacy policy migrates to schema three only in memory', () => {
   const legacy = { schemaVersion: 1, mode: 'rules', bypassLan: true, direct: ['example.com'], proxy: [], block: [],
     dnsUrl: 'https://8.8.8.8/dns-query' };
   const original = JSON.stringify(legacy), checked = policy.validateNetworkPolicy(legacy);
-  assert.equal(checked.schemaVersion, 2); assert.equal(checked.appMode, 'all'); assert.deepEqual(checked.appBundles, []);
+  assert.equal(checked.schemaVersion, 3); assert.equal(checked.appMode, 'all'); assert.deepEqual(checked.appBundles, []);
+  assert.equal(checked.dnsMode, 'proxy'); assert.equal(checked.directDnsUrl, 'https://223.5.5.5/dns-query');
   assert.equal(checked.dnsUrl, legacy.dnsUrl); assert.deepEqual(checked.direct, ['domain:example.com']);
   assert.equal(JSON.stringify(legacy), original);
   assert.throws(() => policy.validateNetworkPolicy({ ...legacy, appMode: 'include' }));
@@ -163,9 +164,9 @@ test('legacy store read never writes back and explicit save persists new app sch
   const legacy = JSON.stringify({ schemaVersion: 1, mode: 'rules', bypassLan: false, direct: ['example.com'],
     proxy: [], block: [], dnsUrl: 'https://1.1.1.1/dns-query' });
   f.files.set(destination, legacy); const p = f.api.readNetworkPolicy('/test');
-  assert.equal(p.schemaVersion, 2); assert.equal(f.files.get(destination), legacy); assert.equal(f.state.next, 0);
+  assert.equal(p.schemaVersion, 3); assert.equal(f.files.get(destination), legacy); assert.equal(f.state.next, 0);
   p.appMode = 'include'; p.appBundles = ['com.example.browser']; f.api.saveNetworkPolicy('/test', p);
-  const saved = JSON.parse(f.files.get(destination)); assert.equal(saved.schemaVersion, 2);
+  const saved = JSON.parse(f.files.get(destination)); assert.equal(saved.schemaVersion, 3);
   assert.equal(saved.appMode, 'include'); assert.deepEqual(saved.appBundles, ['com.example.browser']);
   assert.deepEqual(f.api.readNetworkPolicy('/test').appBundles, saved.appBundles);
 });

@@ -135,6 +135,10 @@ test('fixed failure fields are shown separately for operation cleanup and pendin
   assert.match(result.text,/会话 1失败阶段：代理核心准备/); assert.match(result.text,/会话 1清理阶段问题：资源清理/);
   assert.match(result.text,/会话 1该回执的未完成步骤：域名 HTTPS 检查/); assert.match(result.text,/不能单凭该阶段判定根本原因/); checkPrivate(result);
 });
+test('direct DNS stage remains a bounded operation classification in summary',()=>{
+  const result=scenario({[probe]:probeValue(),[status]:statusValue({currentIssue:{stage:'direct-dns',reason:'timeout',at:clock}})}).collect();
+  assert.match(result.text,/直连 DNS 检查/); assert.match(result.text,/不能单凭该阶段判定根本原因/); checkPrivate(result);
+});
 for(const field of ['failure','cleanupFailure','currentIssue']) test(field+' arbitrary injected classification is omitted',()=>{
   const result=scenario({[probe]:probeValue(),[status]:statusValue({[field]:{stage:secret,reason:secret,at:clock}})}).collect(); assert.equal(result.partial,true); assert.match(result.text,/分类无效/); checkPrivate(result);
 });

@@ -101,6 +101,18 @@ test('unknown operation stages reason indices or nonempty kind cannot enter jour
     assert.equal(s.files.size, 0);
   }
 });
+test('direct DNS fixed stage round-trips with existing reason indices', () => {
+  const s = scenario();
+  for (const reason of ['failed', 'timeout', 'invalid-response']) {
+    const value = failureExports.makeConnectionFailure('direct-dns', reason);
+    s.append(runId, failureExports.failureDiagnosticCode(value), '', failureExports.failureDiagnosticValue(value));
+  }
+  const events = s.read(); assert.equal(events.length, 3);
+  assert.deepEqual(events.map(value => value.value), [0, 1, 4]);
+  assert.deepEqual(events.map(value => failureExports.failureFromDiagnosticEvent(value.code, value.value, value.at).stage),
+    ['direct-dns', 'direct-dns', 'direct-dns']);
+  assert(!JSON.stringify(events).includes('dns-query'));
+});
 test('missing journal is empty and does not create files', () => {
   const s = scenario(); assert.deepEqual(s.read(), []); assert.equal(s.files.size, 0);
 });

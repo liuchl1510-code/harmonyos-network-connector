@@ -3,7 +3,7 @@ import { validateAppRouting } from './AppRouting';
 
 // Pure policy validation. The saved policy never embeds a complete core config.
 export class NetworkPolicy {
-  schemaVersion: number = 2;
+  schemaVersion: number = 3;
   mode: string = 'global';
   bypassLan: boolean = false;
   direct: string[] = [];
@@ -12,6 +12,8 @@ export class NetworkPolicy {
   dnsUrl: string = 'https://1.1.1.1/dns-query';
   appMode: string = 'all';
   appBundles: string[] = [];
+  dnsMode: string = 'proxy';
+  directDnsUrl: string = 'https://223.5.5.5/dns-query';
 }
 
 export class RoutingRule {
@@ -73,12 +75,32 @@ export function policyDnsHost(url: string): string {
   catch (_) { throw new Error('DNS 服务器地址格式无效。'); }
 }
 
+export function policyDirectDnsHost(url: string): string {
+  let host: string;
+  try { host = policyDnsHost(url); }
+  catch (_) { throw new Error('直连 DNS 地址需为 HTTPS IPv4 地址及路径。'); }
+  if (!isBootstrapIpv4Address(host)) { throw new Error('直连 DNS 地址需为 HTTPS IPv4 地址及路径。'); }
+  const octets = host.split('.').map((value: string) => Number(value));
+  // The direct DoH connection must not require bootstrap DNS, use loopback, or
+  // address this VPN's own synthetic DNS/TUN interface. LAN unicast is allowed.
+  if (octets[0] === 0 || octets[0] === 127 || octets[0] >= 224 ||
+    (octets[0] === 198 && octets[1] === 18 && octets[2] === 0 && octets[3] <= 3)) {
+    throw new Error('直连 DNS 服务器地址不可用。');
+  }
+  return host;
+}
+
+export function isSplitDnsActive(policy: NetworkPolicy): boolean {
+  return policy.mode === 'whitelist' && policy.dnsMode === 'split';
+}
+
 export function validateNetworkPolicy(value: NetworkPolicy): NetworkPolicy {
   if (!value || typeof value !== 'object' || Array.isArray(value)) { throw new Error('网络设置格式无效。'); }
   const keys = ['schemaVersion', 'mode', 'bypassLan', 'direct', 'proxy', 'block', 'dnsUrl'];
-  if (value.schemaVersion === 2) { keys.push('appMode', 'appBundles'); }
+  if (value.schemaVersion === 2 || value.schemaVersion === 3) { keys.push('appMode', 'appBundles'); }
+  if (value.schemaVersion === 3) { keys.push('dnsMode', 'directDnsUrl'); }
   if (Object.keys(value).length !== keys.length || Object.keys(value).some((key: string) => !keys.includes(key)) ||
-    ![1, 2].includes(value.schemaVersion) || !['global', 'rules', 'whitelist'].includes(value.mode) || typeof value.bypassLan !== 'boolean') {
+    ![1, 2, 3].includes(value.schemaVersion) || !['global', 'rules', 'whitelist'].includes(value.mode) || typeof value.bypassLan !== 'boolean') {
     throw new Error('网络设置格式或版本无效。');
   }
   const result = new NetworkPolicy();
@@ -96,9 +118,14 @@ export function validateNetworkPolicy(value: NetworkPolicy): NetworkPolicy {
   policyDnsHost(value.dnsUrl);
   result.dnsUrl = value.dnsUrl;
   // Legacy preferences migrate only in memory. The store writes only after an explicit save.
-  if (value.schemaVersion === 2) {
+  if (value.schemaVersion === 2 || value.schemaVersion === 3) {
     const apps = validateAppRouting(value.appMode, value.appBundles);
     result.appMode = apps.mode; result.appBundles = apps.bundles;
+  }
+  if (value.schemaVersion === 3) {
+    if (!['proxy', 'split'].includes(value.dnsMode)) { throw new Error('DNS 查询模式无效。'); }
+    policyDirectDnsHost(value.directDnsUrl);
+    result.dnsMode = value.dnsMode; result.directDnsUrl = value.directDnsUrl;
   }
   return result;
 }
@@ -126,7 +153,7 @@ export function policyRoutingRules(policy: NetworkPolicy): RoutingRule[] {
 }
 
 export function networkPolicyLabel(policy: NetworkPolicy): string {
-  if (policy.mode === 'whitelist') { return '白名单 · 绕过大陆'; }
+  if (policy.mode === 'whitelist') { return isSplitDnsActive(policy) ? '白名单 · 分流 DNS' : '白名单 · 绕过大陆'; }
   return policy.mode === 'global' ? '全部代理' : policy.bypassLan ? '规则分流 · 绕过局域网' : '规则分流';
 }
 

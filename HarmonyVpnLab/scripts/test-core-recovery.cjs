@@ -10,7 +10,7 @@ const project = path.resolve(__dirname, '..');
 const etsRoot = path.join(project, 'entry/src/main/ets');
 const ts = require(path.join(process.env.DEVECO_STUDIO_HOME || 'C:/Program Files/Huawei/DevEco Studio',
   'sdk/default/openharmony/ets/build-tools/ets-loader/node_modules/typescript'));
-const sourceNames = ['vpn/CoreProbe.ets', 'model/ConnectionConfig.ets', 'model/ConnectionSnapshot.ets', 'model/NodeBootstrap.ets', 'model/NetworkPolicy.ets', 'model/AppRouting.ets', 'model/ConnectionFailure.ets'];
+const sourceNames = ['vpn/CoreProbe.ets', 'model/ConnectionConfig.ets', 'model/ConnectionSnapshot.ets', 'model/NodeBootstrap.ets', 'model/NetworkPolicy.ets', 'model/AppRouting.ets', 'model/ConnectionFailure.ets', 'model/DnsFaultTest.ets'];
 const sources = new Map(sourceNames.map(name => [name, fs.readFileSync(path.join(etsRoot, name), 'utf8')]));
 function deferred() { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; }
 async function flush() { for (let i = 0; i < 40; i++) await Promise.resolve(); }
@@ -41,6 +41,7 @@ function scenario() {
   const bootstrap = load('model/NodeBootstrap.ets');
   const apps = load('model/AppRouting.ets'), failures = load('model/ConnectionFailure.ets');
   const policy = load('model/NetworkPolicy.ets', { './NodeBootstrap': bootstrap, './AppRouting': apps });
+  const fault = load('model/DnsFaultTest.ets', { './NetworkPolicy': policy });
   const config = load('model/ConnectionConfig.ets', { './NodeBootstrap': bootstrap, './NetworkPolicy': policy });
   const snapshot = load('model/ConnectionSnapshot.ets');
   const native = {
@@ -99,7 +100,9 @@ function scenario() {
     '../model/NetworkPolicy': policy, '../model/ConnectionFailure': failures,
     '@kit.NetworkKit': { http: { createHttp: () => { s.httpRequests++; throw new Error('Stats must not make an HTTP request'); } }, socket: {} }
   }).CoreProbe;
-  s.probe = new CoreProbe(); s.context = { filesDir: '/synthetic' };
+  s.probe = new CoreProbe(); s.context = { filesDir: '/synthetic', applicationInfo: { debug: false } };
+  s.newProbe = () => new CoreProbe();
+  s.faultPolicy = kind => fault.createDnsFaultPolicy(new policy.NetworkPolicy(), kind);
   s.pin = ip => new bootstrap.NodeBootstrap('node.example.test', ip);
   s.newPolicy = () => new policy.NetworkPolicy();
   s.typedFailure = (stage, reason = 'failed') => error => {
@@ -108,7 +111,7 @@ function scenario() {
     assert.equal(error.failure.stage, stage); assert.equal(error.failure.reason, reason);
     return true;
   };
-  s.start = p => s.probe.startConnection(7000, s.context, async () => {}, s.pin('192.0.2.1'), outbound, p);
+  s.start = (p, dnsFault = '') => s.probe.startConnection(7000, s.context, async () => {}, s.pin('192.0.2.1'), outbound, p, dnsFault);
   s.resume = (ip = '192.0.2.2') => s.probe.resumeConnection(s.context, s.pin(ip));
   s.appendDiagnostics = () => { const name = '/synthetic/xray-connection-diagnostic.log';
     s.files.set(name, s.files.get(name) + 'app/dispatcher: taking detour [dns-out]\napp/dispatcher: taking detour [block-ipv6]\n'); };
@@ -140,6 +143,90 @@ test('verified whitelist and DNS survive recovery without rereading assets or ad
   assert.deepEqual(s.configs[1].dns.servers, first.dns.servers);
   assert.equal(count(s, 'assets'), 1); assert.equal(count(s, 'start'), 2);
   assert.equal(s.configs[1].inbounds[0].sniffing.routeOnly, true); assert.equal(s.httpRequests, 0);
+  await s.probe.stop();
+});
+test('split DNS selection and direct resolver freeze across recovery despite external policy changes', async () => {
+  const s = scenario(), p = s.newPolicy(); p.mode = 'whitelist'; p.dnsMode = 'split';
+  p.directDnsUrl = 'https://223.5.5.5/dns-query';
+  await s.start(p); const first = s.configs[0];
+  assert.equal(first.dns.servers.length, 3);
+  assert.deepEqual(first.dns.servers.map(server => server.tag), ['dns-via-node', 'dns-via-direct', 'dns-via-node']);
+  assert.equal(first.dns.servers[1].address, 'https://223.5.5.5/dns-query');
+  assert.deepEqual(first.dns.servers[0].domains, ['geosite:google']);
+  assert(first.dns.servers[1].domains.includes('geosite:cn'));
+  assert(first.dns.servers.every(server => server.finalQuery === true && server.skipFallback === true));
+  assert.equal(count(s, 'assets'), 1);
+  p.dnsMode = 'proxy'; p.directDnsUrl = 'https://9.9.9.9/dns-query';
+  await s.probe.suspendConnection(); await s.resume();
+  const resumed = s.configs[1];
+  assert.deepEqual(resumed.dns.servers, first.dns.servers);
+  assert.deepEqual(resumed.routing, first.routing);
+  assert.equal(resumed.dns.disableFallback, true); assert.equal(resumed.dns.disableFallbackIfMatch, true);
+  assert.equal(resumed.dns.enableParallelQuery, false);
+  assert.equal(resumed.routing.rules.find(rule => rule.inboundTag?.includes('dns-via-direct')).outboundTag, 'direct');
+  assert.equal(resumed.routing.rules.find(rule => rule.inboundTag?.includes('dns-via-node')).outboundTag, 'nodeProxy');
+  assert(!JSON.stringify(resumed).includes('9.9.9.9'));
+  assert.equal(count(s, 'assets'), 1); assert.equal(count(s, 'start'), 2);
+  assert.equal(s.profileReads, 0); assert.equal(s.httpRequests, 0);
+  await s.probe.stop();
+});
+test('debug timeout affects only the direct resolver and freezes across recovery', async () => {
+  const s = scenario(); s.context.applicationInfo.debug = true;
+  const p = s.faultPolicy('timeout'); await s.start(p, 'timeout'); const first = s.configs[0];
+  const direct = first.dns.servers[1];
+  assert.equal(direct.tag, 'dns-via-direct'); assert.equal(direct.timeoutMs, 1); assert.equal(direct.disableCache, true);
+  assert.equal(direct.address, 'https://223.5.5.5/dns-query');
+  for (const index of [0, 2]) {
+    assert.equal(first.dns.servers[index].tag, 'dns-via-node');
+    assert.equal(first.dns.servers[index].timeoutMs, undefined); assert.equal(first.dns.servers[index].disableCache, undefined);
+  }
+  p.dnsMode = 'proxy'; p.directDnsUrl = 'https://9.9.9.9/dns-query';
+  await s.probe.suspendConnection(); await s.resume();
+  assert.deepEqual(s.configs[1].dns.servers, first.dns.servers); assert.deepEqual(s.configs[1].routing, first.routing);
+  assert.equal(count(s, 'assets'), 1); assert.equal(count(s, 'start'), 2); await s.probe.stop();
+});
+test('debug 404 and baseline keep ordinary timeout behavior with fixed direct URLs', async () => {
+  for (const kind of ['baseline', 'http404']) {
+    const s = scenario(); s.context.applicationInfo.debug = true;
+    const p = s.faultPolicy(kind); await s.start(p, kind);
+    const first = s.configs[0];
+    assert.equal(first.dns.servers[1].address, kind === 'http404'
+      ? 'https://223.5.5.5/harmony-vpn-dns-invalid-path' : 'https://223.5.5.5/dns-query');
+    assert(first.dns.servers.every(server => server.timeoutMs === undefined && server.disableCache === undefined));
+    p.directDnsUrl = 'https://9.9.9.9/dns-query';
+    await s.probe.suspendConnection(); await s.resume();
+    assert.deepEqual(s.configs[1].dns.servers, first.dns.servers); await s.probe.stop();
+  }
+});
+test('nondebug fault startup is rejected before assets native core or socket protection', async () => {
+  for (const kind of ['baseline', 'http404', 'timeout']) {
+    const s = scenario(); const p = s.faultPolicy(kind);
+    await assert.rejects(s.start(p, kind), s.typedFailure('configuration'));
+    assert.equal(s.configs.length, 0); assert.equal(count(s, 'assets'), 0); assert.equal(count(s, 'ports'), 0);
+    assert.equal(count(s, 'ca'), 0); assert.equal(count(s, 'protector'), 0); assert.equal(s.core, false); assert.equal(s.hev, false);
+    await s.probe.stop();
+  }
+});
+test('fault enum and split policy URL must agree before core is loaded', async () => {
+  for (const [kind, patch] of [['unknown', {}], ['timeout', { mode: 'global' }], ['timeout', { dnsMode: 'proxy' }],
+    ['timeout', { directDnsUrl: 'https://9.9.9.9/dns-query' }],
+    ['http404', { directDnsUrl: 'https://223.5.5.5/dns-query' }]]) {
+    const s = scenario(); s.context.applicationInfo.debug = true; const p = s.faultPolicy('timeout'); Object.assign(p, patch);
+    await assert.rejects(s.start(p, kind), s.typedFailure('configuration'));
+    assert.equal(s.configs.length, 0); assert.equal(count(s, 'assets'), 0); assert.equal(count(s, 'ca'), 0);
+    assert.equal(count(s, 'protector'), 0); await s.probe.stop();
+  }
+});
+test('a fresh ordinary core never inherits an earlier diagnostic fault', async () => {
+  const s = scenario(); s.context.applicationInfo.debug = true;
+  await s.start(s.faultPolicy('timeout'), 'timeout'); assert.equal(s.configs[0].dns.servers[1].timeoutMs, 1);
+  await s.probe.stop(); s.probe = s.newProbe();
+  // A ordinary production start needs no debug privilege and no diagnostic enum.
+  s.context.applicationInfo.debug = false;
+  const p = s.newPolicy(); p.mode = 'whitelist'; p.dnsMode = 'split'; p.directDnsUrl = 'https://9.9.9.9/dns-query';
+  await s.start(p); const ordinary = s.configs[1];
+  assert.equal(ordinary.dns.servers[1].address, p.directDnsUrl);
+  assert(ordinary.dns.servers.every(server => server.timeoutMs === undefined && server.disableCache === undefined));
   await s.probe.stop();
 });
 test('three recoveries preserve Hev TUN ports credentials duration and cumulative traffic', async () => {

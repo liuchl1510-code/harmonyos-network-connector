@@ -25,6 +25,24 @@ GC/compiler changes are preserved.
 
 From the HarmonyVpnLab project directory:
 
+Application 0.26.0 adds `patches/0002-doh-session-transport-pool.patch` to the
+isolated core source, alongside the socket-controller patch. Within one DNS
+instance, ordinary remote HTTPS nameservers with the same full URL and effective
+inbound tag share an HTTP2 transport; clients, DNS caches and query policies stay
+separate. Local/h2c endpoints and different tags or core instances do not share.
+The transport owns cancellation, active raw connections and late dial cleanup;
+`DNS.Close()` closes its scope without claiming to drain every DNS goroutine.
+
+`dns-pool/manifest.json` pins the four affected Go files. `apply_patch.py` requires
+clean pinned inputs, fixes LF output independently of Git settings, and checks
+the resulting byte hashes. The standard native build runs the local real-HTTP2
+and lifecycle fixture in `validation/doh_transport_test.go.template` before
+publishing an output library. Policy validation is separately available through
+`scripts/validate-split-dns-core.ps1 -DoHTransportPool`; Linux race and device
+checks remain separate. Artifact hashes and validation boundaries for this change
+are recorded in [phase33](../../docs/phase33-doh-pool.md); the source-lock and
+historical baseline artifact hashes are not promises of identical future binaries.
+
 ```powershell
 & .\scripts\build-xray.ps1
 ```

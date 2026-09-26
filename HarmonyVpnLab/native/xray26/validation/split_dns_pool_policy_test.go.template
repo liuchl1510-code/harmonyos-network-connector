@@ -1,0 +1,404 @@
+// Added only to an isolated copy of the pinned app/dns package by the validator.
+// Real config protobufs, New, geodata matcher, sortClients, LookupIP and QueryIP
+// run here. Only leaf name servers are replaced with counted, in-memory doubles.
+package dns
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/xtls/xray-core/app/router"
+	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/core"
+	fdns "github.com/xtls/xray-core/features/dns"
+	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet"
+	"google.golang.org/protobuf/proto"
+)
+
+type splitDNSCase struct {
+	Domain              string `json:"domain"`
+	ExpectedClientIndex int    `json:"expectedClientIndex"`
+	FailSelected        bool   `json:"failSelected,omitempty"`
+}
+type splitDNSFixture struct {
+	Name         string         `json:"name"`
+	ConfigSHA256 string         `json:"configSha256"`
+	DNS          []byte         `json:"dnsProto"`
+	Router       []byte         `json:"routerProto"`
+	OutboundTags []string       `json:"outboundTags"`
+	Cases        []splitDNSCase `json:"cases"`
+}
+type splitDNSResult struct {
+	Name                        string `json:"name"`
+	ConfigSHA256                string `json:"configSha256"`
+	Passed                      bool   `json:"passed"`
+	CaseCount                   int    `json:"caseCount"`
+	PassedCases                 int    `json:"passedCases"`
+	Failure                     string `json:"failure,omitempty"`
+	RoutingAssertions           int    `json:"routingAssertions"`
+	CacheIsolation              bool   `json:"cacheIsolation"`
+	TagIsolation                bool   `json:"tagIsolation"`
+	NoFinalQueryNegativeControl bool   `json:"noFinalQueryNegativeControl"`
+}
+type splitDNSReport struct {
+	CoreVersion            string           `json:"coreVersion"`
+	Passed                 bool             `json:"passed"`
+	Results                []splitDNSResult `json:"results"`
+	BlockedNetworkAttempts int64            `json:"blockedNetworkAttempts"`
+	CoreInstanceStarted    bool             `json:"coreInstanceStarted"`
+	Scope                  string           `json:"scope"`
+}
+
+var splitDNSBlocked atomic.Int64
+
+type splitDNSDenyHTTP struct{}
+
+func (splitDNSDenyHTTP) RoundTrip(*http.Request) (*http.Response, error) {
+	splitDNSBlocked.Add(1)
+	return nil, errors.New("NETWORK_DISABLED")
+}
+
+type splitDNSDenySystem struct{}
+
+func (splitDNSDenySystem) Dial(context.Context, xnet.Address, xnet.Destination, *internet.SocketConfig) (xnet.Conn, error) {
+	splitDNSBlocked.Add(1)
+	return nil, errors.New("NETWORK_DISABLED")
+}
+func (splitDNSDenySystem) DestIpAddress() xnet.IP { return nil }
+
+type splitDNSDispatcher struct{}
+
+func (splitDNSDispatcher) Type() interface{} { return routing.DispatcherType() }
+func (splitDNSDispatcher) Start() error      { return errors.New("START_FORBIDDEN") }
+func (splitDNSDispatcher) Close() error      { return nil }
+func (splitDNSDispatcher) Dispatch(context.Context, xnet.Destination) (*transport.Link, error) {
+	splitDNSBlocked.Add(1)
+	return nil, errors.New("DISPATCH_FORBIDDEN")
+}
+func (splitDNSDispatcher) DispatchLink(context.Context, xnet.Destination, *transport.Link) error {
+	splitDNSBlocked.Add(1)
+	return errors.New("DISPATCH_FORBIDDEN")
+}
+
+type splitDNSLeaf struct {
+	index      int
+	calls      int
+	fail       bool
+	inboundTag string
+}
+
+func (s *splitDNSLeaf) Name() string       { return fmt.Sprintf("synthetic-resolver-%d", s.index) }
+func (*splitDNSLeaf) IsDisableCache() bool { return false }
+func (s *splitDNSLeaf) QueryIP(ctx context.Context, _ string, _ fdns.IPOption) ([]xnet.IP, uint32, error) {
+	s.calls++
+	in := session.InboundFromContext(ctx)
+	if in != nil {
+		s.inboundTag = in.Tag
+	}
+	if s.fail {
+		return nil, 0, errors.New("SYNTHETIC_SELECTED_RESOLVER_FAILURE")
+	}
+	return []xnet.IP{{192, 0, 2, byte(10 + s.index)}}, 60, nil
+}
+func splitDNSNew(c *Config) (*DNS, error) {
+	instance := &core.Instance{}
+	if err := instance.AddFeature(splitDNSDispatcher{}); err != nil {
+		return nil, err
+	}
+	// XrayKey is exported explicitly for tests in this pinned revision. This is
+	// not a supported application integration API and is not used in app code.
+	ctx := context.WithValue(context.Background(), core.XrayKey(1), instance)
+	return New(ctx, c)
+}
+func splitDNSMocks(d *DNS) []*splitDNSLeaf {
+	m := make([]*splitDNSLeaf, len(d.clients))
+	for i, c := range d.clients {
+		m[i] = &splitDNSLeaf{index: i}
+		c.server = m[i]
+	}
+	return m
+}
+func splitDNSProtoCheck(c *Config) string {
+	if len(c.NameServer) != 1 && len(c.NameServer) != 3 {
+		return "PROTO_DNS_SERVER_COUNT"
+	}
+	if c.QueryStrategy != QueryStrategy_USE_IP4 || !c.DisableFallback || !c.DisableFallbackIfMatch || c.EnableParallelQuery {
+		return "PROTO_DNS_POLICY"
+	}
+	for i, s := range c.NameServer {
+		u, err := url.Parse(s.Address.Address.GetDomain())
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return "PROTO_ROUTED_DOH_REQUIRED"
+		}
+		if !s.SkipFallback || s.QueryStrategy != QueryStrategy_USE_IP4 || len(s.Domain) == 0 {
+			return "PROTO_SERVER_POLICY"
+		}
+		tag := s.Tag
+		if tag == "" {
+			tag = c.Tag
+		}
+		want := "dns-via-node"
+		if len(c.NameServer) == 3 {
+			if !s.FinalQuery {
+				return "PROTO_FINAL_QUERY"
+			}
+			if i == 1 {
+				want = "dns-via-direct"
+				if ip := net.ParseIP(u.Hostname()); ip == nil || ip.To4() == nil {
+					return "PROTO_DIRECT_DOH_IPV4_REQUIRED"
+				}
+			}
+		}
+		if tag != want {
+			return "PROTO_DNS_TAG"
+		}
+	}
+	return ""
+}
+
+// Actual router matching, with SkipDNSResolve as set by routed DoH.
+type splitDNSRouteContext struct {
+	tag string
+	ip  xnet.IP
+}
+
+func (c splitDNSRouteContext) GetInboundTag() string          { return c.tag }
+func (c splitDNSRouteContext) GetTargetIPs() []xnet.IP        { return []xnet.IP{c.ip} }
+func (splitDNSRouteContext) GetSourceIPs() []xnet.IP          { return nil }
+func (splitDNSRouteContext) GetLocalIPs() []xnet.IP           { return nil }
+func (splitDNSRouteContext) GetSourcePort() xnet.Port         { return 0 }
+func (splitDNSRouteContext) GetLocalPort() xnet.Port          { return 0 }
+func (splitDNSRouteContext) GetTargetPort() xnet.Port         { return 443 }
+func (splitDNSRouteContext) GetTargetDomain() string          { return "" }
+func (splitDNSRouteContext) GetNetwork() xnet.Network         { return xnet.Network_TCP }
+func (splitDNSRouteContext) GetProtocol() string              { return "https" }
+func (splitDNSRouteContext) GetUser() string                  { return "" }
+func (splitDNSRouteContext) GetVlessRoute() xnet.Port         { return 0 }
+func (splitDNSRouteContext) GetAttributes() map[string]string { return nil }
+func (splitDNSRouteContext) GetSkipDNSResolve() bool          { return true }
+func splitDNSValidate(f splitDNSFixture) (out splitDNSResult) {
+	out.Name = f.Name
+	out.ConfigSHA256 = f.ConfigSHA256
+	out.CaseCount = len(f.Cases)
+	defer func() {
+		if recover() != nil {
+			out.Passed = false
+			out.Failure = "PINNED_DNS_PANIC"
+		}
+	}()
+	c := &Config{}
+	rc := &router.Config{}
+	if proto.Unmarshal(f.DNS, c) != nil || proto.Unmarshal(f.Router, rc) != nil {
+		out.Failure = "PREPARED_PROTO_REJECTED"
+		return
+	}
+	if failure := splitDNSProtoCheck(c); failure != "" {
+		out.Failure = failure
+		return
+	}
+	d, err := splitDNSNew(c)
+	if err != nil {
+		out.Failure = "PINNED_DNS_NEW_REJECTED"
+		return
+	}
+	// Check real NewClient-created resources before swapping leaves, including
+	// the same URL used by Google and the remote catch-all.
+	for i, a := range d.clients {
+		da, ok := a.server.(*DoHNameServer)
+		if !ok {
+			out.Failure = "NON_DOH_SERVER_CREATED"
+			return
+		}
+		for j, b := range d.clients {
+			if i >= j {
+				continue
+			}
+			db, ok := b.server.(*DoHNameServer)
+			if !ok || da == db || da.cacheController == db.cacheController || da.httpClient == db.httpClient {
+				out.Failure = "CACHE_OR_CLIENT_SHARED"
+				return
+			}
+			expectedShared := da.shareRemoteHTTPS && db.shareRemoteHTTPS && da.dohURL == db.dohURL && a.tag == b.tag
+			if (da.httpClient.Transport == db.httpClient.Transport) != expectedShared {
+				out.Failure = "TRANSPORT_EQUIVALENCE_FAILED"
+				return
+			}
+			da.cacheController.ips["synthetic-cache.invalid."] = &record{}
+			if _, exists := db.cacheController.ips["synthetic-cache.invalid."]; exists {
+				out.Failure = "CACHE_RECORD_CROSSED_GROUP"
+				return
+			}
+			delete(da.cacheController.ips, "synthetic-cache.invalid.")
+		}
+	}
+	out.CacheIsolation = true
+	mocks := splitDNSMocks(d)
+	for _, test := range f.Cases {
+		if test.ExpectedClientIndex < 0 || test.ExpectedClientIndex >= len(mocks) {
+			out.Failure = "EXPECTED_INDEX_OUT_OF_RANGE"
+			return
+		}
+		for _, m := range mocks {
+			m.calls = 0
+			m.fail = false
+			m.inboundTag = ""
+		}
+		mocks[test.ExpectedClientIndex].fail = test.FailSelected
+		selected := d.sortClients(test.Domain)
+		if len(selected) != 1 || selected[0] != d.clients[test.ExpectedClientIndex] {
+			out.Failure = "DNS_SELECTED_CLIENT_MISMATCH"
+			return
+		}
+		ips, _, lookupErr := d.LookupIP(test.Domain, fdns.IPOption{IPv4Enable: true})
+		if test.FailSelected {
+			if lookupErr == nil || len(ips) != 0 {
+				out.Failure = "FAILED_QUERY_DID_NOT_FAIL_CLOSED"
+				return
+			}
+		} else {
+			if lookupErr != nil || len(ips) != 1 {
+				out.Failure = "SELECTED_QUERY_DID_NOT_SUCCEED"
+				return
+			}
+		}
+		for i, m := range mocks {
+			want := 0
+			if i == test.ExpectedClientIndex {
+				want = 1
+			}
+			if m.calls != want {
+				out.Failure = "CROSS_RESOLVER_FALLBACK"
+				return
+			}
+		}
+		if mocks[test.ExpectedClientIndex].inboundTag != d.clients[test.ExpectedClientIndex].tag {
+			out.Failure = "QUERY_TAG_MISMATCH"
+			return
+		}
+		out.PassedCases++
+	}
+	out.TagIsolation = true
+	if len(rc.BalancingRule) != 0 {
+		out.Failure = "BALANCER_FORBIDDEN"
+		return
+	}
+	for _, rule := range rc.Rule {
+		if rule.Webhook != nil || len(rule.Process) > 0 || rule.GetBalancingTag() != "" || !slices.Contains(f.OutboundTags, rule.GetTag()) {
+			out.Failure = "IMPURE_OR_UNBOUND_ROUTING_RULE"
+			return
+		}
+	}
+	r := &router.Router{}
+	if r.Init(context.Background(), rc, d, nil, splitDNSDispatcher{}) != nil {
+		out.Failure = "ROUTER_INIT_REJECTED"
+		return
+	}
+	defer r.Close()
+	for i, client := range d.clients {
+		callsBefore := 0
+		for _, m := range mocks {
+			callsBefore += m.calls
+		}
+		want := "nodeProxy"
+		if len(d.clients) == 3 && i == 1 {
+			want = "direct"
+		}
+		route, err := r.PickRoute(splitDNSRouteContext{tag: client.tag, ip: xnet.IP{223, 5, 5, 5}})
+		if err != nil || route.GetOutboundTag() != want {
+			out.Failure = "DNS_ROUTING_TAG_MISMATCH"
+			return
+		}
+		callsAfter := 0
+		for _, m := range mocks {
+			callsAfter += m.calls
+		}
+		if callsAfter != callsBefore {
+			out.Failure = "DNS_ROUTE_RECURSIVE_LOOKUP"
+			return
+		}
+		out.RoutingAssertions++
+	}
+	if len(c.NameServer) == 3 {
+		// Deliberately overlap the direct domain list with the Google list and
+		// remove only Google's finalQuery: selected failure must then call direct.
+		// This demonstrates why disableFallback alone is not a sufficient guard.
+		bad := proto.Clone(c).(*Config)
+		bad.NameServer[0].FinalQuery = false
+		bad.NameServer[1].Domain = append(bad.NameServer[1].Domain, bad.NameServer[0].Domain...)
+		nd, e := splitDNSNew(bad)
+		if e != nil {
+			out.Failure = "NEGATIVE_CONTROL_SETUP"
+			return
+		}
+		nm := splitDNSMocks(nd)
+		nm[0].fail = true
+		_, _, e = nd.LookupIP("www.google.com", fdns.IPOption{IPv4Enable: true})
+		if e != nil || nm[0].calls != 1 || nm[1].calls != 1 || nm[2].calls != 0 {
+			out.Failure = "NEGATIVE_CONTROL_NOT_EXPOSED"
+			return
+		}
+		out.NoFinalQueryNegativeControl = true
+	}
+	out.Passed = true
+	return
+}
+func TestHarmonySplitDNSPoolPolicyFixtures(t *testing.T) {
+	path := os.Getenv("HARMONY_SPLIT_DNS_PREPARED")
+	output := os.Getenv("HARMONY_SPLIT_DNS_RESULT")
+	if path == "" || output == "" {
+		t.Fatal("VALIDATION_PATHS_REQUIRED")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || len(b) > 8*1024*1024 {
+		t.Fatal("PREPARED_READ_FAILED")
+	}
+	var fs []splitDNSFixture
+	if json.Unmarshal(b, &fs) != nil || len(fs) == 0 {
+		t.Fatal("PREPARED_FIXTURES_INVALID")
+	}
+	previousResolver, previousClient, previousTransport := net.DefaultResolver, http.DefaultClient, http.DefaultTransport
+	net.DefaultResolver = &net.Resolver{PreferGo: true, Dial: func(context.Context, string, string) (net.Conn, error) {
+		splitDNSBlocked.Add(1)
+		return nil, errors.New("SYSTEM_DNS_FORBIDDEN")
+	}}
+	http.DefaultTransport = splitDNSDenyHTTP{}
+	http.DefaultClient = &http.Client{Transport: splitDNSDenyHTTP{}}
+	internet.UseAlternativeSystemDialer(splitDNSDenySystem{})
+	defer func() {
+		net.DefaultResolver = previousResolver
+		http.DefaultClient = previousClient
+		http.DefaultTransport = previousTransport
+		internet.UseAlternativeSystemDialer(nil)
+	}()
+	report := splitDNSReport{CoreVersion: core.Version(), Passed: true, Scope: "Fixed real JSON-loader protobufs, DNS.New, packaged geosite matching, LookupIP/QueryIP, real Router.PickRoute; in-memory leaf DNS only; no core start or sockets"}
+	for _, f := range fs {
+		result := splitDNSValidate(f)
+		report.Results = append(report.Results, result)
+		if !result.Passed {
+			report.Passed = false
+			t.Errorf("%s: %s", strings.ReplaceAll(f.Name, "\n", " "), result.Failure)
+		}
+	}
+	report.BlockedNetworkAttempts = splitDNSBlocked.Load()
+	if report.BlockedNetworkAttempts != 0 {
+		report.Passed = false
+		t.Error("NETWORK_ATTEMPT_BLOCKED")
+	}
+	encoded, err := json.MarshalIndent(report, "", "  ")
+	if err != nil || os.WriteFile(output, encoded, 0600) != nil {
+		t.Fatal("REPORT_WRITE_FAILED")
+	}
+}

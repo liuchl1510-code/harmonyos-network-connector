@@ -18,6 +18,8 @@ struct NetworkSettings {
   @State proxy: string = '';
   @State block: string = '';
   @State dnsUrl: string = 'https://1.1.1.1/dns-query';
+  @State dnsMode: string = 'proxy';
+  @State directDnsUrl: string = 'https://223.5.5.5/dns-query';
   @State appMode: string = 'all';
   @State appBundles: string[] = [];
   @State appSearch: string = '';
@@ -52,7 +54,7 @@ struct NetworkSettings {
   }
   private snapshot(): string {
     return JSON.stringify([this.mode, String(this.bypassLan), this.direct, this.proxy, this.block, this.dnsUrl,
-      this.appMode, this.appBundles.slice().sort(), this.appInput]);
+      this.dnsMode, this.directDnsUrl, this.appMode, this.appBundles.slice().sort(), this.appInput]);
   }
   private draftChanged(): void { this.dirty = this.snapshot() !== this.baseline; this.message = ''; }
   onBackPress(): boolean {
@@ -87,6 +89,7 @@ struct NetworkSettings {
     this.mode = policy.mode; this.bypassLan = policy.bypassLan;
     this.direct = policy.direct.join('\n'); this.proxy = policy.proxy.join('\n'); this.block = policy.block.join('\n');
     this.dnsUrl = policy.dnsUrl;
+    this.dnsMode = policy.dnsMode; this.directDnsUrl = policy.directDnsUrl;
     this.appMode = policy.appMode; this.appBundles = policy.appBundles.slice();
     this.baseline = this.snapshot(); this.dirty = false; this.needsRepair = false;
   }
@@ -105,6 +108,7 @@ struct NetworkSettings {
       policy.mode = this.mode; policy.bypassLan = this.bypassLan;
       policy.direct = parseRoutingEntries(this.direct); policy.proxy = parseRoutingEntries(this.proxy);
       policy.block = parseRoutingEntries(this.block); policy.dnsUrl = this.dnsUrl.trim();
+      policy.dnsMode = this.dnsMode; policy.directDnsUrl = this.directDnsUrl.trim();
       policy.appMode = this.appMode; policy.appBundles = this.appBundles.slice();
       saveNetworkPolicy(this.context().filesDir, policy);
       committed = true;
@@ -119,6 +123,7 @@ struct NetworkSettings {
         '分流列表过长。', '每类分流最多 300 条。', '分流列表格式无效。',
         'DNS 地址需为有效的 HTTPS URL。', 'DNS 地址需包含 HTTPS 域名或 IPv4 地址及路径，不支持账号、片段或 IPv6 地址。',
         'DNS 服务器地址格式无效。', '网络设置超过 32 KiB，未保存。', '网络设置未保存，原设置已保留。',
+        'DNS 查询模式无效。', '直连 DNS 地址需为 HTTPS IPv4 地址及路径。', '直连 DNS 服务器地址不可用。',
         '应用代理范围无效。', '应用列表格式无效或超过 255 项。',
         '请至少选择一个应用，或切换到全部应用。', '本应用自动参与连接检查，无需加入应用选择列表。',
         '应用包名格式无效；需为 7 至 128 位且至少三段，以字母开头，各段以字母或数字结尾。'
@@ -140,6 +145,26 @@ struct NetworkSettings {
     if (!this.editable || this.confirmingLeave || this.leaving ||
       !['global', 'whitelist', 'rules'].includes(mode)) { return; }
     this.mode = mode; this.draftChanged();
+  }
+
+  private changeDnsMode(mode: string): void {
+    this.refreshEditable();
+    if (!this.editable || this.confirmingLeave || this.leaving || !['proxy', 'split'].includes(mode)) { return; }
+    this.dnsMode = mode; this.draftChanged();
+  }
+
+  private resetDnsUrl(direct: boolean): void {
+    this.refreshEditable();
+    if (!this.editable || this.confirmingLeave || this.leaving) { return; }
+    if (direct) { this.directDnsUrl = 'https://223.5.5.5/dns-query'; }
+    else { this.dnsUrl = 'https://1.1.1.1/dns-query'; }
+    this.draftChanged();
+  }
+
+  private dnsModeHint(): string {
+    if (this.dnsMode !== 'split') { return '默认全部经节点查询。白名单 DNS 分流未开启。'; }
+    if (this.mode !== 'whitelist') { return '分流选择和直连 DNS 地址已保留；当前不是白名单模式，DNS 仍全部经节点查询。'; }
+    return '白名单 DNS 分流将在下次连接时生效。Google 类别优先经节点；内置的大陆、私有及 DNS 服务域名类别直接查询，其余域名经节点。';
   }
 
   private appName(bundle: string): string {
@@ -347,16 +372,56 @@ struct NetworkSettings {
           }.padding(18).width('100%').alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.surface')).borderRadius(18);
           Column({ space: 12 }) {
             Text('DNS over HTTPS').fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
+            Column({ space: 8 }) {
+              Button({ type: ButtonType.Normal }) {
+                Text(this.dnsMode === 'proxy' ? '✓ 全部经节点（默认）' : '全部经节点（默认）').fontSize(16).width('100%')
+                  .fontColor(this.dnsMode === 'proxy' ? $r('app.color.accent') : $r('app.color.text_primary'));
+              }.id('dnsModeProxy').width('100%').constraintSize({ minHeight: 48 }).padding(14).borderRadius(12)
+                .backgroundColor(this.dnsMode === 'proxy' ? $r('app.color.accent_soft') : $r('app.color.surface_secondary'))
+                .accessibilityText('全部经节点（默认），' + (this.dnsMode === 'proxy' ? '已选择' : '未选择'))
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving).onClick(() => { this.changeDnsMode('proxy'); });
+              Button({ type: ButtonType.Normal }) {
+                Text(this.dnsMode === 'split' ? '✓ 白名单 DNS 分流' : '白名单 DNS 分流').fontSize(16).width('100%')
+                  .fontColor(this.dnsMode === 'split' ? $r('app.color.accent') : $r('app.color.text_primary'));
+              }.id('dnsModeSplit').width('100%').constraintSize({ minHeight: 48 }).padding(14).borderRadius(12)
+                .backgroundColor(this.dnsMode === 'split' ? $r('app.color.accent_soft') : $r('app.color.surface_secondary'))
+                .accessibilityText('白名单 DNS 分流，' + (this.dnsMode === 'split' ? '已选择' : '未选择'))
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving).onClick(() => { this.changeDnsMode('split'); });
+            }.width('100%');
+            Text(this.dnsModeHint()).id('dnsModeHint').fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
+            Text('经节点查询的 DoH').fontSize(15).fontColor($r('app.color.text_primary'));
             TextInput({ text: this.dnsUrl, placeholder: 'https://1.1.1.1/dns-query' }).enableKeyboardOnFocus(deviceInfo.deviceType !== '2in1').id('dnsUrl').maxLength(2048)
               .enabled(this.editable && !this.confirmingLeave && !this.leaving).fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.surface_secondary'))
               .onChange((text: string) => { this.dnsUrl = text; this.draftChanged(); });
-            Text('DNS 请求始终经节点发送。支持域名或 IPv4 的 HTTPS URL；URL 中的域名交给远端节点解析。节点检测使用独立的默认 DNS 和全部代理配置。')
+            Text('支持域名或 IPv4 的 HTTPS URL；URL 中的域名交给远端节点解析。')
               .fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
-            Button('填入默认 DNS').id('resetDns').fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
-              .enabled(this.editable && !this.confirmingLeave && !this.leaving).onClick(() => { this.dnsUrl = 'https://1.1.1.1/dns-query'; this.draftChanged(); });
+            Button('填入默认代理 DNS').id('resetDns').constraintSize({ minHeight: 44, maxWidth: '100%' })
+              .fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
+              .enabled(this.editable && !this.confirmingLeave && !this.leaving).onClick(() => { this.resetDnsUrl(false); });
+            if (this.dnsMode === 'split' || this.directDnsUrl !== 'https://223.5.5.5/dns-query') {
+              Text('直接查询的 DoH').fontSize(15).fontColor($r('app.color.text_primary'));
+              if (this.dnsMode !== 'split' || this.mode !== 'whitelist') {
+                Text('直连地址当前不生效，保留以供白名单 DNS 分流使用；保存前仍会检查地址格式。')
+                  .id('directDnsInactiveHint').fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
+              }
+              TextInput({ text: this.directDnsUrl, placeholder: 'https://223.5.5.5/dns-query' })
+                .enableKeyboardOnFocus(deviceInfo.deviceType !== '2in1').id('directDnsUrl').maxLength(2048)
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving)
+                .fontColor($r('app.color.text_primary')).backgroundColor($r('app.color.surface_secondary'))
+                .onChange((text: string) => { this.directDnsUrl = text; this.draftChanged(); });
+              Text('仅支持 HTTPS IPv4 地址及路径，避免查询 DNS 服务器本身时形成循环。默认使用阿里公共 DNS（223.5.5.5）；直连查询通过当前物理网络发送，提供方可见查询域名和你的网络出口。公共 DNS 不保证能解析局域网私有域名。')
+                .id('directDnsHint').fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
+              Button('填入默认直连 DNS').id('resetDirectDns').constraintSize({ minHeight: 44, maxWidth: '100%' })
+                .fontColor($r('app.color.accent')).backgroundColor($r('app.color.accent_soft'))
+                .enabled(this.editable && !this.confirmingLeave && !this.leaving).onClick(() => { this.resetDnsUrl(true); });
+              Text('DNS 按域名类别选择查询路径；仅命中 IP 分流的连接不一定使用直连 DNS。查询失败时不会改用另一条 DNS 路径。')
+                .id('dnsSplitFailureHint').fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
+            }
+            Text('节点检测使用独立的默认 DNS 和全部代理配置，不使用此处的 DNS 分流。')
+              .fontSize(13).lineHeight('21fp').fontColor($r('app.color.text_secondary'));
           }.padding(18).width('100%').alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.surface')).borderRadius(18);
         }.padding({ left: 20, right: 20, bottom: 28 }).width(formContentWidth(this.windowWidthVp)).alignItems(HorizontalAlign.Start);
-      }.layoutWeight(1).width('100%').align(Alignment.Top);
+      }.id('networkSettingsScroll').layoutWeight(1).width('100%').align(Alignment.Top);
       Column({ space: 10 }) {
         if (this.message) { Text(this.message).id('networkSettingsResult').fontSize(14).fontColor($r('app.color.text_secondary')).width('100%'); }
         Text(this.dirty ? '有未保存的修改' : '保存后，下次连接时生效').id('networkSettingsDirtyState')

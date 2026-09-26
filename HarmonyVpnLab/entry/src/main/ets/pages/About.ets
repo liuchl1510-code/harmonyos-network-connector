@@ -66,7 +66,7 @@ struct About {
 
         Column({ space: 10 }) {
           Text('当前连接能力').fontSize(17).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'));
-          Text('使用你导入的节点提供 IPv4 代理连接。连接期间，应用接管的 DNS 通过节点转发；IPv6 流量目前捕获后阻断。')
+          Text('使用你导入的节点提供 IPv4 代理连接。DNS 默认通过节点查询，也可在白名单模式下选择按域名分流；IPv6 流量目前捕获后阻断。')
             .fontSize(14).lineHeight('23fp').fontColor($r('app.color.text_secondary'));
           Text('后台和锁屏期间可保持连接；强行结束应用可能使系统停止 VPN。')
             .fontSize(14).lineHeight('23fp').fontColor($r('app.color.text_secondary'));

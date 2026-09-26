@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "coreCommit": "94ffd50060f1cfd5d7482ec90a23a92bdefdff68",
+  "patch": "patches/0002-doh-session-transport-pool.patch",
+  "patchSHA256": "78ab62a87df5cea367b3b0566fb8cbdd635da0a218e1019d051377ad7d8cf34b",
+  "files": [
+    {
+      "path": "app/dns/dns.go",
+      "originalSHA256LF": "dbf6f72f6007f5e777d5a40e23e3e1d402594a4b0f187a143302d326355025ea",
+      "patchedSHA256LF": "6f37965b4333ca741c6c7d5fa5774cb1ca8bfa46ecefad94f96e1891c87779f5"
+    },
+    {
+      "path": "app/dns/nameserver.go",
+      "originalSHA256LF": "08357d41eee26fcb8e8345cffe608339369d9093a542e6cf444c3bda3ff78a14",
+      "patchedSHA256LF": "21927383d19d16c4825359b06c0b8bb7af74971c4543efd007f8127f7a7debdf"
+    },
+    {
+      "path": "app/dns/nameserver_doh.go",
+      "originalSHA256LF": "b164cd52e4de2eae6709ee1f3648497dba27a67f6722f51adec1e078c486b532",
+      "patchedSHA256LF": "e3b1c800dcab11a89645f0ac856b84ca97ee06f1e34939d5e0109688ed799826"
+    },
+    {
+      "path": "app/dns/doh_transport.go",
+      "originalSHA256LF": null,
+      "patchedSHA256LF": "c256a9224a18612a7725dd154d2dc9eb41ec7b1d0a4580e1bc2619b95ad72367"
+    }
+  ],
+  "scope": "DNS instance; ordinary remote HTTPS only; exact URL and effective inbound tag; independent query caches and options; verified uTLS unchanged"
+}
